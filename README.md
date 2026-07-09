@@ -2,6 +2,14 @@
 
 BioInsAlgo is a Python MVP implementation of a bio-inspired workflow for 3D soybean root skeletonization and phenotyping from root-only point clouds or meshes. It was built to reproduce the main computational structure of the paper "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm" as a reliable first working package, not yet as a fully validated author-equivalent reproduction.
 
+## Related Paper
+
+This repository is organized around the workflow described in:
+
+Zhou et al. (2025). "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm." *Computers and Electronics in Agriculture*, 239(B), 110890. DOI: [10.1016/j.compag.2025.110890](https://doi.org/10.1016/j.compag.2025.110890).
+
+The implementation here is an independent MVP reproduction of the main workflow. It is not the original authors' code. Citation metadata is provided in [CITATION.cff](CITATION.cff), and a BibTeX entry is provided in [references.bib](references.bib).
+
 ## What It Does
 
 - Loads root-only `PLY`, `OBJ`, `STL`, `XYZ`, or `CSV` inputs where feasible.
@@ -149,3 +157,4 @@ python -m pytest tests
 ```
 
 Expected result: all tests pass.
+
