@@ -8,6 +8,8 @@ This repository is organized around the workflow described in:
 
 Zhou et al. (2025). "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm." *Computers and Electronics in Agriculture*, 239(B), 110890. DOI: [10.1016/j.compag.2025.110890](https://doi.org/10.1016/j.compag.2025.110890).
 
+Additional Chinese-language reading note/comment on the cited paper: [Zhihu column article](https://zhuanlan.zhihu.com/p/1966826634897232745).
+
 The implementation here is an independent MVP reproduction of the main workflow. It is not the original authors' code. Citation metadata is provided in [CITATION.cff](CITATION.cff), and a BibTeX entry is provided in [references.bib](references.bib).
 
 ## What It Does
