@@ -19,7 +19,7 @@ from .lateral import (
     reduce_similar_paths,
     select_non_overlapping_paths,
 )
-from .primary import estimate_primary_path, tangent_plane_primary_segmentation
+from .primary import estimate_primary_path, refine_primary_centerline, tangent_plane_primary_segmentation
 from .traits import compute_traits
 from .types import Normalization, RootPath
 from .visualize import save_overview_plot, save_tip_angle_front_view
@@ -77,8 +77,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     LOGGER.info("Loaded %d points; d_bar=%g", len(normalized), d_bar)
 
     start, end = _resolve_endpoints(cloud.points, normalized, normalization, config)
-    primary = estimate_primary_path(normalized, start, end, d_bar=d_bar, graph_k=config.graph_k)
-    primary_mask = tangent_plane_primary_segmentation(normalized, primary.points, d_bar=d_bar)
+    coarse_primary = estimate_primary_path(normalized, start, end, d_bar=d_bar, graph_k=config.graph_k)
+    primary_mask = tangent_plane_primary_segmentation(normalized, coarse_primary.points, d_bar=d_bar)
+    refined_primary_points = refine_primary_centerline(normalized, primary_mask, coarse_primary.points, d_bar=d_bar)
+    primary = RootPath(root_id="primary", points=refined_primary_points)
     LOGGER.info("Primary segmentation assigned %d/%d points", int(primary_mask.sum()), len(primary_mask))
 
     selected, lateral_start_count, candidate_count, order_counts = _trace_lateral_orders(

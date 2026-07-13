@@ -82,6 +82,92 @@ def tangent_plane_primary_segmentation(
     return mask
 
 
+def refine_primary_centerline(
+    points: np.ndarray,
+    primary_mask: np.ndarray,
+    primary_path: np.ndarray,
+    d_bar: float,
+    max_stations: int = 400,
+    min_slice_points: int = 12,
+) -> np.ndarray:
+    """Recenter a coarse surface path using primary-root cross sections."""
+    points = np.asarray(points, dtype=float)
+    primary_path = np.asarray(primary_path, dtype=float)
+    primary_mask = np.asarray(primary_mask, dtype=bool)
+    if len(primary_path) < 3 or primary_mask.shape != (len(points),):
+        return primary_path.copy()
+
+    primary_points = points[primary_mask]
+    if len(primary_points) < max(3 * min_slice_points, 30):
+        return primary_path.copy()
+
+    total_length = float(np.linalg.norm(np.diff(primary_path, axis=0), axis=1).sum())
+    if total_length <= 0:
+        return primary_path.copy()
+
+    station_spacing = max(6.0 * d_bar, total_length / max(3, int(max_stations)), 1e-4)
+    stations = resample_polyline(primary_path, station_spacing)
+    if len(stations) < 3:
+        return primary_path.copy()
+
+    tangents = tangent_vectors(stations)
+    tree = cKDTree(primary_points)
+    search_radius = max(18.0 * d_bar, 3.0 * station_spacing, 0.008)
+    slab_half_thickness = max(2.5 * d_bar, 0.75 * station_spacing)
+    centers = np.full_like(stations, np.nan)
+    valid = np.zeros(len(stations), dtype=bool)
+
+    for index, (station, tangent) in enumerate(zip(stations, tangents)):
+        local_indices = tree.query_ball_point(station, r=search_radius)
+        if len(local_indices) < min_slice_points:
+            continue
+        offsets = primary_points[np.asarray(local_indices, dtype=int)] - station
+        axial = offsets @ tangent
+        in_slab = np.abs(axial) <= slab_half_thickness
+        if int(in_slab.sum()) < min_slice_points:
+            continue
+        offsets = offsets[in_slab]
+        axial = axial[in_slab]
+        basis = _plane_basis(tangent)
+        radial = offsets @ basis.T
+        radial_center = _robust_cross_section_center(radial)
+        center_offset = np.median(axial) * tangent + radial_center @ basis
+        if np.linalg.norm(center_offset) > 0.9 * search_radius:
+            continue
+        centers[index] = station + center_offset
+        valid[index] = True
+
+    if int(valid.sum()) < max(3, int(np.ceil(0.25 * len(stations)))):
+        return primary_path.copy()
+
+    station_indices = np.arange(len(stations))
+    valid_indices = station_indices[valid]
+    for axis in range(3):
+        centers[:, axis] = np.interp(station_indices, valid_indices, centers[valid, axis])
+
+    for _ in range(3):
+        smoothed = centers.copy()
+        smoothed[1:-1] = (centers[:-2] + 2.0 * centers[1:-1] + centers[2:]) / 4.0
+        centers = smoothed
+
+    centers[0] = primary_path[0]
+    centers[-1] = primary_path[-1]
+    return resample_polyline(centers, spacing=max(2.0 * d_bar, 1e-4))
+
+
+def _robust_cross_section_center(projected: np.ndarray) -> np.ndarray:
+    """Estimate the midpoint of a possibly unevenly sampled 2D boundary."""
+    projected = np.asarray(projected, dtype=float)
+    median = np.median(projected, axis=0)
+    if len(projected) < 8:
+        return median
+    centered = projected - median
+    _, _, axes = np.linalg.svd(centered, full_matrices=False)
+    rotated = centered @ axes.T
+    lower, upper = np.percentile(rotated, [10.0, 90.0], axis=0)
+    return median + ((lower + upper) * 0.5) @ axes
+
+
 def _plane_basis(normal: np.ndarray) -> np.ndarray:
     normal = normal / max(np.linalg.norm(normal), 1e-12)
     helper = np.array([1.0, 0.0, 0.0])
