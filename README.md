@@ -51,6 +51,25 @@ For tests:
 python -m pytest tests
 ```
 
+## Desktop GUI
+
+Launch the desktop interface with:
+
+```powershell
+soyrootbio gui
+```
+
+The GUI intentionally exposes only:
+
+- input root file and output directory;
+- mesh sample number and display point number;
+- primary-root endpoints selected interactively, entered as Base/Tip XYZ coordinates, or chosen automatically from Z-axis extrema;
+- the fixed tip-direction-versus-downward-Z angle definition `(0, 0, -1)`;
+- a progress bar with ETA; and
+- an activity log.
+
+PCA-axis endpoint selection and PCA-projected branch-angle controls are not included. The isolated candidate's desktop shortcut launches this source snapshot directly.
+
 ## Generate Synthetic Test Data
 
 ```powershell

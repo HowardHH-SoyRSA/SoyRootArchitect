@@ -13,6 +13,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Console logging level.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    gui = subparsers.add_parser("gui", help="Open the desktop application.")
+    gui.add_argument("--input", type=Path, help="Optional root file to prefill in the desktop application.")
+    gui.add_argument("--output", type=Path, help="Optional output directory to prefill in the desktop application.")
+
     run = subparsers.add_parser("run", help="Run the full segmentation, skeletonization, and trait pipeline.")
     run.add_argument("--input", required=True, type=Path, help="Root-only point cloud or mesh exported from VG Studio.")
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
@@ -40,6 +44,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
+    if args.command == "gui":
+        from .desktop_gui import launch_gui
+
+        return launch_gui(args.input, args.output)
     if args.command == "generate-synthetic":
         point_path, endpoint_path = write_synthetic_dataset(
             args.output,

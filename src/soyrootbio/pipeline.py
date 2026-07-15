@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -21,12 +22,16 @@ from .lateral import (
 )
 from .primary import estimate_primary_path, refine_primary_centerline, tangent_plane_primary_segmentation
 from .traits import compute_traits
-from .types import Normalization, RootPath
+from .types import Normalization, PointCloudData, RootPath
 from .visualize import save_overview_plot, save_tip_angle_front_view
 
 
 LOGGER = logging.getLogger(__name__)
 MIN_PIPELINE_POINTS = 20
+
+
+class AnalysisCancelled(RuntimeError):
+    """Raised when the desktop GUI requests cooperative cancellation."""
 
 
 @dataclass
@@ -58,7 +63,13 @@ class PipelineResult:
     lateral_start_count: int
 
 
-def run_pipeline(config: PipelineConfig) -> PipelineResult:
+def run_pipeline(
+    config: PipelineConfig,
+    *,
+    preloaded_cloud: PointCloudData | None = None,
+    progress_callback: Callable[[str, float], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> PipelineResult:
     """Run the soybean root skeletonization and trait workflow.
 
     Order 1 roots are traced from the primary skeleton. Higher orders are an MVP
@@ -66,22 +77,41 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     unassigned points are clustered and traced as child roots.
     """
     _validate_config(config)
+    cancellation_guard = lambda: _raise_if_cancelled(cancel_check)
+    cancellation_guard()
+    _report_progress(progress_callback, "Preparing analysis", 0.02)
     np.random.seed(config.random_seed)
     LOGGER.info("Loading input geometry: %s", config.input_path)
-    cloud = load_root_geometry(config.input_path, sample_points=config.sample_points)
+    if preloaded_cloud is None:
+        cloud = load_root_geometry(
+            config.input_path,
+            sample_points=config.sample_points,
+            random_seed=config.random_seed,
+        )
+    else:
+        cloud = preloaded_cloud
+        LOGGER.info("Using %d points already loaded by the desktop GUI", len(cloud.points))
+    cancellation_guard()
+    _report_progress(progress_callback, "Point cloud ready", 0.12)
     if len(cloud.points) < MIN_PIPELINE_POINTS:
         raise ValueError(f"Too few points for skeletonization: found {len(cloud.points)}, need at least {MIN_PIPELINE_POINTS}")
     normalized, base_normalization = normalize_unit_box(cloud.points)
     normalization = Normalization(base_normalization.minimum, base_normalization.scale, config.unit_scale)
     d_bar = mean_nearest_neighbor_distance(normalized)
     LOGGER.info("Loaded %d points; d_bar=%g", len(normalized), d_bar)
+    cancellation_guard()
+    _report_progress(progress_callback, "Normalized point cloud", 0.20)
 
     start, end = _resolve_endpoints(cloud.points, normalized, normalization, config)
     coarse_primary = estimate_primary_path(normalized, start, end, d_bar=d_bar, graph_k=config.graph_k)
+    cancellation_guard()
+    _report_progress(progress_callback, "Estimated primary-root path", 0.30)
     primary_mask = tangent_plane_primary_segmentation(normalized, coarse_primary.points, d_bar=d_bar)
     refined_primary_points = refine_primary_centerline(normalized, primary_mask, coarse_primary.points, d_bar=d_bar)
     primary = RootPath(root_id="primary", points=refined_primary_points)
     LOGGER.info("Primary segmentation assigned %d/%d points", int(primary_mask.sum()), len(primary_mask))
+    cancellation_guard()
+    _report_progress(progress_callback, "Segmented and refined primary root", 0.48)
 
     selected, lateral_start_count, candidate_count, order_counts = _trace_lateral_orders(
         normalized,
@@ -91,10 +121,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         max_root_order=config.max_root_order,
         max_paths=config.lateral_max_paths,
     )
+    cancellation_guard()
+    _report_progress(progress_callback, "Traced lateral roots", 0.76)
     if lateral_start_count == 0:
         LOGGER.warning("No lateral root starting points detected; exporting primary-root-only results.")
     lateral_labels = _assign_lateral_points(normalized, selected, primary_mask, d_bar)
     traits = compute_traits(primary.points, selected, normalized, primary_mask, lateral_labels, normalization, lateral_start_count=lateral_start_count)
+    cancellation_guard()
+    _report_progress(progress_callback, "Computed root traits", 0.84)
     metadata = {
         "source": str(config.input_path),
         "algorithm_reference": "Zhou et al. 2025, Computers and Electronics in Agriculture, DOI 10.1016/j.compag.2025.110890",
@@ -120,8 +154,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         normalization,
         metadata,
     )
+    cancellation_guard()
+    _report_progress(progress_callback, "Exported skeletons and trait tables", 0.94)
     save_overview_plot(config.output_dir / "overview.png", normalized, primary_mask, lateral_labels, primary.points, selected)
+    cancellation_guard()
     save_tip_angle_front_view(config.output_dir / "tip_angles_front_view_600dpi.png", normalized, primary_mask, lateral_labels, primary.points, selected, traits)
+    cancellation_guard()
+    _report_progress(progress_callback, "Analysis complete", 1.0)
     return PipelineResult(
         output_dir=config.output_dir,
         point_count=len(normalized),
@@ -133,6 +172,20 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         normalization=normalization,
         lateral_start_count=lateral_start_count,
     )
+
+
+def _report_progress(
+    callback: Callable[[str, float], None] | None,
+    stage: str,
+    fraction: float,
+) -> None:
+    if callback is not None:
+        callback(stage, float(np.clip(fraction, 0.0, 1.0)))
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise AnalysisCancelled("Analysis cancelled by the user.")
 
 
 def _trace_lateral_orders(
