@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soybean-root-bio"
+version = "0.2.0"
+description = "Bio-inspired 3D soybean root skeletonization and phenotyping from VG Studio point clouds or meshes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "open3d",
+  "numpy",
+  "scipy",
+  "hdbscan",
+  "scikit-learn",
+  "networkx",
+  "pandas",
+  "matplotlib",
+  "openpyxl",
+  "psutil",
+  "tkinterdnd2",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+soyrootbio = "soyrootbio.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,12 @@
+﻿open3d
+numpy
+scipy
+hdbscan
+scikit-learn
+networkx
+pandas
+matplotlib
+openpyxl
+psutil
+tkinterdnd2
+pytest
