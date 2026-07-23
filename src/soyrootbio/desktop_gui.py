@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 
+from .batch import write_processing_error_log
 from .endpoint_picker import select_primary_endpoints_from_file_gui
 from .pipeline import AnalysisCancelled, PipelineConfig, PipelineResult, run_pipeline
 from .types import PointCloudData
@@ -503,6 +504,14 @@ class BioInsAlgoDesktopApp:
         except AnalysisCancelled:
             self.messages.put(("cancelled", None))
         except Exception as exc:
+            error_log_path = write_processing_error_log(
+                output_dir=config.output_dir,
+                input_path=config.input_path,
+                exception=exc,
+                config=config,
+            )
+            if error_log_path is not None:
+                self.messages.put(("log", f"Error log saved to {error_log_path}"))
             self.messages.put(("error", str(exc)))
         else:
             self.messages.put(("done", result))
@@ -626,8 +635,10 @@ def launch_gui(
     initial_input: str | Path | None = None,
     initial_output: str | Path | None = None,
 ) -> int:
-    root = tk.Tk()
-    BioInsAlgoDesktopApp(root, initial_input=initial_input, initial_output=initial_output)
+    from .batch_gui import BioInsAlgoBatchApp, create_root
+
+    root = create_root()
+    BioInsAlgoBatchApp(root, initial_input=initial_input, initial_output=initial_output)
     root.mainloop()
     return 0
 

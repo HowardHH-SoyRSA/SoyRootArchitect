@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,7 +13,12 @@ from soyrootbio.desktop_gui import (
     format_eta,
     validate_launcher_settings,
 )
-from soyrootbio.endpoint_picker import _parse_sample_count, write_endpoint_file
+from soyrootbio.endpoint_picker import (
+    _parse_sample_count,
+    _wheel_zoom_factor,
+    _zoom_3d_axis,
+    write_endpoint_file,
+)
 from soyrootbio.io import load_root_geometry_with_progress
 from soyrootbio.pipeline import AnalysisCancelled, PipelineConfig, run_pipeline
 
@@ -21,6 +27,25 @@ def _root_file(tmp_path: Path) -> Path:
     source = tmp_path / "root.ply"
     source.write_text("ply", encoding="ascii")
     return source
+
+
+def test_primary_section_wheel_zoom_supports_backend_event_variants() -> None:
+    from matplotlib.figure import Figure
+
+    assert _wheel_zoom_factor("up", 0) == pytest.approx(0.75)
+    assert _wheel_zoom_factor(None, 1) == pytest.approx(0.75)
+    assert _wheel_zoom_factor("down", 0) == pytest.approx(1.35)
+    assert _wheel_zoom_factor(None, -1) == pytest.approx(1.35)
+    assert _wheel_zoom_factor(None, 0) is None
+
+    axis = Figure().add_subplot(projection="3d")
+    axis.set_xlim(0.0, 8.0)
+    axis.set_ylim(-2.0, 2.0)
+    axis.set_zlim(10.0, 14.0)
+    _zoom_3d_axis(axis, 0.75)
+    assert np.diff(axis.get_xlim())[0] == pytest.approx(6.0)
+    assert np.diff(axis.get_ylim())[0] == pytest.approx(3.0)
+    assert np.diff(axis.get_zlim())[0] == pytest.approx(3.0)
 
 
 def test_launcher_accepts_only_the_retained_settings(tmp_path: Path):
@@ -64,37 +89,113 @@ def test_launcher_rejects_invalid_endpoint_values(tmp_path: Path):
         validate_launcher_settings(source, tmp_path / "out", 5000, 3000, endpoint_mode="pca")
 
 
-def test_gui_source_contains_approved_controls_only():
-    import soyrootbio.desktop_gui as desktop_gui
+def test_batch_gui_source_exposes_required_controls():
+    import soyrootbio.batch_gui as batch_gui
 
-    source = Path(desktop_gui.__file__).read_text(encoding="utf-8")
+    source = Path(batch_gui.__file__).read_text(encoding="utf-8")
     for required in (
-        "Input root file",
-        "Output directory",
-        "Mesh samples",
+        "Add files",
+        "Remove selected",
+        "Set selected output",
+        "Open output folder",
+        "Scored automatic",
+        "Manual soil line + scorer",
+        "Interactive endpoints + sections",
+        "Analysis vertex cap",
         "Display points",
-        "Primary-root endpoints",
-        "Automatic Z-axis extrema",
-        "Tip direction vs downward Z (0, 0, -1)",
-        "ETA",
-        "Activity",
+        "Tip vector window (mesh units)",
+        "Concurrent samples",
+        "Threads / sample",
+        "Start batch",
+        "Pause selected",
+        "Resume selected",
+        "Cancel selected",
     ):
         assert required in source
-    for rejected in (
-        "PCA-axis extrema",
-        "PCA-projected",
-        "Maximum laterals",
-        "Unit scale",
-        "Root order:",
-    ):
-        assert rejected not in source
+    assert 'orient="horizontal"' in source
+    assert "xscrollcommand=horizontal_scrollbar.set" in source
+    assert "Voxel size (mm)" not in source
+    assert "Mesh unit → mm" not in source
+    assert "from threadpoolctl import threadpool_limits" not in source
+
+
+def test_batch_gui_opens_only_one_existing_output_folder(tmp_path: Path, monkeypatch):
+    import soyrootbio.batch_gui as batch_gui
+    from soyrootbio.batch_gui import BioInsAlgoBatchApp, SampleEntry
+
+    class Tree:
+        selected: tuple[str, ...] = ()
+
+        def selection(self) -> tuple[str, ...]:
+            return self.selected
+
+    output = tmp_path / "results"
+    output.mkdir()
+    app = BioInsAlgoBatchApp.__new__(BioInsAlgoBatchApp)
+    app.tree = Tree()
+    app.entries = {"sample": SampleEntry("sample", tmp_path / "root.ply", output)}
+    opened: list[Path] = []
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(app, "_open_directory", opened.append)
+    monkeypatch.setattr(batch_gui.messagebox, "showinfo", lambda title, text: notices.append((title, text)))
+
+    app.open_output_folder()
+    assert not opened
+    assert notices[-1][0] == "Select one sample"
+
+    app.tree.selected = ("sample",)
+    app.open_output_folder()
+    assert opened == [output.resolve()]
+
+    output.rmdir()
+    app.open_output_folder()
+    assert opened == [output.resolve()]
+    assert notices[-1][0] == "Output not available"
+
+
+def test_batch_gui_blocks_additions_while_active_and_selects_only_new_entries(tmp_path: Path):
+    from soyrootbio.batch_gui import BioInsAlgoBatchApp, SampleEntry
+
+    class StatusVar:
+        value = ""
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    app = BioInsAlgoBatchApp.__new__(BioInsAlgoBatchApp)
+    app.scheduler = SimpleNamespace(all_done=False)
+    app.status_var = StatusVar()
+    app.add_files([tmp_path / "ignored.ply"])
+    assert "Batch active" in app.status_var.value
+
+    app.entries = {
+        "done": SampleEntry("done", tmp_path / "done.ply", tmp_path / "done-output", job_id="old-job"),
+        "new": SampleEntry("new", tmp_path / "new.ply", tmp_path / "new-output"),
+    }
+    assert app._next_batch_items() == ("new",)
+    app.entries["new"].job_id = "new-job"
+    assert app._next_batch_items() == ("done", "new")
+
+
+def test_batch_gui_rejects_resolved_duplicate_output_paths(tmp_path: Path):
+    from soyrootbio.batch_gui import BioInsAlgoBatchApp, SampleEntry
+
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    app = BioInsAlgoBatchApp.__new__(BioInsAlgoBatchApp)
+    app.entries = {
+        "a": SampleEntry("a", tmp_path / "a.ply", tmp_path / "output"),
+        "b": SampleEntry("b", tmp_path / "b.ply", alias_parent / ".." / "output"),
+    }
+    with pytest.raises(ValueError, match="assigned to both"):
+        app._validate_output_ownership(("a", "b"))
 
 
 def test_progress_eta_helpers_and_pipeline_hooks(tmp_path: Path):
     assert estimate_remaining_seconds(10.0, 0.5) == pytest.approx(10.0)
     assert format_eta(65) == "ETA 01:05"
     signature = inspect.signature(run_pipeline)
-    assert {"preloaded_cloud", "progress_callback", "cancel_check"}.issubset(signature.parameters)
+    assert {"preloaded_cloud", "progress_callback", "cancel_check", "pause_check"}.issubset(signature.parameters)
 
     config = PipelineConfig(tmp_path / "missing.ply", tmp_path / "out", auto_endpoints="z")
     with pytest.raises(AnalysisCancelled):

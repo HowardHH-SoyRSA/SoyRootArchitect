@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial import cKDTree
 
+from .runtime import worker_threads
+
 from .types import Normalization
 
 
@@ -22,7 +24,7 @@ def mean_nearest_neighbor_distance(points: np.ndarray) -> float:
     if len(points) < 2:
         return 0.0
     tree = cKDTree(points)
-    distances, _ = tree.query(points, k=2, workers=-1)
+    distances, _ = tree.query(points, k=2, workers=worker_threads())
     return float(np.mean(distances[:, 1]))
 
 
@@ -79,7 +81,7 @@ def point_to_polyline_distance(points: np.ndarray, path: np.ndarray) -> tuple[np
         distances = np.linalg.norm(points - path[0], axis=1)
         return distances, np.zeros(len(points), dtype=int)
     tree = cKDTree(path)
-    distances, nearest = tree.query(points, k=1, workers=-1)
+    distances, nearest = tree.query(points, k=1, workers=worker_threads())
     return distances.astype(float), nearest.astype(int)
 
 
@@ -89,11 +91,26 @@ def nearest_path_tangent(point: np.ndarray, path: np.ndarray, tangents: np.ndarr
     return tangents[int(idx)], int(idx)
 
 
-def angle_degrees(a: np.ndarray, b: np.ndarray) -> float:
+def vector_angle_degrees(a: np.ndarray, b: np.ndarray) -> float:
+    """Return the directional angle between two vectors in the range 0--180°."""
+
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
+    if na <= 1e-12 or nb <= 1e-12:
+        return float("nan")
     cosine = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
-    return float(np.degrees(np.arccos(abs(cosine))))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def angle_degrees(a: np.ndarray, b: np.ndarray) -> float:
+    """Return the undirected axial angle between two lines in the range 0--90°.
+
+    This compatibility helper is appropriate for a line whose orientation is
+    unknown.  Gravity and ordered root vectors must use
+    :func:`vector_angle_degrees` so upward and downward directions are not
+    collapsed together.
+    """
+
+    angle = vector_angle_degrees(a, b)
+    return min(angle, 180.0 - angle)
 

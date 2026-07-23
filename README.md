@@ -1,181 +1,306 @@
-﻿# BioInsAlgo
+# SoyRootBio / BioInsAlgo 0.2
 
-BioInsAlgo is a Python MVP implementation of a bio-inspired workflow for 3D soybean root skeletonization and phenotyping from root-only point clouds or meshes. It was built to reproduce the main computational structure of the paper "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm" as a reliable first working package, not yet as a fully validated author-equivalent reproduction.
+SoyRootBio is a desktop and command-line application for topology-aware measurement of reconstructed soybean root system architecture (RSA). Its primary inputs are root-only micro-CT surface meshes in STL or PLY format. The software detects a primary root, traces lateral roots recursively, repairs the result into a rooted hierarchy, measures traits in source mesh units, and writes editable and validation-ready outputs.
 
-## Related Paper
+The project prioritizes the measurement objectives in this repository over exact reproduction of any one publication. It evolved from the MIT-licensed [BioInsAlgo baseline](https://github.com/HowardHH-SoyRSA/BioInsAlgo/tree/agent/refine-primary-centerline-log) and remains MIT licensed. Zhou et al. (2025) motivated the original bio-inspired workflow, but this is not the authors' implementation and is not a bit-for-bit reproduction. See [Research lineage and licensing](#research-lineage-and-licensing) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-This repository is organized around the workflow described in:
+## Capabilities
 
-Zhou et al. (2025). "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm." *Computers and Electronics in Agriculture*, 239(B), 110890. DOI: [10.1016/j.compag.2025.110890](https://doi.org/10.1016/j.compag.2025.110890).
-
-Additional Chinese-language reading note/comment on the cited paper: [Zhihu column article](https://zhuanlan.zhihu.com/p/1966826634897232745).
-
-The implementation here is an independent MVP reproduction of the main workflow. It is not the original authors' code. Citation metadata is provided in [CITATION.cff](CITATION.cff), and a BibTeX entry is provided in [references.bib](references.bib).
-
-## What It Does
-
-- Loads root-only `PLY`, `OBJ`, `STL`, `XYZ`, or `CSV` inputs where feasible.
-- Converts mesh inputs to uniformly sampled point clouds with Open3D.
-- Normalizes point clouds to a unit bounding box and computes mean nearest-neighbor distance `d_bar`.
-- Extracts the primary root from two endpoints using a local nearest-neighbor graph and Dijkstra shortest path.
-- Segments primary root points using tangent-plane neighborhoods and HDBSCAN.
-- Detects lateral root starting points from non-primary points near parent-root boundaries using a percentile threshold and HDBSCAN.
-- Traces lateral skeleton paths recursively up to a requested root order.
-- Exports skeletons, segmented point clouds, root traits, angle-labelled figures, and skeleton overlays.
-
-## Repository Layout
-
-```text
-BioInsAlgo/
-  src/soyrootbio/                 Python package
-  tests/                          Unit and synthetic end-to-end tests
-  scripts/                        Helper visualization scripts
-  data/synthetic/                 Small generated synthetic point cloud and endpoints
-  data/real/20260525_stl/         VG Studio STL testing files
-  pyproject.toml                  Installable package metadata
-  requirements.txt                Dependency list
-  .gitattributes                  Git LFS rules for large 3D data
-```
+- Reads STL and PLY meshes while preserving their vertices and faces. OBJ meshes and XYZ/CSV point clouds are also supported.
+- Uses a ranked automatic primary-root detector by default, with manual endpoints, a soil-line constraint, and optional guide sections as overrides.
+- Represents the primary as order 0, its children as order 1, and recursively assigns every descendant `parent order + 1`.
+- Produces an oriented centreline tree, stable root IDs, insertion locations, confidence values, and QC flags.
+- Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
+- Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
+- Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and primary guidance, ETA/progress, hardware-aware concurrency, pause/resume, and cancellation.
+- Keeps the full mesh by default. Automatic analysis reduction is allowed only when the runtime/memory preflight crosses the configured limit; the default runtime limit is 30 minutes.
 
 ## Installation
 
+Python 3.10 or newer is required. On Windows PowerShell:
+
 ```powershell
+git clone https://github.com/HowardHH-SoyRSA/BioInsAlgo.git
 cd BioInsAlgo
-python -m pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-For tests:
+The main dependencies are Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, and tkinterdnd2. A normal Python.org Windows installation includes Tcl/Tk for the desktop interface.
+
+For development and tests:
 
 ```powershell
-python -m pytest tests
+python -m pip install -e ".[test]"
+python -m pytest -q
 ```
 
-## Desktop GUI
-
-Launch the desktop interface with:
-
-```powershell
-soyrootbio gui
-```
-
-The GUI intentionally exposes only:
-
-- input root file and output directory;
-- mesh sample number and display point number;
-- primary-root endpoints selected interactively, entered as Base/Tip XYZ coordinates, or chosen automatically from Z-axis extrema;
-- the fixed tip-direction-versus-downward-Z angle definition `(0, 0, -1)`;
-- a progress bar with ETA; and
-- an activity log.
-
-PCA-axis endpoint selection and PCA-projected branch-angle controls are not included. The isolated candidate's desktop shortcut launches this source snapshot directly.
-
-## Generate Synthetic Test Data
-
-```powershell
-soyrootbio generate-synthetic --output data/synthetic/synthetic_taproot.csv --lateral-count 3 --seed 21
-```
-
-This writes:
-
-- `data/synthetic/synthetic_taproot.csv`
-- `data/synthetic/synthetic_taproot_endpoints.csv`
-
-## Run on Synthetic Data
-
-```powershell
-soyrootbio run `
-  --input data/synthetic/synthetic_taproot.csv `
-  --endpoint-file data/synthetic/synthetic_taproot_endpoints.csv `
-  --output outputs/synthetic_run `
-  --max-root-order 2 `
-  --max-laterals 20
-```
-
-## Run on a VG Studio STL/PLY/OBJ/XYZ/CSV File
-
-With an endpoint file:
-
-```powershell
-soyrootbio run `
-  --input "path/to/root_only_export.stl" `
-  --endpoint-file "path/to/endpoints.csv" `
-  --output outputs/my_root_run `
-  --sample-points 50000 `
-  --max-root-order 3 `
-  --max-laterals 80
-```
-
-With direct endpoints:
-
-```powershell
-soyrootbio run `
-  --input "path/to/root_only_export.ply" `
-  --output outputs/my_root_run `
-  --start x1 y1 z1 `
-  --end x2 y2 z2 `
-  --sample-points 50000 `
-  --max-root-order 3
-```
-
-For smoke tests only, when endpoints are not yet manually picked:
-
-```powershell
-soyrootbio run `
-  --input data/real/20260525_stl/巴西2号4-2.stl `
-  --output outputs/baxi2_4_2_smoke `
-  --auto-endpoints z `
-  --sample-points 5000
-```
-
-## Main Outputs
-
-Each run writes to the requested output directory:
-
-- `metadata.json`: run configuration, normalization, `d_bar`, point counts, and root-order counts.
-- `primary_skeleton.csv`: primary root skeleton nodes.
-- `lateral_skeletons.csv`: non-primary skeleton nodes with `root_id`, `parent_id`, and `root_order`.
-- `root_traits.csv`: root length, parent/root order, base angle, tip angle to parent, tip angle to primary root, tip angle to Z-axis, point counts, and radius estimates.
-- `segmented_points.ply`: point cloud colored by root class/order.
-- `skeleton_original_overlay.ply`: gray original point cloud plus colored skeleton overlay.
-- `overview.png`: 3D overview.
-- `tip_angles_front_view_600dpi.png`: 600 dpi front view with angle labels.
-
-## Color Code
-
-- Primary root: blue
-- Order 1 laterals: red
-- Order 2 laterals: green
-- Order 3 laterals: purple
-- Higher-order laterals: gold
-- Unassigned/original background: gray
-
-## Data
-
-The included real test data are root-only STL exports from `20260525 CT扫描结果`. The files are intended for testing and method development. They are tracked with Git LFS because the complete STL set is about 583 MB.
-
-If cloning this repository, install Git LFS first and then run:
+Large repository data use Git LFS. If a clone contains pointer files rather than meshes, install Git LFS and run:
 
 ```powershell
 git lfs install
 git lfs pull
 ```
 
-## Current Limitations
+## Desktop batch GUI
 
-- This is an MVP engineering reproduction, not a verified bit-for-bit reproduction of the paper author's implementation.
-- Automatic endpoint modes are for smoke tests; manually selected primary endpoints are recommended for measurement-quality runs.
-- Recursive order tracing is heuristic and needs validation against annotated roots.
-- Dense high-sample runs can be slow because graph and clustering steps are currently CPU-bound Python/scikit-learn workflows.
-- Inputs should be root-only. Soil, pot, stem, or strong segmentation noise should be removed before analysis.
-
-## Development Checks
-
-The current prepared repository was validated with:
+Launch the application with:
 
 ```powershell
-python -m pytest tests
+soyrootbio gui
 ```
 
-Expected result: all tests pass.
+Optionally prefill one input and an output root:
 
+```powershell
+soyrootbio gui --input "D:\roots\sample.ply" --output "D:\results"
+```
+
+The GUI supports these primary-root modes:
+
+- **Scored automatic**: the measurement default.
+- **Z-axis extrema**: a simple fallback for consistently oriented, clean roots.
+- **Manual soil line + scorer**: constrains the collar search around a supplied soil-surface Z value.
+- **Interactive endpoints + sections**: configure a selected sample in the 3D picker; select collar/tip endpoints and optional sections that the primary centreline must cross. The picker can also record a horizontal soil line, and the mouse wheel zooms both the endpoint and primary-section views.
+- **XYZ endpoints**: enter collar/base and tip coordinates, with an optional semicolon-separated guide list (`x,y,z; x,y,z`).
+
+Add multiple STL/PLY files with **Add files** or drag/drop them onto the queue. Each sample receives a unique output directory, which can be changed individually. Select one sample and use **Open output folder** to open that directory. The queue/status table has both vertical and horizontal scrollbars for long paths and status messages. Automatic resource allocation reserves a logical CPU for the desktop, considers physical/logical CPU counts and available RAM, and assigns concurrent samples and threads per sample. Both values can be overridden.
+
+If a sample fails, its output directory contains `processing_error.log` with the failure time, input/output paths, exception, traceback, and non-sensitive pipeline configuration. Cancelled jobs are not reported as processing failures. GUI batch clustering avoids nested HDBSCAN worker pools, so sample-level concurrency remains within the scheduler's resource allocation.
+
+The displayed memory summary distinguishes currently available RAM from installed RAM, and automatic concurrency is budgeted against the available value with a reserve for the desktop. Manual concurrency/thread overrides are honored and can intentionally oversubscribe the machine. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
+
+Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` and are reused for future ETAs. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
+
+## Command-line use
+
+The scored automatic detector and full-mesh analysis are the defaults:
+
+```powershell
+soyrootbio run `
+  --input "D:\roots\sample.ply" `
+  --output "D:\results\sample"
+```
+
+The output path may be new or an existing empty directory. A non-empty output directory is rejected; choose a fresh path for every run, including correction reruns.
+
+Constrain the automatic collar detector with a soil-line Z coordinate:
+
+```powershell
+soyrootbio run `
+  --input "D:\roots\sample.stl" `
+  --output "D:\results\sample" `
+  --auto-endpoints scored `
+  --soil-z 92.5 `
+  --max-root-order 3
+```
+
+Use endpoints in original input coordinates and force the centreline through guide sections:
+
+```powershell
+soyrootbio run `
+  --input "D:\roots\sample.ply" `
+  --output "D:\results\sample_manual" `
+  --start 3.7 59.2 94.6 `
+  --end -19.7 67.3 -55.3 `
+  --guide-file "D:\roots\sample_primary_guides.csv"
+```
+
+An endpoint file may be JSON (`{"start":[x,y,z],"end":[x,y,z]}`), a CSV with `x,y,z` columns and two rows, or text containing six numbers. A guide file may be JSON, CSV with `x,y,z` columns, or whitespace/comma-delimited XYZ rows.
+
+Re-run after editing the exported hierarchy:
+
+```powershell
+soyrootbio run `
+  --input "D:\roots\sample.ply" `
+  --output "D:\results\sample_corrected" `
+  --correction-file "D:\results\sample\root_hierarchy.json"
+```
+
+In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, or inconsistent topology are rejected. Root order is recalculated from the corrected parent links.
+
+The primary row is immutable in a correction file; change the primary with endpoints, soil line, or guide sections instead. Lateral root IDs are treated as immutable provenance keys while corrections are applied: deleting a root does not renumber the survivors or reuse the deleted ID. Unknown/stale IDs, duplicate IDs, and stale geometry fingerprints are rejected. If a lateral's parent or polyline is actually changed, its automatic attachment confidence is set to `0` and the QC flags `manual_correction`, `attachment_confidence_invalidated`, and `low_confidence` are added pending review.
+
+Useful options include:
+
+- `--auto-endpoints scored|z|pca` (default `scored`)
+- `--sample-points N` for an explicit analysis cap; `0` means no user cap
+- `--max-root-order N` (default 3)
+- `--max-laterals N` for a deliberate branch-count cap
+- `--graph-k N` (default 14)
+- `--runtime-limit-minutes M` (default 30)
+- `--minimum-retained-fraction F` (default 0.25)
+- `--tip-window-mesh-units W` (default 2.0), the source-mesh arc-length window used for local tip and reference directions
+
+Run `soyrootbio run --help` for the authoritative option list.
+
+For a self-contained smoke test, generate a synthetic taproot and its endpoint file:
+
+```powershell
+soyrootbio generate-synthetic `
+  --output data/synthetic/synthetic_taproot.csv `
+  --lateral-count 3 `
+  --seed 21
+
+soyrootbio run `
+  --input data/synthetic/synthetic_taproot.csv `
+  --endpoint-file data/synthetic/synthetic_taproot_endpoints.csv `
+  --output outputs/synthetic_run `
+  --max-root-order 2
+```
+
+## Primary-root detection
+
+The automatic detector does not hide a single endpoint heuristic. It generates collar-to-tip candidates on a local sparse graph and ranks them using five recorded score components:
+
+1. basal/collar location, relative to gravity or the supplied soil line;
+2. local radius and thickness continuity;
+3. downward extent;
+4. geodesic path length; and
+5. graph centrality/reachability.
+
+Candidate rank, score, confidence, endpoints, component values, and QC flags are preserved in `metadata.json`. The winning path is refined from the segmented primary surface. Manual endpoints supersede automatic endpoints; optional guide sections create constrained shortest-path segments so the centreline crosses biologically identified primary-root regions.
+
+The selected or detected base is also the upper assignment boundary. Within a sampling-scaled collar neighbourhood, the boundary follows the local primary cross-section so both walls of a tilted collar are preserved. Outside that neighbourhood, “above” follows gravity so a long sideways lateral is not cut by an infinite oblique plane. Shoot-side points are excluded from primary segmentation, lateral tracing, and full-resolution root assignment. `metadata.json` records both directions, the collar radius, tolerance, rule, counts, and assignment-state explanations under `point_assignment`.
+
+Automatic confidence is evidence for review, not a probability of biological correctness. Inspect the labelled PLY, skeleton overlay, hierarchy, and angle figures, especially for merged roots, broken mesh components, pot/soil remnants, or an ambiguous collar.
+
+## Topology and root order
+
+All paths are oriented from collar/insertion toward the root tip. Before traits are computed, the topology stage:
+
+- attaches each lateral to an already established lower-order parent;
+- records insertion point and parent-centreline index;
+- reorients reversed paths;
+- repairs cycles by reattaching the weakest edge;
+- recomputes orders recursively; and
+- assigns stable IDs such as `root-o1-001`.
+
+The invariant is `primary = order 0`; a child of the primary is order 1; every other child is `parent order + 1`. The final graph must be connected to the primary, acyclic, and free of missing parents.
+
+## Angle definitions
+
+Gravity is fixed to the directional vector **g = (0, 0, -1)**. Angles use normalized vectors and `acos(clip(a · b, -1, 1))`, so their range is 0–180°; they are not folded into an acute 0–90° axis angle.
+
+For an oriented lateral centreline `p[0] ... p[n-1]`:
+
+- **Tip–gravity** (`tip_gravity_angle_deg`): angle between the lateral tip tangent and **g**. The tangent points toward `p[n-1]` and is interpolated over the final source-mesh arc-length window selected by `--tip-window-mesh-units`.
+- **Tip-start–gravity** (`tip_start_gravity_angle_deg`): angle between the vector `p[n-1] - p[0]` and **g**.
+- **Tip–primary** (`tip_primary_angle_deg`): angle between the lateral tip tangent and the ordered primary-root tangent, interpolated over the same mesh-unit window around the lateral insertion location.
+
+The requested mesh-unit window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_requested_window` and `tip_vector_arc_window` record the requested and effective lateral-tip windows, and `tip_vector_window_unit` is `mesh_unit`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in source mesh units, the local primary reference vector, and gravity components.
+
+Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, and `Primary`. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
+
+## Trait definitions and units
+
+Physical calibration is temporarily disabled. Output lengths, coordinates, and vector components use the source mesh coordinate unit (`mesh_unit`); area uses `mesh_unit^2` and volume uses `mesh_unit^3`. Internal unit-box normalization is only a numerical transform and is reversed before reporting. No millimetre/voxel conversion value is accepted by the current CLI or GUI, and no physical distance is used for a threshold.
+
+| Trait | Method | Interpretation / limitation |
+|---|---|---|
+| Root length | Sum of consecutive centreline segment lengths | Per primary and lateral root. Accuracy depends on centreline and resolution. |
+| Lateral count | Count of validated hierarchy nodes grouped by order | Deliberate `--max-laterals` caps make this a selected count, not a complete biological count. |
+| Tortuosity | Centreline length / endpoint chord length | Undefined when the chord is effectively zero. |
+| Diameter | Twice a smoothed local radius from assigned surface-to-centreline distances | A geometric estimate; touching roots and assignment errors can bias it. Mean, median, minimum, and maximum are reported. |
+| Per-root surface area | Mesh-triangle area partitioned by majority vertex label | Falls back to a centreline-frustum estimate for point clouds or roots lacking assigned faces. |
+| Whole-system surface area | Sum of original mesh triangle areas, or sum of per-root estimates when no mesh area is available | `root_system_surface_area_method` records `full_mesh_triangle_area` or `sum_per_root_surface_estimates`; biological accuracy still depends on reconstruction quality. |
+| Per-root volume | Consecutive centreline frustums using the estimated radius profile | Always labelled `centerline_frustum_estimate`; per-root values are not guaranteed to sum to the whole-mesh volume. |
+| Whole-system volume | Sum of absolute component-centred tetrahedral volumes for an edge-clean, consistently oriented closed mesh; otherwise the sum of per-root centreline-frustum estimates | The exact mesh value is used only when there are no boundary, non-manifold, degenerate, or orientation-inconsistent faces. `root_system_volume_method`, `root_system_volume_reliable`, and its reason distinguish the two cases. |
+| Confidence and QC | Attachment, tangent continuity, length/support, and tracing evidence | Review aids, not calibrated biological probabilities. |
+
+Disconnected components, boundary/non-manifold edges, degenerate faces, signed/absolute volume, retained fraction, and reduction reason are recorded in `metadata.json`.
+
+## Outputs
+
+Every run writes a self-contained output directory. Class-specific PLY files are omitted only when that class has no points.
+
+### Measurements and topology
+
+- `root_traits.csv`: one row per root with all measurements, units, methods, vectors, confidence, and QC.
+- `traits.xlsx`: sheets for Root traits, System summary, Length, Counts by order, Angles, Tortuosity, Surface area, Volume, Diameter, Vectors, Topology, QC, and Label map.
+- `csv/system_summary.csv`
+- `csv/root_lengths.csv`
+- `csv/lateral_counts_by_order.csv`
+- `csv/root_angles.csv`
+- `csv/root_tortuosity.csv`
+- `csv/root_surface_area.csv`
+- `csv/root_volume.csv`
+- `csv/root_diameter.csv`
+- `csv/angle_vectors.csv`
+- `csv/root_topology.csv`
+- `csv/root_qc.csv`
+- `csv/root_label_map.csv`: numeric PLY labels mapped to stable root IDs, parent IDs, orders, and colours, including `-2` uncertain and `-1` unassigned rows.
+- `primary_skeleton.csv` and `lateral_skeletons.csv`: centreline nodes with source-mesh `x,y,z` coordinates and explicit `mesh_unit` labels.
+- `root_hierarchy.json`: editable topology and polylines.
+- `root_system.rsml`: nested, hierarchy-preserving RSML with source-mesh geometry, `mesh_unit` labels, and selected properties.
+- `metadata.json`: configuration, provenance, primary candidates, mesh audit, topology report, stage timings, system summary, and output inventory.
+
+### Geometry and validation figures
+
+- `segmented_root_structure.ply`: full-resolution labelled vertices and original triangle faces.
+- `segmented_points.ply`: compatibility coloured point cloud for viewers that ignore custom PLY properties.
+- `primary_points.ply`, `lateral_points.ply`, `unassigned_points.ply`, and `uncertain_points.ply`.
+- `skeleton_original_overlay.ply`: coloured centreline samples over the original grey structure.
+- `overview.png`: 3D segmentation and skeleton overview.
+- `tip_gravity_front_view_600dpi.png`
+- `tip_start_gravity_front_view_600dpi.png`
+- `tip_primary_front_view_600dpi.png`
+- `tip_angles_front_view_600dpi.png`: compatibility alias of the tip–gravity figure.
+
+The labelled PLY stores RGB plus scalar properties `root_id`, `root_order`, and `assignment_state`. Numeric `root_id` is `0` for primary, positive for selected laterals, `-1` for unassigned, and `-2` for uncertain. `assignment_state` is `0` unassigned, `1` assigned, and `2` uncertain. For the unsigned `root_order` PLY field, `255` denotes unassigned and `254` denotes uncertain; use `csv/root_label_map.csv` rather than treating those sentinels as biological orders. The colours are:
+
+An **unassigned** point is either deliberately above the selected base or was not claimed by the segmented primary or by the support radius of any selected lateral. This commonly includes shoot/stem remnants, soil or pot fragments, disconnected noise, distant surface regions, or real roots that tracing did not retain. An **uncertain** point is different: it lies within assignment range but is nearly equally close to competing selected roots, so ownership is intentionally withheld. Counts for both states and the two unassigned categories are written to `metadata.json`; their fractions are included in the system summary.
+
+| Class | Colour |
+|---|---|
+| Primary / order 0 | Blue |
+| Order 1 | Red |
+| Order 2 | Green |
+| Order 3 | Purple |
+| Order 4+ | Gold |
+| Uncertain | Orange |
+| Unassigned/original background | Grey |
+
+## Resolution, runtime, and reduction policy
+
+Mesh loading uses the original mesh vertices rather than unconditional uniform resampling. With `--sample-points 0` (the default), all vertices are analysed unless a pilot calculation projects that full analysis will exceed the configured runtime or available-memory policy. If automatic reduction is required, the retained fraction cannot fall below `--minimum-retained-fraction` (25% by default). An explicit positive `--sample-points` value is a user-requested cap and can reduce earlier.
+
+Even when the analysis vertices are reduced, the original full vertices/faces are preserved for geometric audit and export, and labels are mapped back to them. Always inspect these metadata fields before comparing samples:
+
+- `source_geometry.analysis_reduced`
+- `source_geometry.retained_fraction`
+- `source_geometry.reduction_reason`
+- `source_geometry.projected_full_analysis_seconds`
+- `stage_timings_seconds`
+
+The 30-minute policy is a projection, not a hard deadline. Topology complexity, disconnected components, and lateral-candidate count can make an individual stage slower than the pilot estimate.
+
+## Validation status and supplied samples
+
+The external test folder `E:\Seafile\Test files for BioInsAlgo` contains six matched STL/PLY soybean-root pairs (12 files, about 229 MiB): BaxiNo2 4-2, Kaixinlv 3-2, SN14 6-2, w5168-3 m4-2, W82 9cm water 1-2, and W82 MS4-2. The meshes span roughly 101,000–526,000 vertices and include disconnected and, in some samples, non-manifold components. Both binary STL and binary PLY ingestion paths were audited.
+
+A final full-resolution suite ran all six PLY samples without reduction or a lateral-count cap. Per-run metadata recorded 11.91–59.83 seconds on the development machine for 101,102–526,324 vertices; the six runs completed in 156 seconds wall time including all 600-dpi figures and exports. Every run produced all 30 declared artefacts, and all six RSML files passed the official [RootSystemML XSD](https://raw.githubusercontent.com/RootSystemML/RSMLValidator/master/rsml.xsd). A separate matched BaxiNo2 STL run produced the same per-root rows as its PLY input. These are engineering/performance and contract checks, not biological ground truth: automatic counts, orders, assigned fraction, and any future physical calibration still require expert validation.
+
+The 62-test automated suite covers synthetic end-to-end export, above-base assignment exclusion, directional angles, primary candidate ranking, higher-order junction ground truth, hierarchy invariants and corrections, RSML nesting, XLSX/CSV contracts, labelled PLY properties, 600-dpi figures, metadata, scheduling, and hardware allocation. A production-path smoke test also completed two real samples concurrently through `BatchScheduler` with four threads per sample and verified both complete export bundles. Measurement-quality validation still requires expert annotation or manual measurements for each genotype, age, scan protocol, and reconstruction workflow.
+
+## Known limitations
+
+- Inputs should contain reconstructed root tissue only. Soil, pot, shoot, labels, and reconstruction artefacts can be mistaken for roots.
+- Root touching/merging and gaps can create ambiguous topology; use confidence/QC and the editable hierarchy.
+- The automatic primary scorer assumes the coordinate system has meaningful Z orientation and gravity is `(0,0,-1)`.
+- Fine laterals below the reconstruction/mesh resolution cannot be recovered reliably.
+- Per-root diameter and volume are centreline/assignment estimates, not voxel-exact organ measurements.
+- The GUI is currently Tk-based and the compute path is CPU based. GPU discovery is informational.
+- STL contains no portable unit standard. Source-unit hints may be recorded as provenance, but this temporary build does not apply them to traits or thresholds.
+
+## Research lineage and licensing
+
+The only direct source-code lineage claimed by this tree is the MIT-licensed BioInsAlgo baseline. P3D is also MIT licensed, but was used as a design/algorithm reference rather than copied into this Python implementation. Repositories without an explicit software license and GPL-licensed projects were treated as reference-only; their code is not incorporated here. Publication open-access terms do not grant a software license.
+
+The methods considered include Zhou et al. (2025), 4DRoot, TopoRoot/TopoRoot+, P3D, DIRT/3D, Rootine, archiDART, DynamicRoots, GiA Roots/Gia3D, RooTh/RooTrak, VRoot, RootForce, open_iA, and the 2025 3D plant-root skeleton preprint. Their concrete relevance and license boundaries are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Citation metadata for the original BioInsAlgo paper focus is also available in [CITATION.cff](CITATION.cff) and [references.bib](references.bib).
+
+## License
+
+SoyRootBio/BioInsAlgo is distributed under the [MIT License](LICENSE). Scientific validity and fitness for a particular experiment are not guaranteed; retain metadata and validation artefacts with every reported result.

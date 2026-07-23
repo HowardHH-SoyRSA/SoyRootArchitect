@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 import time
@@ -10,6 +11,44 @@ import pandas as pd
 
 from .io import load_root_geometry_with_progress
 from .types import PointCloudData
+
+
+@dataclass(frozen=True)
+class PrimaryGuidance:
+    """Manual biological constraints selected from the 3-D point cloud."""
+
+    start: np.ndarray
+    end: np.ndarray
+    soil_z: float | None
+    guides: np.ndarray
+    use_endpoints: bool = True
+
+
+def _wheel_zoom_factor(button, step: float | int | None = None) -> float | None:
+    """Normalize Matplotlib wheel events across Tk/backend variants."""
+
+    numeric_step = 0.0 if step is None else float(step)
+    if button == "up" or numeric_step > 0.0:
+        return 0.75
+    if button == "down" or numeric_step < 0.0:
+        return 1.35
+    return None
+
+
+def _zoom_3d_axis(axis, factor: float, canvas=None) -> None:
+    """Scale all three visible limits about their current centres."""
+
+    for getter, setter in (
+        (axis.get_xlim, axis.set_xlim),
+        (axis.get_ylim, axis.set_ylim),
+        (axis.get_zlim, axis.set_zlim),
+    ):
+        lower, upper = getter()
+        center = (lower + upper) / 2.0
+        half = max((upper - lower) * float(factor) / 2.0, 1e-12)
+        setter(center - half, center + half)
+    if canvas is not None:
+        canvas.draw_idle()
 
 
 def select_primary_endpoints_gui(
@@ -302,12 +341,7 @@ def _run_endpoint_picker(
     def zoom(factor: float) -> None:
         if display_points is None:
             return
-        for getter, setter in ((axis.get_xlim, axis.set_xlim), (axis.get_ylim, axis.set_ylim), (axis.get_zlim, axis.set_zlim)):
-            lower, upper = getter()
-            center = (lower + upper) / 2.0
-            half = max((upper - lower) * float(factor) / 2.0, 1e-12)
-            setter(center - half, center + half)
-        figure.canvas.draw_idle()
+        _zoom_3d_axis(axis, factor, figure.canvas)
 
     def begin_load(_event=None) -> None:
         if input_path is None:
@@ -466,10 +500,9 @@ def _run_endpoint_picker(
     def on_scroll(event) -> None:
         if event.inaxes is not axis:
             return
-        if event.button == "up":
-            zoom(0.75)
-        elif event.button == "down":
-            zoom(1.35)
+        factor = _wheel_zoom_factor(event.button, getattr(event, "step", None))
+        if factor is not None:
+            zoom(factor)
 
     def reset_selection(_event=None) -> None:
         clear_selection(clear_boxes=True)
@@ -641,3 +674,215 @@ def _validate_endpoint(point: np.ndarray, name: str) -> np.ndarray:
     if point.shape != (3,) or not np.all(np.isfinite(point)):
         raise ValueError(f"{name} endpoint must contain three finite coordinates.")
     return point
+
+
+def select_primary_guidance_from_file_gui(
+    path: str | Path,
+    sample_points: int | None = None,
+    max_display_points: int = 30000,
+    title: str = "Select primary-root guidance",
+    random_seed: int | None = 42,
+) -> tuple[PointCloudData, PrimaryGuidance, int]:
+    """Pick endpoints, optional primary sections, and a horizontal soil line."""
+
+    effective_samples = 0 if sample_points is None else int(sample_points)
+    cloud, start, end, loaded_samples = select_primary_endpoints_from_file_gui(
+        path,
+        sample_points=max(10, effective_samples) if effective_samples else 50000,
+        max_display_points=max_display_points,
+        title=title,
+        random_seed=random_seed,
+    )
+    soil_z, guides = select_primary_sections_gui(
+        cloud.points,
+        start=start,
+        end=end,
+        max_display_points=max_display_points,
+        title=f"{title} — soil line and primary sections",
+        random_seed=random_seed,
+    )
+    return cloud, PrimaryGuidance(start, end, soil_z, guides, True), loaded_samples
+
+
+def select_soil_guidance_from_file_gui(
+    path: str | Path,
+    sample_points: int | None = None,
+    max_display_points: int = 30000,
+    title: str = "Select soil line and primary-root sections",
+    random_seed: int | None = 42,
+) -> tuple[PointCloudData, PrimaryGuidance, int]:
+    """Select a soil line/sections while leaving endpoints to the scorer."""
+
+    effective_samples = 0 if sample_points is None else int(sample_points)
+    display_sample_count = max(10, effective_samples) if effective_samples else 50000
+    cloud = load_root_geometry_with_progress(
+        path,
+        sample_points=display_sample_count,
+        random_seed=random_seed,
+    )
+    heights = cloud.points[:, 2]
+    start = cloud.points[int(np.argmax(heights))].copy()
+    end = cloud.points[int(np.argmin(heights))].copy()
+    soil_z, guides = select_primary_sections_gui(
+        cloud.points,
+        start=start,
+        end=end,
+        max_display_points=max_display_points,
+        title=title,
+        random_seed=random_seed,
+    )
+    if soil_z is None:
+        raise ValueError("Soil-guided scoring requires a selected soil line.")
+    return cloud, PrimaryGuidance(start, end, soil_z, guides, False), display_sample_count
+
+
+def select_primary_sections_gui(
+    points: np.ndarray,
+    *,
+    start: np.ndarray,
+    end: np.ndarray,
+    max_display_points: int = 30000,
+    title: str = "Select soil line and primary-root sections",
+    random_seed: int | None = 42,
+) -> tuple[float | None, np.ndarray]:
+    """Select any number of primary guide sections and one soil-line height.
+
+    Shift-clicking chooses the nearest visible cloud point.  In ``Guide
+    section`` mode every click adds an ordered constraint; in ``Soil line``
+    mode the point's Z coordinate defines the horizontal soil surface.
+    """
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import Button, RadioButtons
+        from mpl_toolkits.mplot3d import proj3d
+    except ImportError as exc:
+        raise ImportError("matplotlib is required for primary-section selection") from exc
+
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 2:
+        raise ValueError("Primary-section selection requires XYZ points")
+    rng = np.random.default_rng(random_seed)
+    display_indices = (
+        rng.choice(len(points), size=max_display_points, replace=False)
+        if len(points) > max_display_points
+        else np.arange(len(points))
+    )
+    display = points[display_indices]
+    state: dict[str, object] = {
+        "mode": "Guide section",
+        "guides": [],
+        "soil_z": None,
+        "saved": False,
+    }
+    figure = plt.figure(figsize=(11.5, 8.0))
+    figure.canvas.manager.set_window_title(title)
+    axis = figure.add_axes([0.04, 0.08, 0.72, 0.86], projection="3d")
+
+    def redraw(*, preserve_view: bool = True) -> None:
+        view_limits = None
+        view_angles = None
+        if preserve_view and axis.has_data():
+            view_limits = (axis.get_xlim(), axis.get_ylim(), axis.get_zlim())
+            view_angles = (axis.elev, axis.azim)
+        axis.clear()
+        axis.scatter(display[:, 0], display[:, 1], display[:, 2], s=0.45, c="#777777", alpha=0.18)
+        axis.scatter([start[0]], [start[1]], [start[2]], s=45, c="#0b57d0", marker="o", label="Base")
+        axis.scatter([end[0]], [end[1]], [end[2]], s=45, c="#8b1a1a", marker="^", label="Tip")
+        guides = state["guides"]
+        if guides:
+            guide_array = np.asarray(guides)
+            axis.scatter(guide_array[:, 0], guide_array[:, 1], guide_array[:, 2], s=38, c="#8a2be2", marker="D")
+            for index, point in enumerate(guide_array, start=1):
+                axis.text(point[0], point[1], point[2], f"G{index}", fontsize=8, color="#6b14a8")
+        soil_z = state["soil_z"]
+        if soil_z is not None:
+            x0, x1 = float(points[:, 0].min()), float(points[:, 0].max())
+            y0, y1 = float(points[:, 1].min()), float(points[:, 1].max())
+            axis.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], [soil_z] * 5, c="#16833f", lw=1.4)
+            axis.text(x0, y0, soil_z, f"soil Z={soil_z:.6g}", color="#16833f")
+        axis.set_xlabel("X")
+        axis.set_ylabel("Y")
+        axis.set_zlabel("Z")
+        axis.set_box_aspect(np.maximum(np.ptp(points, axis=0), 1e-6))
+        if view_limits is not None:
+            axis.set_xlim(view_limits[0])
+            axis.set_ylim(view_limits[1])
+            axis.set_zlim(view_limits[2])
+            axis.view_init(elev=view_angles[0], azim=view_angles[1])
+        axis.legend(loc="upper right")
+        figure.canvas.draw_idle()
+
+    redraw(preserve_view=False)
+    figure.text(
+        0.79,
+        0.89,
+        "Shift + left-click a visible point.\nDrag normally to rotate; wheel zooms.\nGuides constrain the primary path.",
+        fontsize=9,
+        va="top",
+    )
+    radio = RadioButtons(figure.add_axes([0.79, 0.66, 0.19, 0.15]), ("Guide section", "Soil line"))
+    undo_button = Button(figure.add_axes([0.79, 0.53, 0.19, 0.055]), "Undo guide")
+    clear_soil_button = Button(figure.add_axes([0.79, 0.45, 0.19, 0.055]), "Clear soil line")
+    save_button = Button(figure.add_axes([0.79, 0.28, 0.19, 0.065]), "Save guidance")
+    skip_button = Button(figure.add_axes([0.79, 0.19, 0.19, 0.055]), "No guides / soil")
+
+    def on_mode(label: str) -> None:
+        state["mode"] = label
+
+    def on_click(event) -> None:
+        if event.inaxes is not axis or event.button != 1 or event.key != "shift":
+            return
+        projected_x, projected_y, _ = proj3d.proj_transform(
+            display[:, 0], display[:, 1], display[:, 2], axis.get_proj()
+        )
+        screen = axis.transData.transform(np.column_stack([projected_x, projected_y]))
+        distance = np.linalg.norm(screen - np.array([event.x, event.y]), axis=1)
+        selected = display[int(np.argmin(distance))].copy()
+        if state["mode"] == "Soil line":
+            state["soil_z"] = float(selected[2])
+        else:
+            state["guides"].append(selected)
+        redraw()
+
+    def on_scroll(event) -> None:
+        if event.inaxes is not axis:
+            return
+        factor = _wheel_zoom_factor(event.button, getattr(event, "step", None))
+        if factor is not None:
+            _zoom_3d_axis(axis, factor, figure.canvas)
+
+    def undo(_event) -> None:
+        guides = state["guides"]
+        if guides:
+            guides.pop()
+            redraw()
+
+    def clear_soil(_event) -> None:
+        state["soil_z"] = None
+        redraw()
+
+    def save(_event) -> None:
+        state["saved"] = True
+        plt.close(figure)
+
+    def skip(_event) -> None:
+        state["guides"] = []
+        state["soil_z"] = None
+        state["saved"] = True
+        plt.close(figure)
+
+    radio.on_clicked(on_mode)
+    undo_button.on_clicked(undo)
+    clear_soil_button.on_clicked(clear_soil)
+    save_button.on_clicked(save)
+    skip_button.on_clicked(skip)
+    figure.canvas.mpl_connect("button_press_event", on_click)
+    figure.canvas.mpl_connect("scroll_event", on_scroll)
+    plt.show(block=True)
+    if not state["saved"]:
+        raise RuntimeError("Primary guidance selection was closed before saving")
+    guides = np.asarray(state["guides"], dtype=float)
+    if not len(guides):
+        guides = np.empty((0, 3), dtype=float)
+    return state["soil_z"], guides

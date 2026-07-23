@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soybean-root-bio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bio-inspired 3D soybean root skeletonization and phenotyping from VG Studio point clouds or meshes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,9 @@ dependencies = [
   "networkx",
   "pandas",
   "matplotlib",
+  "openpyxl",
+  "psutil",
+  "tkinterdnd2",
 ]
 
 [project.optional-dependencies]

@@ -20,12 +20,13 @@ def generate_synthetic_taproot(
     reproducing CT surface complexity.
     """
     rng = np.random.default_rng(seed)
-    z = np.linspace(0.0, 1.0, primary_points)
+    # Ordered collar-to-tip to match the fixed gravity vector (0, 0, -1).
+    z = np.linspace(1.0, 0.0, primary_points)
     primary = np.column_stack([np.zeros_like(z), np.zeros_like(z), z])
     primary += rng.normal(scale=noise, size=primary.shape)
 
     branches = [primary]
-    anchors = np.linspace(0.24, 0.78, lateral_count)
+    anchors = np.linspace(0.78, 0.24, lateral_count)
     for branch_id, anchor_z in enumerate(anchors):
         length = 0.22 + 0.08 * (branch_id % 2)
         t = np.linspace(0.0, 1.0, lateral_points)
@@ -33,7 +34,7 @@ def generate_synthetic_taproot(
         angle = 0.48 + 0.13 * branch_id
         x = side * length * np.sin(angle) * t
         y = 0.04 * np.sin(np.pi * t + branch_id)
-        branch_z = anchor_z + length * np.cos(angle) * t
+        branch_z = anchor_z - length * np.cos(angle) * t
         branch = np.column_stack([x, y, branch_z])
         branch += rng.normal(scale=noise, size=branch.shape)
         branches.append(branch)
