@@ -103,7 +103,7 @@ def test_batch_gui_source_exposes_required_controls():
         "Interactive endpoints + sections",
         "Analysis vertex cap",
         "Display points",
-        "Tip vector window (mesh units)",
+        "Angle vector window (mesh units)",
         "Concurrent samples",
         "Threads / sample",
         "Start batch",

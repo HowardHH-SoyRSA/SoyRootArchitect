@@ -313,11 +313,11 @@ def _surface_samples(path: np.ndarray, radius: float) -> np.ndarray:
 def test_traits_preserve_directional_angles_and_vector_coordinates():
     primary = np.array(
         [
-            [-1.0, 0.0, 1.0],
-            [-0.5, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.5],
             [0.0, 0.0, 0.0],
-            [0.5, 0.0, 0.0],
-            [1.0, 0.0, -1.0],
+            [0.0, 0.0, -0.5],
+            [0.0, 0.0, -1.0],
         ]
     )
     lateral_points = np.array(
@@ -375,7 +375,7 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
         "gravity_dy",
         "gravity_dz",
     }
-    for prefix in ("tip_vector", "tip_start_vector", "primary_vector"):
+    for prefix in ("tip_vector", "tip_start_vector", "base_vector", "primary_vector"):
         required_columns.update(
             {
                 f"{prefix}_start_x",
@@ -402,7 +402,12 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
     assert np.all((row[angle_columns].to_numpy(dtype=float) <= 180.0))
     assert row["tip_gravity_angle_deg"] == pytest.approx(135.0)
     assert row["tip_start_gravity_angle_deg"] == pytest.approx(90.0)
-    assert row["tip_primary_angle_deg"] == pytest.approx(90.0)
+    # The lateral starts downwards at 45° to the downward primary tangent but
+    # bends upwards at its tip.  This distinguishes the requested start-based
+    # primary angle from the former 135° tip-based definition.
+    assert row["tip_primary_angle_deg"] == pytest.approx(45.0)
+    assert row["tip_angle_primary_deg"] == pytest.approx(45.0)
+    assert row["tip_angle_parent_deg"] == pytest.approx(135.0)
     assert row["tortuosity"] == pytest.approx(np.sqrt(2.0))
     assert row["mean_diameter"] == pytest.approx(0.02)
     assert row["length_unit"] == "mesh_unit"
@@ -422,8 +427,12 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
         [0.0, 1.0, 0.0],
     )
     np.testing.assert_allclose(
+        row[["base_vector_dx", "base_vector_dy", "base_vector_dz"]].to_numpy(dtype=float),
+        [0.0, 0.25, -0.25],
+    )
+    np.testing.assert_allclose(
         row[["primary_vector_dx", "primary_vector_dy", "primary_vector_dz"]].to_numpy(dtype=float),
-        [(1.0 + np.sqrt(5.0)) / 4.0, 0.0, 0.0],
+        [0.0, 0.0, -0.5],
     )
     np.testing.assert_allclose(
         row[["gravity_dx", "gravity_dy", "gravity_dz"]].to_numpy(dtype=float),

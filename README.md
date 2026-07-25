@@ -129,7 +129,7 @@ Useful options include:
 - `--graph-k N` (default 14)
 - `--runtime-limit-minutes M` (default 30)
 - `--minimum-retained-fraction F` (default 0.25)
-- `--tip-window-mesh-units W` (default 2.0), the source-mesh arc-length window used for local tip and reference directions
+- `--tip-window-mesh-units W` (default 2.0), the source-mesh arc-length window used for local tip, lateral-start, and primary-reference directions
 
 Run `soyrootbio run --help` for the authoritative option list.
 
@@ -185,11 +185,11 @@ For an oriented lateral centreline `p[0] ... p[n-1]`:
 
 - **Tip–gravity** (`tip_gravity_angle_deg`): angle between the lateral tip tangent and **g**. The tangent points toward `p[n-1]` and is interpolated over the final source-mesh arc-length window selected by `--tip-window-mesh-units`.
 - **Tip-start–gravity** (`tip_start_gravity_angle_deg`): angle between the vector `p[n-1] - p[0]` and **g**.
-- **Tip–primary** (`tip_primary_angle_deg`): angle between the lateral tip tangent and the ordered primary-root tangent, interpolated over the same mesh-unit window around the lateral insertion location.
+- **Lateral-start–primary** (`tip_primary_angle_deg`, historical column name): angle between the lateral tangent over the first mesh-unit window from `p[0]` and the ordered primary-root tangent interpolated around the lateral insertion location.
 
-The requested mesh-unit window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_requested_window` and `tip_vector_arc_window` record the requested and effective lateral-tip windows, and `tip_vector_window_unit` is `mesh_unit`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in source mesh units, the local primary reference vector, and gravity components.
+The requested mesh-unit window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_*` records the lateral-tip window and `base_vector_*` records the lateral-start window; both use `mesh_unit`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in source mesh units, the local primary reference vector, and gravity components.
 
-Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, and `Primary`. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
+Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, `Start`, and `Primary` as applicable. In the lateral-start–primary view, both rays originate at the lateral insertion; the name and angle label remains connected to the root tip. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
 
 ## Trait definitions and units
 
@@ -243,8 +243,7 @@ Every run writes a self-contained output directory. Class-specific PLY files are
 - `overview.png`: 3D segmentation and skeleton overview.
 - `tip_gravity_front_view_600dpi.png`
 - `tip_start_gravity_front_view_600dpi.png`
-- `tip_primary_front_view_600dpi.png`
-- `tip_angles_front_view_600dpi.png`: compatibility alias of the tip–gravity figure.
+- `tip_primary_front_view_600dpi.png`: lateral-start vector versus the local primary-root tangent; the filename is retained for compatibility.
 
 The labelled PLY stores RGB plus scalar properties `root_id`, `root_order`, and `assignment_state`. Numeric `root_id` is `0` for primary, positive for selected laterals, `-1` for unassigned, and `-2` for uncertain. `assignment_state` is `0` unassigned, `1` assigned, and `2` uncertain. For the unsigned `root_order` PLY field, `255` denotes unassigned and `254` denotes uncertain; use `csv/root_label_map.csv` rather than treating those sentinels as biological orders. The colours are:
 

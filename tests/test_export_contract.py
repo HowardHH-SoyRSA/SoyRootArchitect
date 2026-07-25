@@ -45,6 +45,18 @@ TRAIT_CSV_COLUMNS = {
         "tip_gravity_angle_deg",
         "tip_start_gravity_angle_deg",
         "tip_primary_angle_deg",
+        "base_vector_start_x",
+        "base_vector_start_y",
+        "base_vector_start_z",
+        "base_vector_end_x",
+        "base_vector_end_y",
+        "base_vector_end_z",
+        "base_vector_dx",
+        "base_vector_dy",
+        "base_vector_dz",
+        "base_vector_requested_window",
+        "base_vector_arc_window",
+        "base_vector_window_unit",
     },
     "root_topology.csv": {"root_id", "parent_id", "root_order"},
     "root_qc.csv": {"root_id", "confidence", "qc_flags"},
@@ -184,7 +196,16 @@ def test_trait_workbook_and_per_trait_csv_contract(
         "Surface area": {"root_id", "surface_area", "area_unit"},
         "Volume": {"root_id", "volume", "volume_unit"},
         "Diameter": {"root_id", "mean_diameter", "length_unit"},
-        "Vectors": {"root_id", "root_start_x", "root_tip_x"},
+        "Vectors": {
+            "root_id",
+            "root_start_x",
+            "root_tip_x",
+            "base_vector_start_x",
+            "base_vector_end_x",
+            "base_vector_dx",
+            "base_vector_arc_window",
+            "base_vector_window_unit",
+        },
         "Topology": {"root_id", "parent_id", "root_order"},
         "QC": {"root_id", "confidence", "qc_flags"},
         "Label map": {"numeric_label", "root_id", "root_order"},
@@ -303,6 +324,7 @@ def test_angle_figures_are_pngs_at_approximately_600_dpi(
     synthetic_export: tuple[Path, Path, PipelineResult],
 ) -> None:
     _, output_dir, _ = synthetic_export
+    assert not (output_dir / "tip_angles_front_view_600dpi.png").exists()
     for filename in ANGLE_FIGURES:
         path = output_dir / filename
         assert path.is_file() and path.stat().st_size > 0

@@ -3,7 +3,6 @@
 from pathlib import Path
 import os
 import re
-import shutil
 import tempfile
 import threading
 
@@ -163,7 +162,7 @@ def _save_angle_front_views(
         (
             "tip_primary_front_view_600dpi.png",
             "tip_primary_angle_deg",
-            "Tip vector vs primary-root tangent",
+            "Lateral-start vector vs primary-root tangent",
             "tip_primary",
         ),
     ]
@@ -182,12 +181,10 @@ def _save_angle_front_views(
             gravity=np.asarray(gravity, dtype=float),
             max_points=max_points,
         )
-    # Retain the historical filename as a compatibility alias to the corrected
-    # gravity figure; the three named files above are the authoritative outputs.
-    shutil.copy2(
-        output_dir / "tip_gravity_front_view_600dpi.png",
-        output_dir / "tip_angles_front_view_600dpi.png",
-    )
+    # This historical alias was a byte-for-byte copy of the tip-gravity figure.
+    # Do not emit it, and remove a stale copy when this helper is used directly
+    # on an existing output directory.
+    (output_dir / "tip_angles_front_view_600dpi.png").unlink(missing_ok=True)
 
 
 def save_tip_angle_front_view(
@@ -420,7 +417,12 @@ def _save_one_angle_front_view(
 def _angle_vector_legend_spec(mode: str) -> list[tuple[str, str]]:
     """Return compact legend entries for vectors that are actually displayed."""
 
-    vector_label = "S–T" if mode == "tip_start_gravity" else "Tip"
+    if mode == "tip_start_gravity":
+        vector_label = "S–T"
+    elif mode == "tip_primary":
+        vector_label = "Start"
+    else:
+        vector_label = "Tip"
     entries = [("#b00020", vector_label)]
     if mode == "tip_primary":
         entries.append(("#14833b", "Primary"))
@@ -594,22 +596,28 @@ def _draw_angle_vectors(
 
     span = min(4, len(path) - 1)
     tip_start = path[-1 - span] if span > 0 else tip
-    tip_vector = recorded_vector("tip_vector", tip - tip_start)
-    tip_unit = tip_vector / max(np.linalg.norm(tip_vector), 1e-12)
+    measured_vector = recorded_vector("tip_vector", tip - tip_start)
+    vector_origin = tip
     if mode == "tip_start_gravity":
         start = path[0]
-        vector = recorded_vector("tip_start_vector", tip - start)
-        tip_unit = vector / max(np.linalg.norm(vector), 1e-12)
+        measured_vector = recorded_vector("tip_start_vector", tip - start)
+    elif mode == "tip_primary":
+        vector_origin = path[0]
+        start_end = path[span] if span > 0 else vector_origin
+        measured_vector = recorded_vector(
+            "base_vector",
+            start_end - vector_origin,
+        )
+    measured_unit = measured_vector / max(np.linalg.norm(measured_vector), 1e-12)
 
-    # Both rays originate at the tip and point in the same directions used by
-    # the numerical angle calculation.  Drawing the path segment into the tip
-    # would display the supplementary angle even though the arrow itself points
-    # toward the tip.
-    vector_end = tip + tip_unit * scale
+    # The gravity views place the measured direction at the root tip.  The
+    # start-primary view places both rays at the lateral insertion so the
+    # artwork matches the numerical angle definition.
+    vector_end = vector_origin + measured_unit * scale
     ax.annotate(
         "",
         xy=(vector_end[0], vector_end[2]),
-        xytext=(tip[0], tip[2]),
+        xytext=(vector_origin[0], vector_origin[2]),
         arrowprops={
             "arrowstyle": "->",
             "color": "#b00020",
@@ -630,11 +638,11 @@ def _draw_angle_vectors(
         tangent_vectors(primary_path)[int(primary_index)],
     )
     primary_vector /= max(np.linalg.norm(primary_vector), 1e-12)
-    reference_end = tip + primary_vector * scale
+    reference_end = vector_origin + primary_vector * scale
     ax.annotate(
         "",
         xy=(reference_end[0], reference_end[2]),
-        xytext=(tip[0], tip[2]),
+        xytext=(vector_origin[0], vector_origin[2]),
         arrowprops={
             "arrowstyle": "->",
             "color": "#14833b",

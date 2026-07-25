@@ -54,6 +54,9 @@ def vector_fixture() -> tuple[RootPath, np.ndarray, dict[str, float]]:
         "tip_start_vector_dx": 1.0,
         "tip_start_vector_dy": 0.0,
         "tip_start_vector_dz": 0.0,
+        "base_vector_dx": 1.0,
+        "base_vector_dy": 0.0,
+        "base_vector_dz": -1.0,
         "primary_vector_dx": 0.0,
         "primary_vector_dy": 0.0,
         "primary_vector_dz": -1.0,
@@ -88,7 +91,7 @@ def test_gravity_angle_views_draw_only_the_measured_lateral_vector(
     np.testing.assert_allclose(np.asarray(arrow["xy"]) - tip_xz, [0.1, 0.0])
 
 
-def test_primary_angle_view_retains_both_required_vectors(
+def test_primary_angle_view_uses_lateral_start_and_primary_vectors_at_insertion(
     vector_fixture: tuple[RootPath, np.ndarray, dict[str, float]],
 ) -> None:
     lateral, primary, traits = vector_fixture
@@ -112,6 +115,19 @@ def test_primary_angle_view_retains_both_required_vectors(
         == pytest.approx(_ANGLE_ARROW_MUTATION_SCALE)
         for item in axis.annotations
     )
+    insertion_xz = lateral.points[0, [0, 2]]
+    red_arrow = axis.annotations[0]["kwargs"]
+    green_arrow = axis.annotations[1]["kwargs"]
+    np.testing.assert_allclose(red_arrow["xytext"], insertion_xz)
+    np.testing.assert_allclose(green_arrow["xytext"], insertion_xz)
+    np.testing.assert_allclose(
+        np.asarray(red_arrow["xy"]) - insertion_xz,
+        np.array([1.0, -1.0]) / np.sqrt(2.0) * 0.1,
+    )
+    np.testing.assert_allclose(
+        np.asarray(green_arrow["xy"]) - insertion_xz,
+        [0.0, -0.1],
+    )
 
 
 def test_angle_vector_legends_are_compact_and_match_visible_vectors() -> None:
@@ -120,7 +136,7 @@ def test_angle_vector_legends_are_compact_and_match_visible_vectors() -> None:
     assert _angle_vector_legend_spec("tip_gravity") == [("#b00020", "Tip")]
     assert _angle_vector_legend_spec("tip_start_gravity") == [("#b00020", "S–T")]
     assert _angle_vector_legend_spec("tip_primary") == [
-        ("#b00020", "Tip"),
+        ("#b00020", "Start"),
         ("#14833b", "Primary"),
     ]
 

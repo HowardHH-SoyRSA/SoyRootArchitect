@@ -46,7 +46,7 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert "tip_angle_z_deg" in traits.columns
     assert (output_dir / "metadata.json").exists()
     assert (output_dir / "overview.png").exists()
-    assert (output_dir / "tip_angles_front_view_600dpi.png").exists()
+    assert not (output_dir / "tip_angles_front_view_600dpi.png").exists()
     assert (output_dir / "tip_gravity_front_view_600dpi.png").exists()
     assert (output_dir / "tip_start_gravity_front_view_600dpi.png").exists()
     assert (output_dir / "tip_primary_front_view_600dpi.png").exists()

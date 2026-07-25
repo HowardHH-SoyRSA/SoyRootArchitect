@@ -33,7 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-root-order", type=int, default=3, help="Trace laterals recursively up to this root order.")
     run.add_argument("--runtime-limit-minutes", type=float, default=30.0, help="Projected runtime threshold before limited analysis reduction is allowed.")
     run.add_argument("--minimum-retained-fraction", type=float, default=0.25, help="Smallest automatic fraction of mesh vertices to retain (0-1).")
-    run.add_argument("--tip-window-mesh-units", type=float, default=2.0, help="Arc-length window, in source mesh units, used for tip direction vectors.")
+    run.add_argument(
+        "--tip-window-mesh-units",
+        type=float,
+        default=2.0,
+        help="Arc-length window, in source mesh units, used for local tip, lateral-start, and primary-reference vectors.",
+    )
 
     synth = subparsers.add_parser("generate-synthetic", help="Write a synthetic taproot point cloud and endpoint file.")
     synth.add_argument("--output", required=True, type=Path, help="Output CSV/XYZ-style point cloud path.")
