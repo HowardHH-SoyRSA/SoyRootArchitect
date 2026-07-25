@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 
+import soyrootbio.visualize as visualize
 from soyrootbio.types import RootPath
 from soyrootbio.visualize import (
     _ANGLE_ARROW_MUTATION_SCALE,
     _ANGLE_VECTOR_SCALE_FRACTION,
+    _ORDER1_ANGLE_MIN_LENGTH_MESH_UNITS,
+    _ORDER2_ANGLE_MIN_LENGTH_MESH_UNITS,
     _adaptive_angle_label_font_size,
     _angle_label_route,
     _angle_vector_legend_spec,
@@ -15,6 +21,7 @@ from soyrootbio.visualize import (
     _draw_angle_vectors,
     _format_angle_tip_label,
     _ordered_angle_label_layout,
+    _show_angle_for_lateral,
 )
 
 
@@ -139,6 +146,148 @@ def test_angle_vector_legends_are_compact_and_match_visible_vectors() -> None:
         ("#b00020", "Start"),
         ("#14833b", "Primary"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("order", "length", "expected"),
+    [
+        (1, 3.499, False),
+        (1, 3.5, True),
+        (1, 8.0, True),
+        (2, 1.299, False),
+        (2, 1.3, True),
+        (2, 4.0, True),
+        (3, 0.25, True),
+    ],
+)
+def test_short_order1_and_order2_roots_hide_angles_below_mesh_unit_limits(
+    order: int,
+    length: float,
+    expected: bool,
+) -> None:
+    lateral = RootPath(
+        root_id=f"root-o{order}-001",
+        points=np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]]),
+        order=order,
+    )
+
+    assert _ORDER1_ANGLE_MIN_LENGTH_MESH_UNITS == pytest.approx(3.5)
+    assert _ORDER2_ANGLE_MIN_LENGTH_MESH_UNITS == pytest.approx(1.3)
+    assert _show_angle_for_lateral(
+        lateral,
+        {"length": length, "length_unit": "mesh_unit"},
+    ) is expected
+
+
+def test_angle_visibility_uses_reported_mesh_length_not_normalized_path_length() -> None:
+    lateral = RootPath(
+        root_id="root-o1-001",
+        points=np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]]),
+        order=1,
+    )
+
+    assert lateral.length < _ORDER1_ANGLE_MIN_LENGTH_MESH_UNITS
+    assert _show_angle_for_lateral(
+        lateral,
+        {"length": 3.5, "length_unit": "mesh_unit"},
+    )
+    assert _show_angle_for_lateral(lateral, {})  # Preserve legacy fallback.
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["tip_gravity", "tip_start_gravity", "tip_primary"],
+)
+def test_angle_front_views_skip_short_order1_and_order2_annotations_and_vectors(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import matplotlib.figure
+
+    laterals = [
+        RootPath(
+            "root-o1-001",
+            np.array([[-0.6, 0.0, 0.8], [-0.5, 0.0, 0.5]]),
+            order=1,
+        ),
+        RootPath(
+            "root-o1-002",
+            np.array([[0.0, 0.0, 0.8], [0.2, 0.0, 0.4]]),
+            order=1,
+        ),
+        RootPath(
+            "root-o2-001",
+            np.array([[0.4, 0.0, 0.7], [0.7, 0.0, 0.2]]),
+            order=2,
+        ),
+        RootPath(
+            "root-o2-002",
+            np.array([[0.6, 0.0, 0.7], [0.9, 0.0, 0.1]]),
+            order=2,
+        ),
+    ]
+    points = np.vstack(
+        [
+            np.array([[-0.1, 0.0, 1.0], [-0.1, 0.0, 0.0]]),
+            *(lateral.points for lateral in laterals),
+        ]
+    )
+    primary_mask = np.zeros(len(points), dtype=bool)
+    primary_mask[:2] = True
+    lateral_labels = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+    traits = pd.DataFrame(
+        [
+            {"root_id": "root-o1-001", "length": 3.49, "angle": 10.0},
+            {"root_id": "root-o1-002", "length": 3.5, "angle": 20.0},
+            {"root_id": "root-o2-001", "length": 1.29, "angle": 30.0},
+            {"root_id": "root-o2-002", "length": 1.3, "angle": 40.0},
+        ]
+    )
+    vector_calls: list[str] = []
+    annotation_calls: list[str] = []
+
+    monkeypatch.setattr(
+        visualize,
+        "_draw_angle_vectors",
+        lambda _axis, lateral, *_args, **_kwargs: vector_calls.append(
+            lateral.root_id
+        ),
+    )
+    monkeypatch.setattr(
+        visualize,
+        "_annotate_angle_tip",
+        lambda _axis, lateral, *_args, **_kwargs: annotation_calls.append(
+            lateral.root_id
+        ),
+    )
+    monkeypatch.setattr(
+        matplotlib.figure.Figure,
+        "savefig",
+        lambda *_args, **_kwargs: None,
+    )
+
+    visualize._save_one_angle_front_view(
+        Path(f"unused-{mode}.png"),
+        points,
+        primary_mask,
+        lateral_labels,
+        points[:2],
+        laterals,
+        traits,
+        trait_column="angle",
+        title="Test",
+        mode=mode,
+        gravity=np.array([0.0, 0.0, -1.0]),
+        max_points=100,
+    )
+
+    expected = {"root-o1-002", "root-o2-002"}
+    assert set(vector_calls) == expected
+    assert set(annotation_calls) == expected
+    assert "root-o1-001" not in vector_calls
+    assert "root-o1-001" not in annotation_calls
+    assert "root-o2-001" not in vector_calls
+    assert "root-o2-001" not in annotation_calls
 
 
 @pytest.mark.parametrize(

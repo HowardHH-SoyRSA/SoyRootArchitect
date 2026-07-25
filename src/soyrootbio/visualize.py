@@ -23,6 +23,8 @@ _ANGLE_LABEL_ENTRY_FRACTION = 0.025
 _ANGLE_LABEL_OUTER_FRACTION = 0.120
 _ANGLE_LABEL_COLUMN_FRACTION = 0.16
 _ANGLE_LABEL_TEXT_GAP_FRACTION = 0.006
+_ORDER1_ANGLE_MIN_LENGTH_MESH_UNITS = 3.5
+_ORDER2_ANGLE_MIN_LENGTH_MESH_UNITS = 1.3
 _LEGACY_ROOT_NAME = re.compile(r"^order(?P<order>\d+)[_-](?P<number>\d+)$")
 
 
@@ -243,9 +245,25 @@ def _save_one_angle_front_view(
     rng = np.random.default_rng(42)
     idx = rng.choice(len(points), size=max_points, replace=False) if len(points) > max_points else np.arange(len(points))
     median_x = float(np.median(points[:, 0]))
+    trait_by_id = {row["root_id"]: row for _, row in traits.iterrows()} if hasattr(traits, "iterrows") else {}
+    show_angle_by_id = {
+        lateral_path.root_id: _show_angle_for_lateral(
+            lateral_path,
+            trait_by_id.get(lateral_path.root_id, {}),
+        )
+        for lateral_path in lateral_paths
+    }
     side_counts = [
-        sum(float(path.points[-1, 0]) < median_x for path in lateral_paths),
-        sum(float(path.points[-1, 0]) >= median_x for path in lateral_paths),
+        sum(
+            show_angle_by_id[path.root_id]
+            and float(path.points[-1, 0]) < median_x
+            for path in lateral_paths
+        ),
+        sum(
+            show_angle_by_id[path.root_id]
+            and float(path.points[-1, 0]) >= median_x
+            for path in lateral_paths
+        ),
     ]
     max_side_count = max(side_counts, default=0)
     # Dense root systems need more vertical room, but keep the raster bounded.
@@ -268,7 +286,6 @@ def _save_one_angle_front_view(
         ax.scatter(points[lateral, 0], points[lateral, 2], s=0.55, c=lateral_point_colors, alpha=0.35, linewidths=0)
     ax.plot(primary_path[:, 0], primary_path[:, 2], c="#002090", linewidth=1.8)
 
-    trait_by_id = {row["root_id"]: row for _, row in traits.iterrows()} if hasattr(traits, "iterrows") else {}
     x_span = max(float(np.ptp(points[:, 0])), 1e-6)
     z_span = max(float(np.ptp(points[:, 2])), 1e-6)
     label_items: dict[int, list[tuple[RootPath, np.ndarray, float]]] = {
@@ -280,6 +297,8 @@ def _save_one_angle_front_view(
         ax.plot(p[:, 0], p[:, 2], c=order_color(lateral_path.order), linewidth=1.2)
         tip = p[-1]
         row = trait_by_id.get(lateral_path.root_id, {})
+        if not show_angle_by_id[lateral_path.root_id]:
+            continue
         angle = row.get(trait_column, np.nan) if hasattr(row, "get") else np.nan
         outward = -1 if tip[0] < median_x else 1
         _draw_angle_vectors(
@@ -352,18 +371,19 @@ def _save_one_angle_front_view(
 
     from matplotlib.lines import Line2D
 
-    legend_spec = _angle_vector_legend_spec(mode)
-    ax.legend(
-        handles=[
-            Line2D([0], [0], color=color, lw=1.2, label=label)
-            for color, label in legend_spec
-        ],
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.025),
-        ncol=len(legend_spec),
-        fontsize=7,
-        framealpha=0.92,
-    )
+    if pending_labels:
+        legend_spec = _angle_vector_legend_spec(mode)
+        ax.legend(
+            handles=[
+                Line2D([0], [0], color=color, lw=1.2, label=label)
+                for color, label in legend_spec
+            ],
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.025),
+            ncol=len(legend_spec),
+            fontsize=7,
+            framealpha=0.92,
+        )
 
     ax.set_xlabel("x")
     ax.set_ylabel("z")
@@ -412,6 +432,33 @@ def _save_one_angle_front_view(
         )
     fig.savefig(path, dpi=600)
     plt.close(fig)
+
+
+def _show_angle_for_lateral(lateral_path: RootPath, trait_row) -> bool:
+    """Return whether one lateral's angle label and vectors belong in figures.
+
+    Rendering receives internally normalized centreline coordinates, whereas
+    the trait table restores root length to source ``mesh_unit`` coordinates.
+    Use that reported length so the order-specific mesh-unit rules are
+    independent of internal normalization. Missing or non-numeric lengths
+    retain the historical visible behavior rather than silently hiding an
+    unverifiable root.
+    """
+
+    minimum_length = {
+        1: _ORDER1_ANGLE_MIN_LENGTH_MESH_UNITS,
+        2: _ORDER2_ANGLE_MIN_LENGTH_MESH_UNITS,
+    }.get(int(lateral_path.order))
+    if minimum_length is None or not hasattr(trait_row, "get"):
+        return True
+    try:
+        length_mesh_units = float(trait_row.get("length", np.nan))
+    except (TypeError, ValueError):
+        return True
+    return (
+        not np.isfinite(length_mesh_units)
+        or length_mesh_units >= minimum_length
+    )
 
 
 def _angle_vector_legend_spec(mode: str) -> list[tuple[str, str]]:
