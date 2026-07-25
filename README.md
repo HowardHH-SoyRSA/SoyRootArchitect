@@ -189,7 +189,7 @@ For an oriented lateral centreline `p[0] ... p[n-1]`:
 
 The requested mesh-unit window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_*` records the lateral-tip window and `base_vector_*` records the lateral-start window; both use `mesh_unit`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in source mesh units, the local primary reference vector, and gravity components.
 
-Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, `Start`, and `Primary` as applicable. In the lateral-start–primary view, both rays originate at the lateral insertion; the name and angle label remains connected to the root tip. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
+Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Order-1 laterals shorter than 3.5 mesh units and order-2 laterals shorter than 1.3 mesh units remain visible as segmented roots, but their angle labels, indicatrices, and related vectors are omitted from all angle figures; the numerical traits and vector tables remain unchanged. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, `Start`, and `Primary` as applicable. In the lateral-start–primary view, both rays originate at the lateral insertion; the name and angle label remains connected to the root tip. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
 
 ## Trait definitions and units
 
@@ -239,7 +239,7 @@ Every run writes a self-contained output directory. Class-specific PLY files are
 - `segmented_root_structure.ply`: full-resolution labelled vertices and original triangle faces.
 - `segmented_points.ply`: compatibility coloured point cloud for viewers that ignore custom PLY properties.
 - `primary_points.ply`, `lateral_points.ply`, `unassigned_points.ply`, and `uncertain_points.ply`.
-- `skeleton_original_overlay.ply`: coloured centreline samples over the original grey structure.
+- `skeleton_original_overlay.ply`: side-by-side validation PLY with the complete original grey structure in source coordinates on the left and the color-coded skeleton translated to the right in the standard X–Z view (+X rightward). Mesh inputs retain the original faces and skeleton tube faces; point-cloud inputs remain face-free so viewers do not discard the original points. The X translation, minimum gap, and representation are recorded under `skeleton_original_overlay_layout` in `metadata.json`; use the skeleton CSV files for unshifted measurement coordinates.
 - `overview.png`: 3D segmentation and skeleton overview.
 - `tip_gravity_front_view_600dpi.png`
 - `tip_start_gravity_front_view_600dpi.png`
@@ -252,8 +252,8 @@ An **unassigned** point is either deliberately above the selected base or was no
 | Class | Colour |
 |---|---|
 | Primary / order 0 | Blue |
-| Order 1 | Red |
-| Order 2 | Green |
+| Order 1 | Magenta (`#FF00FF`) |
+| Order 2 | Green (`#009E73`) |
 | Order 3 | Purple |
 | Order 4+ | Gold |
 | Uncertain | Orange |

@@ -24,8 +24,8 @@ SEGMENT_COLORS = {
     "unassigned": np.array([0.55, 0.55, 0.55]),
     "uncertain": np.array([0.98, 0.48, 0.05]),
     "primary": np.array([0.05, 0.23, 0.88]),
-    "order_1": np.array([0.88, 0.08, 0.06]),
-    "order_2": np.array([0.04, 0.62, 0.22]),
+    "order_1": np.array([1.0, 0.0, 1.0]),  # #FF00FF
+    "order_2": np.array([0.0, 158.0 / 255.0, 115.0 / 255.0]),  # #009E73
     "order_3": np.array([0.55, 0.20, 0.82]),
     "higher_order": np.array([0.95, 0.65, 0.08]),
 }
@@ -96,7 +96,7 @@ def export_results(
     # viewers that ignore custom scalar properties.
     write_point_cloud(output_dir / "segmented_points.ply", geometry_points, colors=colors)
     _write_class_point_clouds(output_dir, geometry_points, geometry_labels, colors)
-    _write_skeleton_overlay(
+    skeleton_overlay_layout = _write_skeleton_overlay(
         output_dir / "skeleton_original_overlay.ply",
         geometry_points,
         triangles,
@@ -142,6 +142,7 @@ def export_results(
     metadata = dict(metadata)
     metadata["system_summary"] = traits.attrs.get("system_summary", {})
     metadata["root_label_map"] = tables["root_label_map.csv"].to_dict(orient="records")
+    metadata["skeleton_original_overlay_layout"] = skeleton_overlay_layout
     if topology_report is not None:
         metadata["topology_report"] = _json_safe(topology_report.__dict__)
     metadata["outputs"] = sorted(
@@ -513,7 +514,7 @@ def _write_skeleton_overlay(
     lateral_paths: list[RootPath],
     normalization: Normalization,
     metadata: dict,
-) -> None:
+) -> dict:
     d_bar = float(metadata.get("d_bar_normalized", 0.002))
     skeleton_spacing = max(d_bar * 0.55, 0.00025)
     points = [original_points]
@@ -522,34 +523,84 @@ def _write_skeleton_overlay(
     orders = [np.full(len(original_points), 255, dtype=np.uint8)]
     states = [np.zeros(len(original_points), dtype=np.uint8)]
     faces: list[np.ndarray] = []
-    if triangles is not None and len(triangles):
+    has_original_faces = triangles is not None and len(triangles) > 0
+    if has_original_faces:
         faces.append(np.asarray(triangles, dtype=np.int32))
     source_spacing = d_bar * float(normalization.scale)
     source_span = float(np.max(np.ptp(np.asarray(original_points, dtype=float), axis=0)))
     tube_radius = max(0.85 * source_spacing, 0.0006 * source_span, 1e-7)
+    skeleton_points: list[np.ndarray] = []
+    skeleton_colors: list[np.ndarray] = []
+    skeleton_root_ids: list[np.ndarray] = []
+    skeleton_orders: list[np.ndarray] = []
+    skeleton_states: list[np.ndarray] = []
+    skeleton_faces: list[np.ndarray] = []
 
     primary_original = normalization.inverse_points(resample_polyline(primary_path, skeleton_spacing))
     primary_vertices, primary_faces = _polyline_tube_mesh(primary_original, tube_radius)
     if len(primary_vertices):
-        offset = sum(len(values) for values in points)
-        points.append(primary_vertices)
-        faces.append(primary_faces + offset)
-        colors.append(np.tile(SEGMENT_COLORS["primary"], (len(primary_vertices), 1)))
-        root_ids.append(np.zeros(len(primary_vertices), dtype=np.int32))
-        orders.append(np.zeros(len(primary_vertices), dtype=np.uint8))
-        states.append(np.ones(len(primary_vertices), dtype=np.uint8))
+        skeleton_points.append(primary_vertices)
+        skeleton_faces.append(primary_faces)
+        skeleton_colors.append(
+            np.tile(SEGMENT_COLORS["primary"], (len(primary_vertices), 1))
+        )
+        skeleton_root_ids.append(np.zeros(len(primary_vertices), dtype=np.int32))
+        skeleton_orders.append(np.zeros(len(primary_vertices), dtype=np.uint8))
+        skeleton_states.append(np.ones(len(primary_vertices), dtype=np.uint8))
     for label, lateral in enumerate(lateral_paths, start=1):
         lateral_original = normalization.inverse_points(resample_polyline(lateral.points, skeleton_spacing))
         lateral_vertices, lateral_faces = _polyline_tube_mesh(lateral_original, tube_radius)
         if not len(lateral_vertices):
             continue
-        offset = sum(len(values) for values in points)
-        points.append(lateral_vertices)
-        faces.append(lateral_faces + offset)
-        colors.append(np.tile(order_color(lateral.order), (len(lateral_vertices), 1)))
-        root_ids.append(np.full(len(lateral_vertices), label, dtype=np.int32))
-        orders.append(np.full(len(lateral_vertices), lateral.order, dtype=np.uint8))
-        states.append(np.ones(len(lateral_vertices), dtype=np.uint8))
+        offset = sum(len(values) for values in skeleton_points)
+        skeleton_points.append(lateral_vertices)
+        skeleton_faces.append(lateral_faces + offset)
+        skeleton_colors.append(
+            np.tile(order_color(lateral.order), (len(lateral_vertices), 1))
+        )
+        skeleton_root_ids.append(
+            np.full(len(lateral_vertices), label, dtype=np.int32)
+        )
+        skeleton_orders.append(
+            np.full(len(lateral_vertices), lateral.order, dtype=np.uint8)
+        )
+        skeleton_states.append(np.ones(len(lateral_vertices), dtype=np.uint8))
+
+    skeleton_shift_x = 0.0
+    comparison_gap = 0.0
+    skeleton_vertex_count = 0
+    if skeleton_points:
+        skeleton_geometry = np.vstack(skeleton_points)
+        skeleton_vertex_count = len(skeleton_geometry)
+        coordinate_magnitude = max(
+            abs(float(np.max(original_points[:, 0]))),
+            abs(float(np.min(skeleton_geometry[:, 0]))),
+            source_span,
+            1.0,
+        )
+        representable_gap = 8.0 * abs(float(np.spacing(coordinate_magnitude)))
+        comparison_gap = max(
+            0.10 * source_span,
+            4.0 * tube_radius,
+            source_spacing,
+            representable_gap,
+            1e-7,
+        )
+        original_max_x = float(np.max(original_points[:, 0]))
+        skeleton_min_x = float(np.min(skeleton_geometry[:, 0]))
+        skeleton_shift_x = original_max_x + comparison_gap - skeleton_min_x
+        skeleton_geometry = skeleton_geometry.copy()
+        skeleton_geometry[:, 0] += skeleton_shift_x
+
+        original_vertex_count = len(original_points)
+        points.append(skeleton_geometry)
+        colors.append(np.vstack(skeleton_colors))
+        root_ids.append(np.concatenate(skeleton_root_ids))
+        orders.append(np.concatenate(skeleton_orders))
+        states.append(np.concatenate(skeleton_states))
+        if has_original_faces:
+            faces.append(np.vstack(skeleton_faces) + original_vertex_count)
+
     write_labeled_ply(
         path,
         np.vstack(points),
@@ -559,6 +610,32 @@ def _write_skeleton_overlay(
         root_orders=np.concatenate(orders),
         assignment_states=np.concatenate(states),
     )
+    return {
+        "arrangement": "side_by_side_x",
+        "original_structure_side": "left",
+        "skeleton_side": "right",
+        "coordinate_unit": "mesh_unit",
+        "original_translation": [0.0, 0.0, 0.0],
+        "skeleton_translation": [float(skeleton_shift_x), 0.0, 0.0],
+        "minimum_gap": float(comparison_gap),
+        "original_vertex_count": int(len(original_points)),
+        "skeleton_vertex_count": int(skeleton_vertex_count),
+        "original_face_count": int(len(triangles)) if has_original_faces else 0,
+        "skeleton_face_count": (
+            int(sum(len(values) for values in skeleton_faces))
+            if has_original_faces
+            else 0
+        ),
+        "geometry_representation": (
+            "mesh_with_skeleton_tube_faces"
+            if has_original_faces
+            else "point_cloud_vertices"
+        ),
+        "note": (
+            "The original structure retains source coordinates; the skeleton "
+            "translation is visualization-only."
+        ),
+    }
 
 
 def _polyline_tube_mesh(

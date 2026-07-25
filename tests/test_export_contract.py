@@ -12,12 +12,18 @@ import pandas as pd
 from PIL import Image
 import pytest
 
-from soyrootbio.export import write_rsml
+from soyrootbio.export import (
+    SEGMENT_COLORS,
+    _polyline_tube_mesh,
+    _write_skeleton_overlay,
+    write_rsml,
+)
+from soyrootbio.geometry import resample_polyline
 from soyrootbio.io import write_labeled_ply
 from soyrootbio.pipeline import PipelineConfig, PipelineResult, run_pipeline
 from soyrootbio.synthetic import write_synthetic_dataset
 from soyrootbio.topology import apply_hierarchy_corrections
-from soyrootbio.types import RootPath
+from soyrootbio.types import Normalization, RootPath
 
 
 ANGLE_FIGURES = (
@@ -63,6 +69,17 @@ TRAIT_CSV_COLUMNS = {
 }
 
 
+def test_root_order_color_codes_match_export_contract() -> None:
+    np.testing.assert_array_equal(
+        np.round(SEGMENT_COLORS["order_1"] * 255).astype(np.uint8),
+        np.array([255, 0, 255], dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.round(SEGMENT_COLORS["order_2"] * 255).astype(np.uint8),
+        np.array([0, 158, 115], dtype=np.uint8),
+    )
+
+
 @pytest.fixture(scope="module")
 def synthetic_export(
     tmp_path_factory: pytest.TempPathFactory,
@@ -106,6 +123,49 @@ def _ply_header(path: Path) -> str:
                 raise AssertionError(f"PLY header terminator is missing from {path}")
             header.extend(chunk)
     return bytes(header).split(b"end_header\n", 1)[0].decode("ascii") + "end_header\n"
+
+
+def _read_labeled_ply(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    payload = path.read_bytes()
+    marker = b"end_header\n"
+    vertex_offset = payload.index(marker) + len(marker)
+    header = payload[:vertex_offset].decode("ascii")
+    element_counts = {
+        parts[1]: int(parts[2])
+        for line in header.splitlines()
+        if len(parts := line.split()) == 3 and parts[0] == "element"
+    }
+    vertex_dtype = np.dtype(
+        [
+            ("x", "<f8"),
+            ("y", "<f8"),
+            ("z", "<f8"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+            ("root_id", "<i4"),
+            ("root_order", "u1"),
+            ("assignment_state", "u1"),
+        ]
+    )
+    vertices = np.frombuffer(
+        payload,
+        dtype=vertex_dtype,
+        count=element_counts["vertex"],
+        offset=vertex_offset,
+    ).copy()
+    face_offset = vertex_offset + vertices.nbytes
+    face_dtype = np.dtype([("count", "u1"), ("vertices", "<i4", (3,))])
+    face_records = np.frombuffer(
+        payload,
+        dtype=face_dtype,
+        count=element_counts["face"],
+        offset=face_offset,
+    )
+    assert np.all(face_records["count"] == 3)
+    return vertices, face_records["vertices"].copy(), header
 
 
 def test_rsml_parses_and_preserves_parent_child_order(
@@ -318,6 +378,145 @@ def test_labeled_ply_headers_include_labels_and_mesh_faces(
     assert "property uchar root_order\n" in mesh_header
     assert "element face 2\n" in mesh_header
     assert "property list uchar int vertex_indices\n" in mesh_header
+
+
+def test_skeleton_original_overlay_is_a_side_by_side_comparison(
+    tmp_path: Path,
+) -> None:
+    original = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 2.0],
+            [0.0, 0.0, 2.0],
+        ]
+    )
+    triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    primary = np.array([[0.5, 0.0, 2.0], [0.5, 0.0, 0.0]])
+    lateral = RootPath(
+        root_id="root-o1-001",
+        parent_id="primary",
+        order=1,
+        points=np.array([[0.5, 0.0, 1.2], [0.9, 0.0, 0.6]]),
+    )
+    second_order = RootPath(
+        root_id="root-o2-001",
+        parent_id="root-o1-001",
+        order=2,
+        points=np.array([[0.9, 0.0, 0.6], [0.8, 0.2, 0.2]]),
+    )
+    output = tmp_path / "skeleton_original_overlay.ply"
+
+    layout = _write_skeleton_overlay(
+        output,
+        original,
+        triangles,
+        primary,
+        [lateral, second_order],
+        Normalization(minimum=np.zeros(3), scale=1.0),
+        {"d_bar_normalized": 0.1},
+    )
+
+    records, faces, header = _read_labeled_ply(output)
+    xyz = np.column_stack([records["x"], records["y"], records["z"]])
+    original_mask = records["root_id"] == -1
+    skeleton_mask = records["root_id"] >= 0
+    assert np.count_nonzero(original_mask) == len(original)
+    np.testing.assert_array_equal(xyz[original_mask], original)
+    assert np.any(skeleton_mask)
+    actual_gap = float(
+        np.min(xyz[skeleton_mask, 0]) - np.max(xyz[original_mask, 0])
+    )
+    assert actual_gap == pytest.approx(layout["minimum_gap"])
+    assert actual_gap > 0.0
+    assert layout["arrangement"] == "side_by_side_x"
+    assert layout["original_structure_side"] == "left"
+    assert layout["skeleton_side"] == "right"
+    assert layout["original_translation"] == [0.0, 0.0, 0.0]
+    assert layout["skeleton_translation"][0] > 0.0
+    assert layout["original_vertex_count"] == len(original)
+    assert layout["skeleton_vertex_count"] == np.count_nonzero(skeleton_mask)
+    assert layout["original_face_count"] == len(triangles)
+    assert layout["geometry_representation"] == "mesh_with_skeleton_tube_faces"
+
+    expected_gray = np.round(SEGMENT_COLORS["unassigned"] * 255).astype(np.uint8)
+    stored_colors = np.column_stack(
+        [records["red"], records["green"], records["blue"]]
+    )
+    np.testing.assert_array_equal(
+        stored_colors[original_mask],
+        np.tile(expected_gray, (len(original), 1)),
+    )
+    assert set(records["root_id"][skeleton_mask]) == {0, 1, 2}
+    assert set(records["root_order"][skeleton_mask]) == {0, 1, 2}
+    assert set(records["assignment_state"][skeleton_mask]) == {1}
+    for root_id, expected_color in (
+        (0, SEGMENT_COLORS["primary"]),
+        (1, SEGMENT_COLORS["order_1"]),
+        (2, SEGMENT_COLORS["order_2"]),
+    ):
+        mask = records["root_id"] == root_id
+        expected_bytes = np.round(expected_color * 255).astype(np.uint8)
+        np.testing.assert_array_equal(
+            stored_colors[mask],
+            np.tile(expected_bytes, (np.count_nonzero(mask), 1)),
+        )
+
+    skeleton_spacing = 0.055
+    tube_radius = 0.085
+    expected_tubes = {
+        0: _polyline_tube_mesh(
+            resample_polyline(primary, skeleton_spacing),
+            tube_radius,
+        ),
+        1: _polyline_tube_mesh(
+            resample_polyline(lateral.points, skeleton_spacing),
+            tube_radius,
+        ),
+        2: _polyline_tube_mesh(
+            resample_polyline(second_order.points, skeleton_spacing),
+            tube_radius,
+        ),
+    }
+    for root_id, (expected_vertices, _) in expected_tubes.items():
+        actual_vertices = xyz[records["root_id"] == root_id]
+        np.testing.assert_allclose(actual_vertices[:, 1:], expected_vertices[:, 1:])
+        np.testing.assert_allclose(
+            actual_vertices[:, 0] - expected_vertices[:, 0],
+            layout["skeleton_translation"][0],
+        )
+
+    np.testing.assert_array_equal(faces[: len(triangles)], triangles)
+    assert np.all(faces[len(triangles) :] >= len(original))
+    assert len(faces) == len(triangles) + sum(
+        len(expected_faces) for _, expected_faces in expected_tubes.values()
+    )
+    assert layout["skeleton_face_count"] == len(faces) - len(triangles)
+    assert f"element vertex {len(records)}\n" in header
+    assert f"element face {len(faces)}\n" in header
+
+
+def test_pipeline_metadata_records_side_by_side_skeleton_layout(
+    synthetic_export: tuple[Path, Path, PipelineResult],
+) -> None:
+    _, output_dir, _ = synthetic_export
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    layout = metadata["skeleton_original_overlay_layout"]
+    records, faces, header = _read_labeled_ply(
+        output_dir / "skeleton_original_overlay.ply"
+    )
+    xyz = np.column_stack([records["x"], records["y"], records["z"]])
+    original_count = int(layout["original_vertex_count"])
+
+    assert layout["arrangement"] == "side_by_side_x"
+    assert original_count == metadata["source_geometry"]["full_point_count"]
+    assert layout["skeleton_vertex_count"] == len(records) - original_count
+    assert np.max(xyz[:original_count, 0]) < np.min(xyz[original_count:, 0])
+    assert layout["geometry_representation"] == "point_cloud_vertices"
+    assert layout["original_face_count"] == 0
+    assert layout["skeleton_face_count"] == 0
+    assert len(faces) == 0
+    assert "element face 0\n" in header
 
 
 def test_angle_figures_are_pngs_at_approximately_600_dpi(
