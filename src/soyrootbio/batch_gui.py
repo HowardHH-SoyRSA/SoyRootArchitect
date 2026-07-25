@@ -182,7 +182,12 @@ class BioInsAlgoBatchApp:
         row = self._setting_row(parent, row, "Soil-line Z", ttk.Entry(parent, textvariable=self.soil_z_var))
         row = self._setting_row(parent, row, "Runtime limit (min)", ttk.Entry(parent, textvariable=self.runtime_limit_var))
         row = self._setting_row(parent, row, "Minimum retained (%)", ttk.Entry(parent, textvariable=self.minimum_fraction_var))
-        row = self._setting_row(parent, row, "Tip vector window (mesh units)", ttk.Entry(parent, textvariable=self.tip_window_var))
+        row = self._setting_row(
+            parent,
+            row,
+            "Angle vector window (mesh units)",
+            ttk.Entry(parent, textvariable=self.tip_window_var),
+        )
 
         ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
         row += 1
@@ -530,7 +535,10 @@ class BioInsAlgoBatchApp:
             max_root_order=self._positive_int(self.max_order_var.get(), "Maximum root order", 1),
             runtime_limit_minutes=self._positive_float(self.runtime_limit_var.get(), "Runtime limit"),
             minimum_retained_fraction=self._percent_fraction(self.minimum_fraction_var.get()),
-            tip_vector_window_mesh_units=self._positive_float(self.tip_window_var.get(), "Tip vector window"),
+            tip_vector_window_mesh_units=self._positive_float(
+                self.tip_window_var.get(),
+                "Angle vector window",
+            ),
             worker_threads=threads,
         )
 

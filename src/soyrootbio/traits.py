@@ -40,8 +40,9 @@ def compute_traits(
 
     * ``tip_gravity_angle_deg``: lateral tip tangent versus ``(0, 0, -1)``;
     * ``tip_start_gravity_angle_deg``: start-to-tip vector versus gravity;
-    * ``tip_primary_angle_deg``: lateral tip tangent versus the ordered primary
-      tangent at the lateral insertion location.
+    * ``tip_primary_angle_deg``: lateral start tangent versus the ordered
+      primary tangent at the lateral insertion location.  The historical
+      column name is retained for export compatibility.
     """
 
     gravity = np.asarray(gravity, dtype=float)
@@ -116,7 +117,12 @@ def compute_traits(
 
         _, parent_index = parent_tree.query(lateral.points[0], k=1)
         _, primary_index = primary_tree.query(lateral.points[0], k=1)
-        _, _, base_vector, _ = _arc_window_vector(
+        (
+            base_vector_start,
+            base_vector_end,
+            base_vector,
+            actual_base_window,
+        ) = _arc_window_vector(
             original,
             anchor_index=0,
             requested_window=tip_vector_window,
@@ -143,7 +149,7 @@ def compute_traits(
         )
         base_parent_angle = angle_degrees(base_vector, parent_vector)
         tip_parent_angle = vector_angle_degrees(tip_vector, parent_vector)
-        tip_primary_angle = vector_angle_degrees(tip_vector, primary_vector)
+        tip_primary_angle = vector_angle_degrees(base_vector, primary_vector)
         tip_gravity_angle = vector_angle_degrees(tip_vector, gravity)
         tip_start_gravity_angle = vector_angle_degrees(tip_start_vector, gravity)
 
@@ -152,6 +158,8 @@ def compute_traits(
             qc_flags.append("undefined_tip_vector")
         if np.linalg.norm(tip_start_vector) <= 1e-12:
             qc_flags.append("undefined_tip_start_vector")
+        if np.linalg.norm(base_vector) <= 1e-12:
+            qc_flags.append("undefined_base_vector")
         if np.linalg.norm(primary_vector) <= 1e-12:
             qc_flags.append("undefined_primary_vector")
         qc_flags = list(dict.fromkeys(qc_flags))
@@ -206,10 +214,18 @@ def compute_traits(
                     root_tip,
                 ),
                 **_vector_columns(
+                    "base_vector",
+                    base_vector_start,
+                    base_vector_end,
+                ),
+                **_vector_columns(
                     "primary_vector",
                     primary_vector_start,
                     primary_vector_end,
                 ),
+                "base_vector_requested_window": float(tip_vector_window),
+                "base_vector_arc_window": float(actual_base_window),
+                "base_vector_window_unit": "mesh_unit",
                 "gravity_dx": float(gravity[0]),
                 "gravity_dy": float(gravity[1]),
                 "gravity_dz": float(gravity[2]),
@@ -263,7 +279,15 @@ def angle_vectors_frame(traits: pd.DataFrame) -> pd.DataFrame:
         for column in ("coordinate_unit",)
         if column in traits.columns
     )
-    vector_prefixes = ("root_start_", "root_tip_", "tip_vector_", "tip_start_vector_", "primary_vector_", "gravity_")
+    vector_prefixes = (
+        "root_start_",
+        "root_tip_",
+        "tip_vector_",
+        "tip_start_vector_",
+        "base_vector_",
+        "primary_vector_",
+        "gravity_",
+    )
     columns.extend(
         column
         for column in traits.columns
