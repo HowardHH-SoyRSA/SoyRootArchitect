@@ -51,6 +51,35 @@ def _zoom_3d_axis(axis, factor: float, canvas=None) -> None:
         canvas.draw_idle()
 
 
+def _configure_selection_axis(axis, points: np.ndarray, *, title: str = "Root point cloud") -> None:
+    """Apply the shared, sparse-grid styling used by both selection windows."""
+
+    from matplotlib.ticker import MaxNLocator
+
+    axis.set_title(title, fontsize=12, pad=12)
+    axis.set_xlabel("x", labelpad=8)
+    axis.set_ylabel("y", labelpad=8)
+    axis.set_zlabel("z", labelpad=8)
+    axis.tick_params(labelsize=8)
+    for coordinate_axis in (axis.xaxis, axis.yaxis, axis.zaxis):
+        coordinate_axis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
+    axis.grid(True)
+    axis.set_box_aspect(np.maximum(np.ptp(points, axis=0), 1e-9))
+
+
+def _inverted_drag_rotation(
+    start_elevation: float,
+    start_azimuth: float,
+    delta_x: float,
+    delta_y: float,
+) -> tuple[float, float]:
+    """Return the deliberately reversed left-drag camera orientation."""
+
+    elevation = float(np.clip(float(start_elevation) + 0.30 * float(delta_y), -89.0, 89.0))
+    azimuth = float(start_azimuth) - 0.35 * float(delta_x)
+    return elevation, azimuth
+
+
 def select_primary_endpoints_gui(
     points: np.ndarray,
     max_display_points: int = 30000,
@@ -284,12 +313,7 @@ def _run_endpoint_picker(
             alpha=0.62,
             depthshade=False,
         )
-        axis.set_title("Root point cloud", fontsize=12, pad=12)
-        axis.set_xlabel("x", labelpad=8)
-        axis.set_ylabel("y", labelpad=8)
-        axis.set_zlabel("z", labelpad=8)
-        axis.tick_params(labelsize=8)
-        axis.set_box_aspect(np.maximum(np.ptp(display_points, axis=0), 1e-9))
+        _configure_selection_axis(axis, display_points)
         axis.disable_mouse_rotation()
         axis.view_init(elev=22.0, azim=-60.0)
         set_root_limits()
@@ -465,10 +489,13 @@ def _run_endpoint_picker(
             drag_state["dragged"] = True
 
         if drag_state["button"] == 1:
-            axis.view_init(
-                elev=float(np.clip(float(drag_state["start_elev"]) - 0.30 * delta_y, -89.0, 89.0)),
-                azim=float(drag_state["start_azim"]) + 0.35 * delta_x,
+            elevation, azimuth = _inverted_drag_rotation(
+                float(drag_state["start_elev"]),
+                float(drag_state["start_azim"]),
+                delta_x,
+                delta_y,
             )
+            axis.view_init(elev=elevation, azim=azimuth)
         else:
             start_xlim = drag_state["start_xlim"]
             start_ylim = drag_state["start_ylim"]
@@ -476,8 +503,8 @@ def _run_endpoint_picker(
             if start_xlim is None or start_ylim is None or start_zlim is None:
                 return
             shift = _camera_pan_shift(
-                delta_x,
-                delta_y,
+                -delta_x,
+                -delta_y,
                 max(float(axis.bbox.width), 1.0),
                 max(float(axis.bbox.height), 1.0),
                 float(drag_state["start_azim"]),
@@ -606,7 +633,7 @@ def _camera_pan_shift(
     elevation_degrees: float,
     limits: np.ndarray,
 ) -> np.ndarray:
-    """Return a world-coordinate shift for a middle-drag camera pan.
+    """Return a world-coordinate shift for a camera pan.
 
     The calculation uses the displayed camera's horizontal and vertical axes,
     keeping panning intuitive after the user has rotated the root view.
@@ -747,9 +774,10 @@ def select_primary_sections_gui(
 ) -> tuple[float | None, np.ndarray]:
     """Select any number of primary guide sections and one soil-line height.
 
-    Shift-clicking chooses the nearest visible cloud point.  In ``Guide
+    Shift-clicking chooses the nearest visible cloud point. In ``Guide
     section`` mode every click adds an ordered constraint; in ``Soil line``
-    mode the point's Z coordinate defines the horizontal soil surface.
+    mode the point's Z coordinate defines the horizontal soil surface. The
+    camera controls deliberately match the endpoint picker.
     """
 
     try:
@@ -775,9 +803,91 @@ def select_primary_sections_gui(
         "soil_z": None,
         "saved": False,
     }
-    figure = plt.figure(figsize=(11.5, 8.0))
+    drag_state: dict[str, object] = {
+        "active": False,
+        "button": None,
+        "start_x": 0.0,
+        "start_y": 0.0,
+        "start_elev": 22.0,
+        "start_azim": -60.0,
+        "start_xlim": None,
+        "start_ylim": None,
+        "start_zlim": None,
+        "dragged": False,
+        "shift_selection": False,
+    }
+
+    figure = plt.figure(figsize=(15, 10))
     figure.canvas.manager.set_window_title(title)
-    axis = figure.add_axes([0.04, 0.08, 0.72, 0.86], projection="3d")
+    axis = figure.add_axes([0.045, 0.095, 0.665, 0.80], projection="3d")
+    figure.text(0.045, 0.952, title, fontsize=16, weight="bold")
+    status_text = figure.text(0.045, 0.921, "Preparing primary guidance...", fontsize=11)
+
+    control_left = 0.765
+    control_width = 0.20
+    figure.text(control_left, 0.835, "Selection mode", fontsize=12, weight="bold")
+    radio = RadioButtons(
+        figure.add_axes([control_left, 0.675, control_width, 0.13]),
+        ("Guide section", "Soil line"),
+    )
+    figure.text(
+        control_left,
+        0.625,
+        "Shift-click to select a visible point.\nGuides constrain the primary path.",
+        fontsize=9,
+        va="top",
+        color="#4b5563",
+    )
+    undo_button = Button(
+        figure.add_axes([control_left, 0.515, control_width, 0.052]),
+        "Undo guide",
+    )
+    clear_soil_button = Button(
+        figure.add_axes([control_left, 0.452, control_width, 0.052]),
+        "Clear soil line",
+    )
+    zoom_in_button = Button(
+        figure.add_axes([control_left, 0.372, 0.092, 0.050]),
+        "Zoom +",
+    )
+    zoom_out_button = Button(
+        figure.add_axes([control_left + 0.108, 0.372, 0.092, 0.050]),
+        "Zoom -",
+    )
+    reset_view_button = Button(
+        figure.add_axes([control_left, 0.309, control_width, 0.050]),
+        "Reset view",
+    )
+    skip_button = Button(
+        figure.add_axes([control_left, 0.135, control_width, 0.052]),
+        "No guides / soil",
+    )
+    save_button = Button(
+        figure.add_axes([control_left, 0.065, control_width, 0.055]),
+        "Save guidance",
+        color="#dbeafe",
+        hovercolor="#bfdbfe",
+    )
+    for label in radio.labels:
+        label.set_fontsize(10)
+    for button in (
+        undo_button,
+        clear_soil_button,
+        zoom_in_button,
+        zoom_out_button,
+        reset_view_button,
+        skip_button,
+        save_button,
+    ):
+        button.label.set_fontsize(10)
+
+    def set_root_limits() -> None:
+        center = display.mean(axis=0)
+        span = float(max(np.ptp(display, axis=0).max(), 1e-9))
+        half = span * 0.55
+        axis.set_xlim(center[0] - half, center[0] + half)
+        axis.set_ylim(center[1] - half, center[1] + half)
+        axis.set_zlim(center[2] - half, center[2] + half)
 
     def redraw(*, preserve_view: bool = True) -> None:
         view_limits = None
@@ -786,53 +896,135 @@ def select_primary_sections_gui(
             view_limits = (axis.get_xlim(), axis.get_ylim(), axis.get_zlim())
             view_angles = (axis.elev, axis.azim)
         axis.clear()
-        axis.scatter(display[:, 0], display[:, 1], display[:, 2], s=0.45, c="#777777", alpha=0.18)
-        axis.scatter([start[0]], [start[1]], [start[2]], s=45, c="#0b57d0", marker="o", label="Base")
-        axis.scatter([end[0]], [end[1]], [end[2]], s=45, c="#8b1a1a", marker="^", label="Tip")
+        axis.scatter(
+            display[:, 0],
+            display[:, 1],
+            display[:, 2],
+            s=1.2,
+            c="#6b7280",
+            alpha=0.62,
+            depthshade=False,
+            linewidths=0,
+        )
+        axis.scatter(
+            [start[0]],
+            [start[1]],
+            [start[2]],
+            s=78,
+            c="#16a34a",
+            edgecolors="white",
+            linewidths=0.8,
+            depthshade=False,
+            marker="o",
+            label="Base",
+        )
+        axis.scatter(
+            [end[0]],
+            [end[1]],
+            [end[2]],
+            s=78,
+            c="#dc2626",
+            edgecolors="white",
+            linewidths=0.8,
+            depthshade=False,
+            marker="^",
+            label="Tip",
+        )
         guides = state["guides"]
         if guides:
             guide_array = np.asarray(guides)
-            axis.scatter(guide_array[:, 0], guide_array[:, 1], guide_array[:, 2], s=38, c="#8a2be2", marker="D")
+            axis.scatter(
+                guide_array[:, 0],
+                guide_array[:, 1],
+                guide_array[:, 2],
+                s=70,
+                c="#7c3aed",
+                edgecolors="white",
+                linewidths=0.8,
+                depthshade=False,
+                marker="D",
+                label="Guide section",
+            )
             for index, point in enumerate(guide_array, start=1):
-                axis.text(point[0], point[1], point[2], f"G{index}", fontsize=8, color="#6b14a8")
+                axis.text(
+                    point[0],
+                    point[1],
+                    point[2],
+                    f"  G{index}",
+                    fontsize=9,
+                    color="#6d28d9",
+                    bbox={
+                        "boxstyle": "round,pad=0.18",
+                        "facecolor": "white",
+                        "edgecolor": "none",
+                        "alpha": 0.82,
+                    },
+                )
         soil_z = state["soil_z"]
         if soil_z is not None:
             x0, x1 = float(points[:, 0].min()), float(points[:, 0].max())
             y0, y1 = float(points[:, 1].min()), float(points[:, 1].max())
-            axis.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], [soil_z] * 5, c="#16833f", lw=1.4)
-            axis.text(x0, y0, soil_z, f"soil Z={soil_z:.6g}", color="#16833f")
-        axis.set_xlabel("X")
-        axis.set_ylabel("Y")
-        axis.set_zlabel("Z")
-        axis.set_box_aspect(np.maximum(np.ptp(points, axis=0), 1e-6))
+            axis.plot(
+                [x0, x1, x1, x0, x0],
+                [y0, y0, y1, y1, y0],
+                [soil_z] * 5,
+                c="#15803d",
+                lw=2.4,
+                alpha=0.95,
+                label="Soil line",
+            )
+            axis.text(
+                x0,
+                y0,
+                soil_z,
+                f"  soil z={soil_z:.6g}",
+                color="#15803d",
+                fontsize=9,
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.82,
+                },
+            )
+        _configure_selection_axis(axis, points)
+        axis.disable_mouse_rotation()
         if view_limits is not None:
             axis.set_xlim(view_limits[0])
             axis.set_ylim(view_limits[1])
             axis.set_zlim(view_limits[2])
             axis.view_init(elev=view_angles[0], azim=view_angles[1])
-        axis.legend(loc="upper right")
+        else:
+            axis.view_init(elev=22.0, azim=-60.0)
+            set_root_limits()
+        axis.legend(loc="upper right", framealpha=0.92, fontsize=9)
+        axis.text2D(
+            0.02,
+            0.02,
+            "Shift-click: select | Left-drag: rotate | Right-drag: pan | Wheel: zoom",
+            transform=axis.transAxes,
+            fontsize=10,
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.82,
+            },
+        )
+        soil_text = "not selected" if soil_z is None else f"z={float(soil_z):.6g}"
+        status_text.set_text(
+            f"{state['mode']} mode | {len(guides)} guide section(s) | Soil line {soil_text}"
+        )
         figure.canvas.draw_idle()
-
-    redraw(preserve_view=False)
-    figure.text(
-        0.79,
-        0.89,
-        "Shift + left-click a visible point.\nDrag normally to rotate; wheel zooms.\nGuides constrain the primary path.",
-        fontsize=9,
-        va="top",
-    )
-    radio = RadioButtons(figure.add_axes([0.79, 0.66, 0.19, 0.15]), ("Guide section", "Soil line"))
-    undo_button = Button(figure.add_axes([0.79, 0.53, 0.19, 0.055]), "Undo guide")
-    clear_soil_button = Button(figure.add_axes([0.79, 0.45, 0.19, 0.055]), "Clear soil line")
-    save_button = Button(figure.add_axes([0.79, 0.28, 0.19, 0.065]), "Save guidance")
-    skip_button = Button(figure.add_axes([0.79, 0.19, 0.19, 0.055]), "No guides / soil")
 
     def on_mode(label: str) -> None:
         state["mode"] = label
+        redraw()
 
-    def on_click(event) -> None:
-        if event.inaxes is not axis or event.button != 1 or event.key != "shift":
+    def select_point_at_event(event) -> None:
+        if event.inaxes is not axis or event.x is None or event.y is None:
             return
+        figure.canvas.draw()
         projected_x, projected_y, _ = proj3d.proj_transform(
             display[:, 0], display[:, 1], display[:, 2], axis.get_proj()
         )
@@ -845,12 +1037,82 @@ def select_primary_sections_gui(
             state["guides"].append(selected)
         redraw()
 
+    def on_pointer_press(event) -> None:
+        if event.inaxes is not axis or event.button not in (1, 2, 3):
+            return
+        if event.x is None or event.y is None:
+            return
+        drag_state.update(
+            active=True,
+            button=event.button,
+            start_x=float(event.x),
+            start_y=float(event.y),
+            start_elev=float(axis.elev),
+            start_azim=float(axis.azim),
+            start_xlim=axis.get_xlim(),
+            start_ylim=axis.get_ylim(),
+            start_zlim=axis.get_zlim(),
+            dragged=False,
+            shift_selection=(event.button == 1 and "shift" in str(event.key).lower()),
+        )
+
+    def on_pointer_motion(event) -> None:
+        if not bool(drag_state["active"]) or event.inaxes is not axis:
+            return
+        if event.x is None or event.y is None:
+            return
+        delta_x = float(event.x) - float(drag_state["start_x"])
+        delta_y = float(event.y) - float(drag_state["start_y"])
+        if abs(delta_x) > 3.0 or abs(delta_y) > 3.0:
+            drag_state["dragged"] = True
+
+        if drag_state["button"] == 1:
+            elevation, azimuth = _inverted_drag_rotation(
+                float(drag_state["start_elev"]),
+                float(drag_state["start_azim"]),
+                delta_x,
+                delta_y,
+            )
+            axis.view_init(elev=elevation, azim=azimuth)
+        else:
+            start_xlim = drag_state["start_xlim"]
+            start_ylim = drag_state["start_ylim"]
+            start_zlim = drag_state["start_zlim"]
+            if start_xlim is None or start_ylim is None or start_zlim is None:
+                return
+            shift = _camera_pan_shift(
+                -delta_x,
+                -delta_y,
+                max(float(axis.bbox.width), 1.0),
+                max(float(axis.bbox.height), 1.0),
+                float(drag_state["start_azim"]),
+                float(drag_state["start_elev"]),
+                np.asarray([start_xlim, start_ylim, start_zlim], dtype=float),
+            )
+            axis.set_xlim(np.asarray(start_xlim, dtype=float) + shift[0])
+            axis.set_ylim(np.asarray(start_ylim, dtype=float) + shift[1])
+            axis.set_zlim(np.asarray(start_zlim, dtype=float) + shift[2])
+        figure.canvas.draw_idle()
+
+    def on_pointer_release(event) -> None:
+        if not bool(drag_state["active"]):
+            return
+        select_point = bool(drag_state["shift_selection"]) and not bool(drag_state["dragged"])
+        drag_state["active"] = False
+        if select_point:
+            select_point_at_event(event)
+
     def on_scroll(event) -> None:
         if event.inaxes is not axis:
             return
         factor = _wheel_zoom_factor(event.button, getattr(event, "step", None))
         if factor is not None:
             _zoom_3d_axis(axis, factor, figure.canvas)
+
+    def reset_view(_event=None) -> None:
+        axis.view_init(elev=22.0, azim=-60.0)
+        set_root_limits()
+        figure.canvas.draw_idle()
 
     def undo(_event) -> None:
         guides = state["guides"]
@@ -872,12 +1134,18 @@ def select_primary_sections_gui(
         state["saved"] = True
         plt.close(figure)
 
+    redraw(preserve_view=False)
     radio.on_clicked(on_mode)
     undo_button.on_clicked(undo)
     clear_soil_button.on_clicked(clear_soil)
+    zoom_in_button.on_clicked(lambda _event: _zoom_3d_axis(axis, 0.75, figure.canvas))
+    zoom_out_button.on_clicked(lambda _event: _zoom_3d_axis(axis, 1.35, figure.canvas))
+    reset_view_button.on_clicked(reset_view)
     save_button.on_clicked(save)
     skip_button.on_clicked(skip)
-    figure.canvas.mpl_connect("button_press_event", on_click)
+    figure.canvas.mpl_connect("button_press_event", on_pointer_press)
+    figure.canvas.mpl_connect("motion_notify_event", on_pointer_motion)
+    figure.canvas.mpl_connect("button_release_event", on_pointer_release)
     figure.canvas.mpl_connect("scroll_event", on_scroll)
     plt.show(block=True)
     if not state["saved"]:

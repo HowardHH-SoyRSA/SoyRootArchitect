@@ -14,6 +14,9 @@ from soyrootbio.desktop_gui import (
     validate_launcher_settings,
 )
 from soyrootbio.endpoint_picker import (
+    _camera_pan_shift,
+    _configure_selection_axis,
+    _inverted_drag_rotation,
     _parse_sample_count,
     _wheel_zoom_factor,
     _zoom_3d_axis,
@@ -46,6 +49,28 @@ def test_primary_section_wheel_zoom_supports_backend_event_variants() -> None:
     assert np.diff(axis.get_xlim())[0] == pytest.approx(6.0)
     assert np.diff(axis.get_ylim())[0] == pytest.approx(3.0)
     assert np.diff(axis.get_zlim())[0] == pytest.approx(3.0)
+
+
+def test_selection_views_share_sparse_grid_and_inverted_drag_directions() -> None:
+    from matplotlib.figure import Figure
+
+    elevation, azimuth = _inverted_drag_rotation(22.0, -60.0, 10.0, 10.0)
+    assert elevation == pytest.approx(25.0)
+    assert azimuth == pytest.approx(-63.5)
+
+    limits = np.array([[-2.0, 8.0], [-4.0, 6.0], [0.0, 10.0]])
+    normal_pan = _camera_pan_shift(12.0, -8.0, 600.0, 400.0, -60.0, 22.0, limits)
+    inverted_pan = _camera_pan_shift(-12.0, 8.0, 600.0, 400.0, -60.0, 22.0, limits)
+    assert inverted_pan == pytest.approx(-normal_pan)
+
+    axis = Figure().add_subplot(projection="3d")
+    points = np.array([[-2.0, -4.0, 0.0], [8.0, 6.0, 10.0]])
+    _configure_selection_axis(axis, points)
+    for coordinate_axis, bounds in zip(
+        (axis.xaxis, axis.yaxis, axis.zaxis),
+        ((-2.0, 8.0), (-4.0, 6.0), (0.0, 10.0)),
+    ):
+        assert len(coordinate_axis.get_major_locator().tick_values(*bounds)) <= 6
 
 
 def test_launcher_accepts_only_the_retained_settings(tmp_path: Path):
