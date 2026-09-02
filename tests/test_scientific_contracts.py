@@ -289,6 +289,96 @@ def test_hierarchy_repair_enforces_recursive_orders_and_validation_metadata():
     assert report.low_confidence_roots == sum(root.confidence < 0.55 for root in repaired)
 
 
+def test_hierarchy_repair_removes_overlong_child_and_its_descendants():
+    primary = np.array(
+        [
+            [0.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    parent = RootPath(
+        root_id="candidate-parent",
+        points=np.array(
+            [
+                [0.0, 0.0, 1.5],
+                [0.4, 0.0, 1.5],
+            ]
+        ),
+        order=1,
+        parent_id="primary",
+    )
+    overlong_child = RootPath(
+        root_id="candidate-overlong-child",
+        points=np.array(
+            [
+                [0.4, 0.0, 1.5],
+                [0.4, 0.7, 1.5],
+            ]
+        ),
+        order=2,
+        parent_id=parent.root_id,
+    )
+    dependent_descendant = RootPath(
+        root_id="candidate-dependent-descendant",
+        points=np.array(
+            [
+                [0.4, 0.7, 1.5],
+                [0.4, 0.7, 1.4],
+            ]
+        ),
+        order=3,
+        parent_id=overlong_child.root_id,
+    )
+    valid_sibling = RootPath(
+        root_id="candidate-valid-sibling",
+        points=np.array(
+            [
+                [0.0, 0.0, 0.5],
+                [-0.3, 0.0, 0.5],
+            ]
+        ),
+        order=1,
+        parent_id="primary",
+    )
+    overlong_first_order = RootPath(
+        root_id="candidate-overlong-first-order",
+        points=np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [2.2, 0.0, 1.0],
+            ]
+        ),
+        order=1,
+        parent_id="primary",
+    )
+
+    repaired, report = repair_root_hierarchy(
+        primary,
+        [
+            parent,
+            overlong_child,
+            dependent_descendant,
+            valid_sibling,
+            overlong_first_order,
+        ],
+        d_bar=0.005,
+    )
+
+    assert len(repaired) == 2
+    assert all(root.order == 1 for root in repaired)
+    assert validate_root_tree(repaired, primary_path=primary) == []
+    assert report.overlong_children_removed == 2
+    assert report.overlong_descendants_removed == 1
+    assert len(report.overlong_child_details) == 2
+    assert any(
+        detail["parent_id"] == "primary"
+        for detail in report.overlong_child_details
+    )
+    for detail in report.overlong_child_details:
+        assert detail["child_length_normalized"] > detail["parent_length_normalized"]
+        assert detail["child_parent_length_ratio"] > 1.0
+
+
 def _surface_samples(path: np.ndarray, radius: float) -> np.ndarray:
     """Sample circular sections normal to the local centreline tangent."""
 

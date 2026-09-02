@@ -56,7 +56,7 @@ def editor_bundle(tmp_path: Path) -> Path:
     root_points = {
         "primary": np.array(
             [
-                [0.0, 0.0, 4.0],
+                [0.0, 0.0, 10.0],
                 [0.0, 0.0, 3.0],
                 [0.0, 0.0, 2.0],
                 [0.0, 0.0, 1.0],
@@ -76,15 +76,15 @@ def editor_bundle(tmp_path: Path) -> Path:
                 [0.0, 0.0, 1.0],
                 [-0.5, 0.0, 1.0],
                 [-1.0, 0.0, 0.8],
-                [-1.5, 0.0, 0.5],
+                [-4.0, 0.0, 0.5],
             ]
         ),
         "root-c": np.array(
             [
                 [0.5, 0.0, 3.0],
-                [0.5, 0.5, 3.0],
-                [0.5, 1.0, 2.8],
-                [0.5, 1.5, 2.5],
+                [0.5, 0.25, 3.0],
+                [0.5, 0.5, 2.9],
+                [0.5, 0.75, 2.8],
             ]
         ),
     }
@@ -188,10 +188,10 @@ def editor_bundle(tmp_path: Path) -> Path:
     )
 
     metric_values = {
-        "primary": (4.0, 4.0, None, 0.20, 3.0, 0.12, 1.0),
+        "primary": (10.0, 10.0, None, 0.20, 3.0, 0.12, 1.0),
         "root-a": (1.54, 1.51, 74.0, 0.10, 1.1, 0.03, 1.02),
-        "root-b": (1.62, 1.58, 62.0, 0.09, 1.0, 0.025, 1.03),
-        "root-c": (1.62, 1.58, 68.0, 0.07, 0.8, 0.015, 1.03),
+        "root-b": (4.05, 4.03, 62.0, 0.09, 1.0, 0.025, 1.01),
+        "root-c": (0.79, 0.78, 68.0, 0.07, 0.8, 0.015, 1.01),
     }
     parents = {
         "primary": "",
@@ -773,8 +773,8 @@ def test_create_root_claims_unassigned_points_near_the_drawn_path(
         {
             "parent_id": "root-a",
             "points": [
-                [1.8, 1.8, 2.1],
-                [2.0, 2.0, 2.0],
+                [1.5, 0.0, 2.8],
+                [1.8, 0.2, 2.6],
             ],
             # Deliberately broad enough to cover assigned and uncertain points.
             # Creation must still claim only label -1.
@@ -1253,6 +1253,28 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     assert manifest["operation_blob_directory"] == "blobs"
     assert manifest["operation_blob_count"] == 1
     assert _file_digests(editor_bundle) == source_before
+
+
+def test_editor_rejects_overlong_child_atomically(editor_bundle: Path) -> None:
+    session = _new_session(editor_bundle, "overlong-child")
+    before = _materialised_snapshot(session)
+
+    with pytest.raises(EditorValidationError, match="exceeds parent"):
+        session.apply_operation(
+            "redraw_root",
+            {
+                "root_id": "root-c",
+                "points": [
+                    [0.5, 0.0, 3.0],
+                    [0.5, 3.0, 3.0],
+                ],
+            },
+            operation_id="invalid-overlong-child",
+        )
+
+    assert _materialised_snapshot(session) == before
+    assert session.public_state()["operation_count"] == 0
+    assert not session.log_path.exists()
 
 
 @pytest.mark.parametrize(

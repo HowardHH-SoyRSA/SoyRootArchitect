@@ -19,7 +19,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from ..export import order_color, write_rsml
-from ..geometry import path_length
+from ..geometry import child_length_exceeds_parent, path_length
 from ..hardware import HardwareInfo, detect_hardware
 from ..io import write_labeled_ply
 from ..traits import compute_traits
@@ -1218,6 +1218,14 @@ class EditorSession:
                 raise EditorValidationError(f"{root.root_id} has an invalid polyline.")
             if root.root_id != PRIMARY_ID:
                 parent = self.roots[root.parent_id]
+                child_length = path_length(root.points)
+                parent_length = path_length(parent.points)
+                if child_length_exceeds_parent(child_length, parent_length):
+                    raise EditorValidationError(
+                        f"{root.root_id} has centreline length {child_length:.9g}, "
+                        f"which exceeds parent {parent.root_id} length "
+                        f"{parent_length:.9g}."
+                    )
                 if (
                     root.insertion_index is None
                     or not 0 <= int(root.insertion_index) < len(parent.points)

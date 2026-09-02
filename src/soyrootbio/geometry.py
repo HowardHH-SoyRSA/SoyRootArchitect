@@ -8,6 +8,10 @@ from .runtime import worker_threads
 from .types import Normalization
 
 
+CHILD_PARENT_LENGTH_ABSOLUTE_TOLERANCE = 1e-12
+CHILD_PARENT_LENGTH_RELATIVE_TOLERANCE = 1e-9
+
+
 def normalize_unit_box(points: np.ndarray) -> tuple[np.ndarray, Normalization]:
     points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[1] != 3:
@@ -32,6 +36,22 @@ def path_length(points: np.ndarray) -> float:
     if len(points) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def child_length_exceeds_parent(
+    child_length: float,
+    parent_length: float,
+) -> bool:
+    """Return whether a child is longer than its parent beyond float noise."""
+
+    child = float(child_length)
+    parent = float(parent_length)
+    tolerance = max(
+        CHILD_PARENT_LENGTH_ABSOLUTE_TOLERANCE,
+        CHILD_PARENT_LENGTH_RELATIVE_TOLERANCE
+        * max(abs(child), abs(parent)),
+    )
+    return child > parent + tolerance
 
 
 def resample_polyline(points: np.ndarray, spacing: float) -> np.ndarray:

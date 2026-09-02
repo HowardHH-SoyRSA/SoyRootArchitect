@@ -9,6 +9,7 @@ The project prioritizes the measurement objectives in this repository over exact
 - Reads STL and PLY meshes while preserving their vertices and faces. OBJ meshes and XYZ/CSV point clouds are also supported.
 - Uses a ranked automatic primary-root detector by default, with manual endpoints, a soil-line constraint, and optional guide sections as overrides.
 - Represents the primary as order 0, its children as order 1, and recursively assigns every descendant `parent order + 1`.
+- Enforces non-increasing centreline length down the hierarchy: an automatic child longer than its parent is removed with its dependent subtree, and equivalent manual edits are rejected atomically.
 - Produces an oriented centreline tree, stable root IDs, insertion locations, confidence values, and QC flags.
 - Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
 - Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
@@ -172,7 +173,7 @@ soyrootbio run `
   --correction-file "D:\results\sample\root_hierarchy.json"
 ```
 
-In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, or inconsistent topology are rejected. Root order is recalculated from the corrected parent links.
+In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, a child centreline longer than its parent, or inconsistent topology are rejected. Root order is recalculated from the corrected parent links.
 
 The primary row is immutable in a correction file; change the primary with endpoints, soil line, or guide sections instead. Lateral root IDs are treated as immutable provenance keys while corrections are applied: deleting a root does not renumber the survivors or reuse the deleted ID. Unknown/stale IDs, duplicate IDs, and stale geometry fingerprints are rejected. If a lateral's parent or polyline is actually changed, its automatic attachment confidence is set to `0` and the QC flags `manual_correction`, `attachment_confidence_invalidated`, and `low_confidence` are added pending review.
 
@@ -304,6 +305,8 @@ Every run writes a self-contained output directory. Class-specific PLY files are
 The labelled PLY stores RGB plus scalar properties `root_id`, `root_order`, and `assignment_state`. Numeric `root_id` is `0` for primary, positive for selected laterals, `-1` for unassigned, and `-2` for uncertain. `assignment_state` is `0` unassigned, `1` assigned, and `2` uncertain. For the unsigned `root_order` PLY field, `255` denotes unassigned and `254` denotes uncertain; use `csv/root_label_map.csv` rather than treating those sentinels as biological orders. The colours are:
 
 An **unassigned** point is either deliberately above the selected base or was not claimed by the segmented primary or by the support radius of any selected lateral. This commonly includes shoot/stem remnants, soil or pot fragments, disconnected noise, distant surface regions, or real roots that tracing did not retain. An **uncertain** point is different: it lies within assignment range but is nearly equally close to competing selected roots, so ownership is intentionally withheld. Counts for both states and the two unassigned categories are written to `metadata.json`; their fractions are included in the system summary.
+
+After full-resolution assignment, a mesh-connectivity cleanup absorbs small, discrete order-1, uncertain, or unassigned islands that are enclosed by primary-labelled surface and lie within the measured primary-root envelope. It preserves every order-1 root's main surface component and never reclaims points excluded above the selected base. The applied policy and absorbed patch/vertex counts are recorded under `point_assignment.primary_surface_patch_cleanup` in `metadata.json`.
 
 | Class | Colour |
 |---|---|

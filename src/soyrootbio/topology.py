@@ -12,7 +12,12 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from .geometry import tangent_vectors, vector_angle_degrees
+from .geometry import (
+    child_length_exceeds_parent,
+    path_length,
+    tangent_vectors,
+    vector_angle_degrees,
+)
 from .lateral import estimate_parent_radius_profile
 from .types import Normalization, RootPath, TopologyReport
 
@@ -668,6 +673,63 @@ def _reject_nonfinite_json(token: str):
     raise ValueError(f"Hierarchy correction contains non-finite JSON constant: {token}")
 
 
+def _prune_overlong_child_subtrees(
+    primary_path: np.ndarray,
+    lateral_paths: list[RootPath],
+) -> tuple[list[RootPath], list[dict[str, object]], int]:
+    """Remove every overlong child and the descendants that depend on it."""
+
+    children: dict[str, list[RootPath]] = defaultdict(list)
+    for path in lateral_paths:
+        children[str(path.parent_id)].append(path)
+
+    removed_ids: set[str] = set()
+    violations: list[dict[str, object]] = []
+    queue: deque[tuple[str, float, bool]] = deque(
+        [(PRIMARY_ID, path_length(np.asarray(primary_path, dtype=float)), False)]
+    )
+    visited = {PRIMARY_ID}
+    while queue:
+        parent_id, parent_length, parent_removed = queue.popleft()
+        for child in sorted(
+            children.get(parent_id, []),
+            key=lambda item: str(item.root_id),
+        ):
+            child_id = str(child.root_id)
+            if child_id in visited:
+                continue
+            visited.add(child_id)
+            child_length = float(child.length)
+            direct_violation = (
+                not parent_removed
+                and child_length_exceeds_parent(child_length, parent_length)
+            )
+            child_removed = parent_removed or direct_violation
+            if child_removed:
+                removed_ids.add(child_id)
+            if direct_violation:
+                violations.append(
+                    {
+                        "root_id": child_id,
+                        "parent_id": parent_id,
+                        "child_length_normalized": child_length,
+                        "parent_length_normalized": float(parent_length),
+                        "child_parent_length_ratio": (
+                            child_length / parent_length
+                            if parent_length > 0.0
+                            else None
+                        ),
+                    }
+                )
+            queue.append((child_id, child_length, child_removed))
+
+    retained = [
+        path for path in lateral_paths if str(path.root_id) not in removed_ids
+    ]
+    descendant_count = max(0, len(removed_ids) - len(violations))
+    return retained, violations, descendant_count
+
+
 def repair_root_hierarchy(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
@@ -869,13 +931,26 @@ def repair_root_hierarchy(
     _assign_recursive_orders(repaired)
     _assign_stable_ids(repaired)
     _refresh_parent_references(primary_path, repaired)
-    errors = validate_root_tree(repaired)
+    (
+        repaired,
+        report.overlong_child_details,
+        report.overlong_descendants_removed,
+    ) = _prune_overlong_child_subtrees(primary_path, repaired)
+    report.overlong_children_removed = len(report.overlong_child_details)
+    report.low_confidence_roots = sum(
+        float(path.confidence) < 0.55 for path in repaired
+    )
+    errors = validate_root_tree(repaired, primary_path=primary_path)
     report.warnings.extend(errors)
     report.disconnected_roots = sum("missing parent" in error for error in errors)
     return repaired, report
 
 
-def validate_root_tree(paths: Iterable[RootPath]) -> list[str]:
+def validate_root_tree(
+    paths: Iterable[RootPath],
+    *,
+    primary_path: np.ndarray | None = None,
+) -> list[str]:
     """Return invariant violations; an empty result proves a rooted tree."""
 
     paths = list(paths)
@@ -897,6 +972,30 @@ def validate_root_tree(paths: Iterable[RootPath]) -> list[str]:
             )
         if path.insertion_point is None or path.insertion_index is None:
             errors.append(f"{path.root_id}: insertion location is missing")
+        parent_length: float | None = None
+        if path.parent_id == PRIMARY_ID:
+            reference = (
+                np.asarray(primary_path, dtype=float)
+                if primary_path is not None
+                else (
+                    np.asarray(path.parent_points, dtype=float)
+                    if path.parent_points is not None
+                    else None
+                )
+            )
+            if reference is not None and reference.ndim == 2 and len(reference) >= 2:
+                parent_length = path_length(reference)
+        else:
+            parent_length = float(by_id[path.parent_id].length)
+        child_length = float(path.length)
+        if (
+            parent_length is not None
+            and child_length_exceeds_parent(child_length, parent_length)
+        ):
+            errors.append(
+                f"{path.root_id}: centreline length {child_length:.9g} exceeds "
+                f"parent {path.parent_id} length {parent_length:.9g}"
+            )
     if not nx.is_directed_acyclic_graph(graph):
         errors.append("root hierarchy contains a cycle")
     unreachable = set(graph.nodes) - set(nx.descendants(graph, PRIMARY_ID)) - {PRIMARY_ID}
@@ -1136,7 +1235,7 @@ def apply_hierarchy_corrections(
     # deleted ID to identify different geometry and would break correction
     # audit trails.  root_order is the authoritative post-edit order.
     _refresh_parent_references(np.asarray(primary_path, dtype=float), kept)
-    errors = validate_root_tree(kept)
+    errors = validate_root_tree(kept, primary_path=primary_path)
     if errors:
         raise ValueError("Invalid corrected hierarchy: " + "; ".join(errors))
     return kept

@@ -161,6 +161,33 @@ def test_polyline_vertex_count_edit_is_accepted_and_invalidates_automatic_confid
     assert "junction_branch_separation" not in edited.score_components
 
 
+def test_correction_rejects_child_longer_than_its_parent(tmp_path: Path) -> None:
+    primary, roots = _hierarchy()
+    correction = _write_payload(
+        tmp_path / "overlong-child.json",
+        {
+            "schema": "soyrootbio.root-hierarchy/v1",
+            "coordinate_space": "analysis_normalized",
+            "roots": [
+                {
+                    "root_id": "root-o2-004",
+                    "polyline": [
+                        [0.2, 0.0, 0.75],
+                        [0.2, 0.8, 0.75],
+                    ],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(ValueError, match="exceeds parent"):
+        apply_hierarchy_corrections(
+            primary,
+            copy.deepcopy(roots),
+            correction,
+        )
+
+
 def test_deleting_a_leaf_preserves_every_surviving_provenance_id(tmp_path: Path) -> None:
     primary, roots = _hierarchy()
     removed_id = "root-o1-011"

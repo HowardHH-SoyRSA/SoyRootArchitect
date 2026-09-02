@@ -61,6 +61,17 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert {"tortuosity", "mean_diameter", "tip_gravity_angle_deg", "tip_start_gravity_angle_deg", "tip_primary_angle_deg"}.issubset(traits.columns)
     assert set(traits["length_unit"]) == {"mesh_unit"}
     assert not any("mm" in column.lower() for column in traits.columns)
+    length_by_id = traits.set_index("root_id")["length"].to_dict()
+    for row in traits.itertuples(index=False):
+        if pd.isna(row.parent_id) or not str(row.parent_id):
+            continue
+        assert float(row.length) <= float(length_by_id[str(row.parent_id)]) + 1e-9
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["lateral_tracing_policy"][
+        "child_length_may_not_exceed_parent"
+    ] is True
+    assert metadata["topology_report"]["overlong_children_removed"] >= 0
+    assert metadata["topology_report"]["overlong_descendants_removed"] >= 0
 
 
 def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path: Path):
@@ -124,6 +135,10 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
         + assignment["unassigned_vertex_count"]
         == assignment["total_vertex_count"]
     )
+    cleanup = assignment["primary_surface_patch_cleanup"]
+    assert cleanup["policy"] == "primary-surface-small-patch-cleanup-v1"
+    assert cleanup["absorbed_patch_count"] >= 0
+    assert cleanup["absorbed_vertex_count"] >= 0
 
 
 def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
