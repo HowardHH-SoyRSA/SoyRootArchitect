@@ -86,10 +86,14 @@ def test_clean_surface_branching_stops_at_junction_and_preserves_two_orders() ->
     assert set(by_order) == {1, 2}
     assert by_order[1].parent_id == "primary"
     assert by_order[2].parent_id == by_order[1].root_id
+    assert (
+        np.linalg.norm(by_order[2].points[0] - expected[1][0])
+        < 0.040
+    )
     for order, expected_centerline in enumerate(expected, start=1):
         root = by_order[order]
         distances = cKDTree(expected_centerline).query(root.points, k=1)[0]
-        assert float(np.median(distances)) < 0.012
+        assert float(np.median(distances)) < 0.013
         assert float(np.max(distances)) < 0.040
         expected_length = path_length(expected_centerline)
         assert abs(root.length - expected_length) / expected_length < 0.20

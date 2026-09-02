@@ -20,6 +20,7 @@ from .lateral import (
     extend_lateral_tip,
     find_lateral_starting_points,
     grow_lateral_candidates,
+    is_ancestor_inward_candidate,
     is_parent_tracking_candidate,
     reduce_similar_paths,
     select_non_overlapping_paths,
@@ -31,7 +32,12 @@ from .primary import (
     refine_primary_centerline,
     tangent_plane_primary_segmentation,
 )
-from .topology import apply_hierarchy_corrections, repair_root_hierarchy, validate_root_tree
+from .topology import (
+    apply_hierarchy_corrections,
+    repair_root_hierarchy,
+    uncross_internal_primary_sibling_contacts,
+    validate_root_tree,
+)
 from .traits import compute_traits
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
@@ -81,6 +87,30 @@ def _lateral_start_distance_limits(
         np.maximum(base_distance_limit, diameter_bridge),
         base_distance_limit,
     )
+
+
+def _ancestor_tube_mask(
+    points: np.ndarray,
+    ancestor_path: np.ndarray,
+    ancestor_radius_profile: np.ndarray,
+    d_bar: float,
+) -> np.ndarray:
+    """Return vertices inside a sampling-scaled ancestor surface envelope."""
+
+    source = np.asarray(points, dtype=float)
+    ancestor = np.asarray(ancestor_path, dtype=float)
+    radii = np.asarray(ancestor_radius_profile, dtype=float)
+    if radii.shape != (len(ancestor),):
+        raise ValueError(
+            "ancestor_radius_profile must contain one value per path node"
+        )
+    distances, nearest = cKDTree(ancestor).query(
+        source,
+        k=1,
+        workers=worker_threads(),
+    )
+    envelope = radii[np.asarray(nearest, dtype=int)] + 2.0 * float(d_bar)
+    return np.asarray(distances, dtype=float) <= envelope
 
 
 @dataclass
@@ -291,7 +321,14 @@ def _run_pipeline_impl(
     checkpoint("lateral_tracing", "Repairing root topology", 0.70)
     if lateral_start_count == 0:
         LOGGER.warning("No lateral root starting points detected; exporting primary-root-only results.")
-    selected, topology_report = repair_root_hierarchy(primary.points, selected, d_bar=d_bar)
+    selected, topology_report = repair_root_hierarchy(
+        primary.points,
+        selected,
+        d_bar=d_bar,
+        primary_surface_points=normalized[
+            np.asarray(primary_mask, dtype=bool) & ~above_base_mask
+        ],
+    )
     if config.correction_file is not None:
         selected = apply_hierarchy_corrections(
             primary.points,
@@ -303,13 +340,39 @@ def _run_pipeline_impl(
     if topology_errors:
         raise RuntimeError("Root topology validation failed: " + "; ".join(topology_errors))
     checkpoint("topology_repair", "Assigning root vertices", 0.76)
-    lateral_labels = _assign_lateral_points(
+    segmented_primary_mask = np.asarray(primary_mask, dtype=bool).copy()
+    lateral_labels, analysis_competing_labels = _assign_lateral_points(
         normalized,
         selected,
-        primary_mask,
+        segmented_primary_mask,
         d_bar,
         excluded_mask=above_base_mask,
+        return_competing_labels=True,
     )
+    analysis_root_labels = _analysis_root_labels(
+        segmented_primary_mask,
+        lateral_labels,
+    )
+    analysis_root_labels, analysis_junction_report = _resolve_parent_owned_junctions(
+        normalized,
+        analysis_root_labels,
+        primary.points,
+        selected,
+        d_bar=d_bar,
+        assignment_radius=max(4.0 * d_bar, 0.006),
+        ambiguity_margin=max(0.75 * d_bar, 0.001),
+        competing_labels=analysis_competing_labels,
+    )
+    # The lateral-label representation reserves zero for "not lateral", so
+    # reconstruct both masks from unified labels after resolving primary-owned
+    # junctions.  This prevents the sampled-point overwrite below from
+    # reintroducing orange uncertainty bands into full-resolution exports.
+    primary_mask = analysis_root_labels == 0
+    lateral_labels = np.zeros(len(analysis_root_labels), dtype=int)
+    lateral_labels[analysis_root_labels > 0] = analysis_root_labels[
+        analysis_root_labels > 0
+    ]
+    lateral_labels[analysis_root_labels == -2] = -1
     full_normalized = normalization.transform_points(cloud.export_points)
     full_above_base_mask = _selected_base_exclusion_mask(
         full_normalized,
@@ -319,17 +382,102 @@ def _run_pipeline_impl(
         collar_neighborhood_radius=base_collar_neighborhood_radius,
         tolerance=base_tolerance,
     )
-    full_root_labels = _assign_full_root_labels(
+    full_root_labels, full_competing_labels = _assign_full_root_labels(
         full_normalized,
         primary.points,
         selected,
         d_bar=d_bar,
         excluded_mask=full_above_base_mask,
+        return_competing_labels=True,
     )
+    (
+        internal_o1_contact_changed_ids,
+        internal_o1_contact_decisions,
+    ) = uncross_internal_primary_sibling_contacts(
+        full_normalized,
+        full_root_labels,
+        selected,
+        d_bar=d_bar,
+    )
+    internal_o1_contact_changed_ids = {
+        str(root_id) for root_id in internal_o1_contact_changed_ids
+    }
+    if internal_o1_contact_changed_ids:
+        topology_errors = validate_root_tree(selected)
+        if topology_errors:
+            raise RuntimeError(
+                "Root topology validation failed after internal O1 contact "
+                "uncrossing: "
+                + "; ".join(topology_errors)
+            )
+        LOGGER.info(
+            "Internal O1 contact uncrossing changed %d roots; "
+            "reassigning analysis and full-resolution vertices",
+            len(internal_o1_contact_changed_ids),
+        )
+        lateral_labels, analysis_competing_labels = _assign_lateral_points(
+            normalized,
+            selected,
+            segmented_primary_mask,
+            d_bar,
+            excluded_mask=above_base_mask,
+            return_competing_labels=True,
+        )
+        analysis_root_labels = _analysis_root_labels(
+            segmented_primary_mask,
+            lateral_labels,
+        )
+        (
+            analysis_root_labels,
+            analysis_junction_report,
+        ) = _resolve_parent_owned_junctions(
+            normalized,
+            analysis_root_labels,
+            primary.points,
+            selected,
+            d_bar=d_bar,
+            assignment_radius=max(4.0 * d_bar, 0.006),
+            ambiguity_margin=max(0.75 * d_bar, 0.001),
+            competing_labels=analysis_competing_labels,
+        )
+        primary_mask = analysis_root_labels == 0
+        lateral_labels = np.zeros(len(analysis_root_labels), dtype=int)
+        lateral_labels[analysis_root_labels > 0] = analysis_root_labels[
+            analysis_root_labels > 0
+        ]
+        lateral_labels[analysis_root_labels == -2] = -1
+        full_root_labels, full_competing_labels = _assign_full_root_labels(
+            full_normalized,
+            primary.points,
+            selected,
+            d_bar=d_bar,
+            excluded_mask=full_above_base_mask,
+            return_competing_labels=True,
+        )
     if cloud.analysis_indices is not None and len(cloud.analysis_indices) == len(normalized):
-        analysis_root_labels = _analysis_root_labels(primary_mask, lateral_labels)
-        full_root_labels[np.asarray(cloud.analysis_indices, dtype=int)] = analysis_root_labels
+        analysis_indices = np.asarray(cloud.analysis_indices, dtype=int)
+        full_root_labels[analysis_indices] = analysis_root_labels
+        # Replace the competitor evidence at sampled vertices with the
+        # evidence that produced the sampled labels. Stale full-resolution
+        # entries are harmless for non-uncertain labels and are ignored below.
+        for analysis_index, pair in analysis_competing_labels.items():
+            full_competing_labels[int(analysis_indices[int(analysis_index)])] = pair
     full_root_labels[full_above_base_mask] = -1
+    full_root_labels, full_junction_report = _resolve_parent_owned_junctions(
+        full_normalized,
+        full_root_labels,
+        primary.points,
+        selected,
+        d_bar=d_bar,
+        assignment_radius=max(5.0 * d_bar, 0.008),
+        ambiguity_margin=max(0.75 * d_bar, 0.001),
+        competing_labels=full_competing_labels,
+    )
+    LOGGER.info(
+        "Assigned %d analysis and %d full-resolution uncertain junction points to their parents",
+        int(analysis_junction_report["resolved_vertex_count"]),
+        int(full_junction_report["resolved_vertex_count"]),
+    )
     checkpoint("point_assignment", "Computing root traits", 0.82)
     traits = compute_traits(
         primary.points,
@@ -386,6 +534,39 @@ def _run_pipeline_impl(
         "candidate_lateral_count": candidate_count,
         "selected_lateral_count": len(selected),
         "selected_order_counts": order_counts,
+        "lateral_tracing_policy": {
+            "hypotheses_per_parameter_variant": 1,
+            "fork_hypothesis_promotion": False,
+            "surface_aware_order1_seeding": True,
+            "surface_contact_distance_d_bar": 2.5,
+            "surface_contact_minimum_points": 3,
+            "minimum_travel_fraction_insertion": 0.30,
+            "minimum_travel_fraction_stable": 0.375,
+            "minimum_travel_fraction_high_curvature": 0.30,
+            "minimum_travel_fraction_fallback": 0.30,
+            "accepted_node_cross_section_clearance": (
+                "0.90 * search_radius with axial progress <= "
+                "0.29 * step_length"
+            ),
+            "covered_forward_recovery": True,
+            "local_radius_continuity_reward": 0.08,
+            "longest_path_reward_per_d_bar": 0.35,
+            "rms_curvature_penalty": 0.25,
+            "cumulative_turn_penalty": 0.06,
+            "same_insertion_divergence_reparenting": True,
+            "same_insertion_o1_duplicate_merge": True,
+            "contacted_primary_sibling_suffix_crop": True,
+            "contacted_sibling_child_continuation_join": True,
+            "internal_o1_contact_uncrossing": True,
+            "internal_o1_contact_uncrossing_labels": (
+                "pre-junction full-resolution root labels"
+            ),
+            "ancestor_inward_terminal_rejection": True,
+        },
+        "internal_o1_contact_changed_root_ids": sorted(
+            internal_o1_contact_changed_ids
+        ),
+        "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "primary_detection_method": _primary_method(config),
         "point_assignment": _point_assignment_summary(
             full_root_labels,
@@ -397,6 +578,8 @@ def _run_pipeline_impl(
             base_tolerance=base_tolerance,
             d_bar=d_bar,
             analysis_above_base_count=int(np.count_nonzero(above_base_mask)),
+            analysis_junction_report=analysis_junction_report,
+            full_junction_report=full_junction_report,
         ),
         "primary_candidates": [_candidate_metadata(candidate, normalization) for candidate in primary_candidates],
         "topology_report": topology_report.__dict__,
@@ -510,6 +693,22 @@ def _trace_lateral_orders(
     total_starts = 0
     total_candidates = 0
     order_counts: dict[int, int] = {}
+    primary_support_points = points[
+        np.asarray(primary_mask, dtype=bool) & ~excluded
+    ]
+    if len(primary_support_points) < 3:
+        primary_support_points = np.asarray(primary_path, dtype=float)
+    primary_ancestor_radius_profile = estimate_parent_radius_profile(
+        primary_path,
+        primary_support_points,
+        d_bar,
+    )
+    primary_ancestor_mask = _ancestor_tube_mask(
+        points,
+        primary_path,
+        primary_ancestor_radius_profile,
+        d_bar,
+    )
 
     for order in range(1, max(1, int(max_root_order)) + 1):
         if cooperate is not None:
@@ -524,6 +723,7 @@ def _trace_lateral_orders(
             if cooperate is not None:
                 cooperate()
             closest_fraction = 0.03 if order == 1 else 0.01
+            parent_position: int | None = None
             if parent_id == "primary":
                 parent_support_mask = np.asarray(primary_mask, dtype=bool) & ~excluded
             else:
@@ -567,6 +767,16 @@ def _trace_lateral_orders(
                 max_parent_distance=parent_distance_limit,
                 minimum_branch_angle_degrees=18.0,
                 exclude_parent_tip_fraction=0.12 if order > 1 else 0.0,
+                parent_surface_points=(
+                    parent_support_points
+                    if order == 1 and parent_id == "primary"
+                    else None
+                ),
+                surface_contact_distance=(
+                    2.5 * float(d_bar)
+                    if order == 1 and parent_id == "primary"
+                    else None
+                ),
             )
             order_starts += len(starts)
             max_steps = 80 if order == 1 else 35
@@ -578,6 +788,9 @@ def _trace_lateral_orders(
                 d_bar=d_bar,
                 max_steps=max_steps,
                 parent_radius_profile=parent_radius_profile,
+                ancestor_exclusion_mask=(
+                    primary_ancestor_mask if order > 1 else None
+                ),
                 cooperate=cooperate,
             )
             order_candidate_count += len(candidates)
@@ -586,6 +799,19 @@ def _trace_lateral_orders(
                 candidate.order = order
                 candidate.parent_id = parent_id
                 candidate.parent_points = parent_path
+                if order > 1:
+                    ancestor_rejected, ancestor_metrics = (
+                        is_ancestor_inward_candidate(
+                            candidate,
+                            primary_path,
+                            primary_ancestor_radius_profile,
+                            d_bar,
+                        )
+                    )
+                    candidate.score_components.update(ancestor_metrics)
+                    if ancestor_rejected:
+                        order_parent_tracking_rejections += 1
+                        continue
                 rejected, tracking_metrics = is_parent_tracking_candidate(
                     candidate,
                     parent_path,
@@ -624,12 +850,66 @@ def _trace_lateral_orders(
             break
         reduced = reduce_similar_paths(order_candidates)
         remaining = None if max_paths is None else max(0, max_paths - len(selected_all))
-        selected = select_non_overlapping_paths(reduced, points, d_bar=d_bar, max_paths=remaining)
+        existing_order_support: set[int] = set()
+        for existing in selected_all:
+            if int(existing.order) != order:
+                continue
+            existing_order_support.update(
+                existing.novel_support_indices
+                if existing.novel_support_indices is not None
+                else existing.covered_indices
+            )
+        selected = select_non_overlapping_paths(
+            reduced,
+            points,
+            d_bar=d_bar,
+            max_paths=remaining,
+            rename_selected=False,
+            initial_used=existing_order_support,
+        )
+        connectors_by_parent: dict[str, list[RootPath]] = {}
+        ordinary_selected: list[RootPath] = []
+        selected_parent_by_id = {
+            str(path.root_id): path
+            for path in selected_all
+        }
+        for path in selected:
+            parent_root = selected_parent_by_id.get(str(path.parent_id))
+            if (
+                parent_root is not None
+                and _is_parent_owned_basal_connector(
+                    path,
+                    parent_root,
+                    d_bar=d_bar,
+                )
+            ):
+                connectors_by_parent.setdefault(
+                    str(parent_root.root_id),
+                    [],
+                ).append(path)
+            else:
+                ordinary_selected.append(path)
+        for parent_id, connectors in connectors_by_parent.items():
+            _merge_parent_owned_basal_connectors(
+                selected_parent_by_id[parent_id],
+                connectors,
+                d_bar=d_bar,
+            )
+            order_parent_tracking_rejections += len(connectors)
+        selected = ordinary_selected
+        sequence_base = len(selected_all)
+        for sequence_index, path in enumerate(selected, start=1):
+            path.order = order
+            path.root_id = (
+                f"order{path.order}_{sequence_base + sequence_index:03d}"
+            )
         refined: list[RootPath] = []
         for path in selected:
-            path.order = order
-            path.root_id = f"order{order}_{len(selected_all) + len(refined) + 1:03d}"
-            path.parent_points = path.parent_points if path.parent_points is not None else primary_path
+            path.parent_points = (
+                path.parent_points
+                if path.parent_points is not None
+                else primary_path
+            )
             path.parent_id = path.parent_id or "primary"
             traced_paths = backtrace_to_primary(
                 [path],
@@ -700,8 +980,30 @@ def _trace_lateral_orders(
                 )
                 if len(centered) >= 2:
                     traced.points = centered
+        if order > 1:
+            final_refined: list[RootPath] = []
+            for traced in refined:
+                ancestor_rejected, ancestor_metrics = (
+                    is_ancestor_inward_candidate(
+                        traced,
+                        primary_path,
+                        primary_ancestor_radius_profile,
+                        d_bar,
+                    )
+                )
+                traced.score_components.update(ancestor_metrics)
+                traced.score_components[
+                    "ancestor_inward_final_check"
+                ] = 1.0
+                if ancestor_rejected:
+                    order_parent_tracking_rejections += 1
+                    continue
+                final_refined.append(traced)
+            refined = final_refined
+        if not refined:
+            break
         selected_all.extend(refined)
-        order_counts[order] = len(refined)
+        order_counts[order] = sum(int(path.order) == order for path in selected_all)
         labels = _assign_lateral_points(
             points,
             selected_all,
@@ -710,7 +1012,11 @@ def _trace_lateral_orders(
             excluded_mask=excluded,
         )
         occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded | (labels > 0)
-        parent_paths = [(path.root_id, path.points) for path in refined]
+        parent_paths = [
+            (path.root_id, path.points)
+            for path in selected_all
+            if int(path.order) == order
+        ]
         LOGGER.info(
             "Selected %d order-%d lateral paths (%d tip-extended) from %d starts and %d candidates; flagged %d parent-tracking variants",
             len(refined),
@@ -727,6 +1033,194 @@ def _trace_lateral_orders(
     }
     order_counts = {order: count for order, count in order_counts.items() if count > 0}
     return selected_all, total_starts, total_candidates, order_counts
+
+
+def _is_parent_owned_basal_connector(
+    candidate: RootPath,
+    parent: RootPath,
+    *,
+    d_bar: float,
+) -> bool:
+    """Identify a reverse trace that completes its parent's ancestor junction."""
+
+    if (
+        len(candidate.points) < 3
+        or len(parent.points) < 2
+        or parent.parent_points is None
+        or len(parent.parent_points) < 2
+        or candidate.score_components.get(
+            "parent_short_contained_without_escape",
+            0.0,
+        )
+        <= 0.0
+        or candidate.score_components.get(
+            "parent_terminal_outside_fraction",
+            1.0,
+        )
+        > 0.10
+    ):
+        return False
+
+    spacing = float(d_bar)
+    attachment_radius = float(
+        candidate.score_components.get(
+            "parent_attachment_radius",
+            0.0,
+        )
+    )
+    if (
+        not np.isfinite(spacing)
+        or spacing <= 0.0
+        or not np.isfinite(attachment_radius)
+        or attachment_radius <= 0.0
+    ):
+        return False
+
+    child = np.asarray(candidate.points, dtype=float)
+    parent_path = np.asarray(parent.points, dtype=float)
+    ancestor = np.asarray(parent.parent_points, dtype=float)
+    parent_start = parent_path[0]
+    start_limit = max(2.0 * spacing, 0.35 * attachment_radius)
+    if float(np.linalg.norm(child[0] - parent_start)) > start_limit:
+        return False
+
+    ancestor_tree = cKDTree(ancestor)
+    ancestor_distances, ancestor_indices = ancestor_tree.query(
+        child,
+        k=1,
+        workers=worker_threads(),
+    )
+    ancestor_distances = np.asarray(ancestor_distances, dtype=float)
+    # The terminal point supplies the intended ancestor insertion.  Projecting
+    # the parent-side start instead can choose a different ancestor station and
+    # turn a valid diagonal connector into an apparent corridor excursion.
+    ancestor_projection = ancestor[int(ancestor_indices[-1])]
+    ancestor_gap = float(np.linalg.norm(parent_start - ancestor_projection))
+    if ancestor_gap <= max(2.0 * spacing, 0.50 * attachment_radius):
+        return False
+    approach = float(ancestor_distances[0] - ancestor_distances[-1])
+    minimum_approach = max(2.0 * spacing, 0.50 * attachment_radius)
+    terminal_limit = max(4.0 * spacing, 0.75 * attachment_radius)
+    if approach < minimum_approach or float(ancestor_distances[-1]) > terminal_limit:
+        return False
+
+    parent_segments = np.linalg.norm(np.diff(parent_path, axis=0), axis=1)
+    parent_arc = np.concatenate([[0.0], np.cumsum(parent_segments)])
+    _, nearest_parent = cKDTree(parent_path).query(
+        child,
+        k=1,
+        workers=worker_threads(),
+    )
+    basal_limit = max(8.0 * spacing, 1.5 * attachment_radius)
+    if float(np.max(parent_arc[np.asarray(nearest_parent, dtype=int)])) > basal_limit:
+        return False
+
+    corridor = parent_start - ancestor_projection
+    corridor_squared = float(np.dot(corridor, corridor))
+    if corridor_squared <= 1e-20:
+        return False
+    parameters = np.clip(
+        ((child - ancestor_projection) @ corridor) / corridor_squared,
+        0.0,
+        1.0,
+    )
+    corridor_projection = (
+        ancestor_projection
+        + parameters[:, None] * corridor
+    )
+    corridor_deviation = np.linalg.norm(
+        child - corridor_projection,
+        axis=1,
+    )
+    corridor_limit = max(2.0 * spacing, 0.60 * attachment_radius)
+    return bool(float(np.max(corridor_deviation)) <= corridor_limit)
+
+
+def _merge_parent_owned_basal_connectors(
+    parent: RootPath,
+    connectors: list[RootPath],
+    *,
+    d_bar: float,
+) -> None:
+    """Prepend the strongest ancestor connector and retain all its support."""
+
+    if not connectors or parent.parent_points is None:
+        return
+    representative = max(
+        connectors,
+        key=lambda path: (
+            len(
+                path.novel_support_indices
+                if path.novel_support_indices is not None
+                else path.covered_indices
+            ),
+            float(path.score),
+            float(path.length),
+            str(path.root_id),
+        ),
+    )
+    ancestor = np.asarray(parent.parent_points, dtype=float)
+    terminal = np.asarray(representative.points[-1], dtype=float)
+    _, ancestor_index = cKDTree(ancestor).query(terminal, k=1)
+    ancestor_projection = ancestor[int(ancestor_index)].copy()
+    reversed_connector = np.asarray(
+        representative.points[::-1],
+        dtype=float,
+    )
+    joined = np.vstack(
+        [
+            ancestor_projection,
+            reversed_connector,
+            np.asarray(parent.points[1:], dtype=float),
+        ]
+    )
+    keep = np.concatenate(
+        [
+            [True],
+            np.linalg.norm(np.diff(joined, axis=0), axis=1) > 1e-12,
+        ]
+    )
+    parent.points = joined[keep]
+    covered_support: set[int] = set()
+    novel_support: set[int] = set()
+    for connector in connectors:
+        covered_support.update(connector.covered_indices)
+        novel_support.update(
+            connector.novel_support_indices
+            if connector.novel_support_indices is not None
+            else connector.covered_indices
+        )
+    parent.covered_indices.update(covered_support)
+    if parent.novel_support_indices is not None or novel_support:
+        parent.novel_support_indices = set(
+            parent.novel_support_indices or ()
+        ) | novel_support
+    parent.raw_start_point = terminal.copy()
+    parent.node_indices = None
+    parent.score_components["parent_owned_basal_connector_merged"] = (
+        parent.score_components.get(
+            "parent_owned_basal_connector_merged",
+            0.0,
+        )
+        + 1.0
+    )
+    parent.score_components["parent_owned_basal_connector_variants"] = (
+        parent.score_components.get(
+            "parent_owned_basal_connector_variants",
+            0.0,
+        )
+        + float(len(connectors))
+    )
+    parent.score_components["parent_owned_basal_connector_support_added"] = (
+        parent.score_components.get(
+            "parent_owned_basal_connector_support_added",
+            0.0,
+        )
+        + float(len(covered_support))
+    )
+    parent.score_components["parent_owned_basal_connector_spacing"] = float(
+        d_bar
+    )
 
 
 def _prune_parent_tracking_paths(paths: list[RootPath]) -> list[RootPath]:
@@ -1114,14 +1608,15 @@ def _assign_lateral_points(
     d_bar: float,
     *,
     excluded_mask: np.ndarray | None = None,
-) -> np.ndarray:
+    return_competing_labels: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     labels = np.zeros(len(points), dtype=int)
     if not paths:
-        return labels
+        return (labels, {}) if return_competing_labels else labels
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
     non_primary = np.flatnonzero(~np.asarray(primary_mask, dtype=bool) & ~excluded)
     if len(non_primary) == 0:
-        return labels
+        return (labels, {}) if return_competing_labels else labels
     path_nodes = np.vstack([path.points for path in paths])
     node_to_label = np.concatenate([np.full(len(path.points), idx, dtype=int) for idx, path in enumerate(paths, start=1)])
     tree = cKDTree(path_nodes)
@@ -1134,6 +1629,7 @@ def _assign_lateral_points(
     assigned = distances[:, 0] <= radius
     nearest_labels = node_to_label[node_idx[:, 0]]
     labels[non_primary[assigned]] = nearest_labels[assigned]
+    competing_labels: dict[int, tuple[int, int]] = {}
     if query_k > 1:
         second_labels = node_to_label[node_idx[:, 1]]
         ambiguous = (
@@ -1141,7 +1637,20 @@ def _assign_lateral_points(
             & (nearest_labels != second_labels)
             & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
         )
-        labels[non_primary[ambiguous]] = -1
+        ambiguous_indices = non_primary[ambiguous]
+        labels[ambiguous_indices] = -1
+        if return_competing_labels:
+            competing_labels = {
+                int(vertex_index): (int(first_label), int(second_label))
+                for vertex_index, first_label, second_label in zip(
+                    ambiguous_indices,
+                    nearest_labels[ambiguous],
+                    second_labels[ambiguous],
+                    strict=True,
+                )
+            }
+    if return_competing_labels:
+        return labels, competing_labels
     return labels
 
 
@@ -1152,6 +1661,412 @@ def _analysis_root_labels(primary_mask: np.ndarray, lateral_labels: np.ndarray) 
     labels[lateral_labels > 0] = lateral_labels[lateral_labels > 0]
     labels[lateral_labels < 0] = -2
     return labels
+
+
+def _group_indices_by_label(
+    labels: np.ndarray,
+    included_labels: set[int],
+) -> dict[int, np.ndarray]:
+    """Group selected label indices with one full label-array pass."""
+
+    values = np.asarray(labels, dtype=int)
+    if values.ndim != 1 or not included_labels:
+        return {}
+    selected = np.asarray(sorted(int(label) for label in included_labels), dtype=int)
+    included_indices = np.flatnonzero(np.isin(values, selected))
+    if not len(included_indices):
+        return {}
+    included_values = values[included_indices]
+    order = np.argsort(included_values, kind="stable")
+    sorted_indices = included_indices[order]
+    sorted_values = included_values[order]
+    starts = np.concatenate(
+        [[0], np.flatnonzero(np.diff(sorted_values) != 0) + 1]
+    )
+    ends = np.concatenate([starts[1:], [len(sorted_values)]])
+    return {
+        int(sorted_values[start]): sorted_indices[start:end]
+        for start, end in zip(starts, ends, strict=True)
+    }
+
+
+def _competing_pair_supports_parent_claim(
+    pair: tuple[int, int],
+    *,
+    parent_label: int,
+    child_label: int,
+    parent_by_label: dict[int, int],
+) -> bool:
+    """Return whether the observed competitors belong to this junction."""
+
+    first, second = (int(pair[0]), int(pair[1]))
+    if first == child_label:
+        other = second
+    elif second == child_label:
+        other = first
+    else:
+        other = None
+    if other is not None:
+        return (
+            other == parent_label
+            or parent_by_label.get(other) == parent_label
+            or _root_label_is_ancestor(other, parent_label, parent_by_label)
+            or _root_label_is_ancestor(child_label, other, parent_by_label)
+        )
+
+    if first == parent_label:
+        other = second
+    elif second == parent_label:
+        other = first
+    else:
+        return False
+    return (
+        other == child_label
+        or parent_by_label.get(other) == parent_label
+        or _root_label_is_ancestor(child_label, other, parent_by_label)
+    )
+
+
+def _root_label_is_ancestor(
+    possible_ancestor: int,
+    descendant: int,
+    parent_by_label: dict[int, int],
+) -> bool:
+    current = int(descendant)
+    seen: set[int] = set()
+    while current in parent_by_label and current not in seen:
+        seen.add(current)
+        current = int(parent_by_label[current])
+        if current == int(possible_ancestor):
+            return True
+    return False
+
+
+def _resolve_parent_owned_junctions(
+    points: np.ndarray,
+    labels: np.ndarray,
+    primary_path: np.ndarray,
+    lateral_paths: list[RootPath],
+    *,
+    d_bar: float,
+    assignment_radius: float,
+    ambiguity_margin: float,
+    competing_labels: dict[int, tuple[int, int]] | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Assign only branch-site uncertainty to the biological parent root.
+
+    Parent and child skeletons intentionally share their insertion coordinate.
+    A nearest-node ambiguity rule therefore creates a short orange band even
+    when the topology is known.  This postprocessor uses the observed competing
+    root labels, repaired topology, and exact point-to-segment projections to
+    resolve only uncertain vertices within a sampling-scaled basal child
+    prefix. Unassigned and excluded vertices are never reclaimed.
+    """
+
+    source = np.asarray(points, dtype=float)
+    resolved = np.asarray(labels, dtype=int).copy()
+    if source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("points must have shape (n, 3)")
+    if resolved.shape != (len(source),):
+        raise ValueError("labels must contain one value per point")
+    spacing = float(d_bar)
+    radius = float(assignment_radius)
+    margin = float(ambiguity_margin)
+    if (
+        not np.isfinite(spacing)
+        or not np.isfinite(radius)
+        or not np.isfinite(margin)
+        or spacing <= 0.0
+        or radius <= 0.0
+        or margin < 0.0
+    ):
+        raise ValueError("junction assignment scales must be non-negative and finite")
+
+    root_ids = ["primary"] + [str(path.root_id) for path in lateral_paths]
+    root_id_to_label = {root_id: index for index, root_id in enumerate(root_ids)}
+    root_paths = [np.asarray(primary_path, dtype=float)] + [
+        np.asarray(path.points, dtype=float) for path in lateral_paths
+    ]
+    parent_by_label: dict[int, int] = {}
+    order_by_label: dict[int, int] = {0: 0}
+    for child_label, path in enumerate(lateral_paths, start=1):
+        parent_label = root_id_to_label.get(str(path.parent_id))
+        if parent_label is not None:
+            parent_by_label[child_label] = int(parent_label)
+        order_by_label[child_label] = int(path.order)
+
+    uncertain_indices = np.flatnonzero(resolved == -2)
+    report = {
+        "policy": "topology-aware-parent-owned-junction-v2",
+        "rule": (
+            "Only uncertain vertices whose observed competing roots belong to "
+            "the repaired parent-child junction, and whose segment distances "
+            "remain ambiguous, are assigned to the parent. The prefix length is "
+            "the larger of four mean point spacings and the local parent radius, "
+            "capped by child length; no physical-distance threshold is used."
+        ),
+        "resolved_vertex_count": 0,
+        "remaining_uncertain_vertex_count": int(len(uncertain_indices)),
+        "per_parent_vertex_count": {},
+        "junction_arc_count": 0,
+        "junction_arc_min_normalized": 0.0,
+        "junction_arc_median_normalized": 0.0,
+        "junction_arc_max_normalized": 0.0,
+        "multi_claim_vertex_count": 0,
+    }
+    if not len(uncertain_indices) or not lateral_paths:
+        return resolved, report
+
+    observed_competitors = competing_labels or {}
+    uncertain_tree = cKDTree(source[uncertain_indices])
+    parent_radius_cache: dict[int, np.ndarray] = {}
+    parent_support_indices = _group_indices_by_label(
+        resolved,
+        set(parent_by_label.values()),
+    )
+    empty_indices = np.empty(0, dtype=int)
+    claims: dict[int, list[tuple[int, int, float, float, float]]] = {}
+    junction_arcs: list[float] = []
+
+    for child_label, child in enumerate(lateral_paths, start=1):
+        parent_label = parent_by_label.get(child_label)
+        if parent_label is None:
+            continue
+        parent = root_paths[parent_label]
+        child_points = root_paths[child_label]
+        if len(parent) == 0 or len(child_points) < 2:
+            continue
+        insertion = (
+            np.asarray(child.insertion_point, dtype=float)
+            if child.insertion_point is not None
+            else child_points[0]
+        )
+        if insertion.shape != (3,) or not np.all(np.isfinite(insertion)):
+            continue
+        parent_index = (
+            int(child.insertion_index)
+            if child.insertion_index is not None
+            else int(cKDTree(parent).query(insertion, k=1)[1])
+        )
+        if parent_index < 0 or parent_index >= len(parent):
+            parent_index = int(cKDTree(parent).query(insertion, k=1)[1])
+
+        if parent_label not in parent_radius_cache:
+            parent_support = source[
+                parent_support_indices.get(parent_label, empty_indices)
+            ]
+            parent_radius_cache[parent_label] = estimate_parent_radius_profile(
+                parent,
+                parent_support,
+                spacing,
+            )
+        parent_radii = parent_radius_cache[parent_label]
+        local_parent_radius = (
+            float(parent_radii[parent_index])
+            if parent_radii.shape == (len(parent),)
+            and np.isfinite(parent_radii[parent_index])
+            else 2.5 * spacing
+        )
+        child_length = float(
+            np.linalg.norm(np.diff(child_points, axis=0), axis=1).sum()
+        )
+        junction_arc = min(
+            child_length,
+            max(4.0 * spacing, local_parent_radius),
+        )
+        if not np.isfinite(junction_arc) or junction_arc <= 1e-12:
+            continue
+        child_prefix = _polyline_prefix(child_points, junction_arc)
+        if len(child_prefix) < 2:
+            continue
+        junction_arcs.append(float(junction_arc))
+
+        prefilter_radius = float(
+            np.sqrt(junction_arc**2 + (radius + margin) ** 2) + margin
+        )
+        nearby_positions = uncertain_tree.query_ball_point(
+            insertion,
+            r=prefilter_radius,
+            workers=worker_threads(),
+        )
+        if not nearby_positions:
+            continue
+        candidate_indices = uncertain_indices[np.asarray(nearby_positions, dtype=int)]
+        candidate_points = source[candidate_indices]
+        child_distance, child_arc = _polyline_projection_distance_and_arc(
+            candidate_points,
+            child_prefix,
+        )
+        parent_distance, _ = _polyline_projection_distance_and_arc(
+            candidate_points,
+            parent,
+        )
+        eligible = (
+            (child_distance <= radius)
+            & (child_arc <= junction_arc + 1e-12)
+            & (parent_distance <= radius + margin)
+            & (np.abs(parent_distance - child_distance) <= margin)
+        )
+        for candidate_position in np.flatnonzero(eligible):
+            vertex_index = int(candidate_indices[candidate_position])
+            pair = observed_competitors.get(vertex_index)
+            if pair is None or not _competing_pair_supports_parent_claim(
+                pair,
+                parent_label=int(parent_label),
+                child_label=int(child_label),
+                parent_by_label=parent_by_label,
+            ):
+                continue
+            insertion_distance = float(
+                np.linalg.norm(candidate_points[candidate_position] - insertion)
+            )
+            distance_mismatch = float(
+                abs(
+                    parent_distance[candidate_position]
+                    - child_distance[candidate_position]
+                )
+            )
+            combined_distance = float(
+                parent_distance[candidate_position]
+                + child_distance[candidate_position]
+            )
+            claims.setdefault(vertex_index, []).append(
+                (
+                    int(parent_label),
+                    int(child_label),
+                    insertion_distance,
+                    distance_mismatch,
+                    combined_distance,
+                )
+            )
+
+    assigned_parent: dict[int, int] = {}
+    multi_claim_vertex_count = 0
+    for vertex_index, vertex_claims in claims.items():
+        if len(vertex_claims) > 1:
+            multi_claim_vertex_count += 1
+        best_claim = min(
+            vertex_claims,
+            key=lambda claim: (
+                -order_by_label.get(claim[0], -1),
+                claim[2],
+                claim[3],
+                claim[4],
+                claim[0],
+                claim[1],
+            ),
+        )
+        assigned_parent[vertex_index] = int(best_claim[0])
+
+    per_parent: dict[str, int] = {}
+    for vertex_index, parent_label in assigned_parent.items():
+        resolved[vertex_index] = int(parent_label)
+        parent_id = root_ids[parent_label]
+        per_parent[parent_id] = per_parent.get(parent_id, 0) + 1
+
+    report["resolved_vertex_count"] = int(len(assigned_parent))
+    report["remaining_uncertain_vertex_count"] = int(np.count_nonzero(resolved == -2))
+    report["per_parent_vertex_count"] = dict(sorted(per_parent.items()))
+    report["multi_claim_vertex_count"] = int(multi_claim_vertex_count)
+    report["junction_arc_count"] = int(len(junction_arcs))
+    if junction_arcs:
+        arcs = np.asarray(junction_arcs, dtype=float)
+        report["junction_arc_min_normalized"] = float(np.min(arcs))
+        report["junction_arc_median_normalized"] = float(np.median(arcs))
+        report["junction_arc_max_normalized"] = float(np.max(arcs))
+    return resolved, report
+
+
+def _polyline_prefix(path: np.ndarray, maximum_arc: float) -> np.ndarray:
+    """Return a polyline ending exactly at a requested positive arc length."""
+
+    polyline = np.asarray(path, dtype=float)
+    if len(polyline) <= 1:
+        return polyline.copy()
+    keep = np.concatenate(
+        [[True], np.linalg.norm(np.diff(polyline, axis=0), axis=1) > 1e-12]
+    )
+    polyline = polyline[keep]
+    if len(polyline) <= 1:
+        return polyline.copy()
+    lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    target = min(max(float(maximum_arc), 0.0), float(cumulative[-1]))
+    if target >= cumulative[-1] - 1e-12:
+        return polyline.copy()
+    segment_index = int(np.searchsorted(cumulative, target, side="right") - 1)
+    segment_index = min(max(segment_index, 0), len(lengths) - 1)
+    segment_length = float(lengths[segment_index])
+    if segment_length <= 1e-12:
+        return polyline[: segment_index + 2].copy()
+    fraction = (target - float(cumulative[segment_index])) / segment_length
+    endpoint = (
+        polyline[segment_index]
+        + float(np.clip(fraction, 0.0, 1.0))
+        * (polyline[segment_index + 1] - polyline[segment_index])
+    )
+    return np.vstack([polyline[: segment_index + 1], endpoint])
+
+
+def _polyline_projection_distance_and_arc(
+    query_points: np.ndarray,
+    path: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return exact nearest-segment distance and projected path arc."""
+
+    query = np.asarray(query_points, dtype=float)
+    polyline = np.asarray(path, dtype=float)
+    if query.ndim != 2 or query.shape[1] != 3:
+        raise ValueError("query_points must have shape (n, 3)")
+    if len(polyline) == 0:
+        return (
+            np.full(len(query), np.inf, dtype=float),
+            np.zeros(len(query), dtype=float),
+        )
+    if len(polyline) == 1:
+        return (
+            np.linalg.norm(query - polyline[0], axis=1),
+            np.zeros(len(query), dtype=float),
+        )
+    starts = polyline[:-1]
+    vectors = np.diff(polyline, axis=0)
+    squared_lengths = np.sum(vectors * vectors, axis=1)
+    segment_lengths = np.sqrt(squared_lengths)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    distances = np.full(len(query), np.inf, dtype=float)
+    arcs = np.zeros(len(query), dtype=float)
+    chunk_size = max(128, min(8192, 1_000_000 // max(1, len(starts))))
+    for chunk_start in range(0, len(query), chunk_size):
+        chunk = query[chunk_start : chunk_start + chunk_size]
+        offsets = chunk[:, None, :] - starts[None, :, :]
+        parameters = np.zeros((len(chunk), len(starts)), dtype=float)
+        valid = squared_lengths > 1e-20
+        if np.any(valid):
+            parameters[:, valid] = np.clip(
+                np.einsum(
+                    "nkj,kj->nk",
+                    offsets[:, valid, :],
+                    vectors[valid],
+                )
+                / squared_lengths[valid][None, :],
+                0.0,
+                1.0,
+            )
+        projections = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+        candidate_distances = np.linalg.norm(
+            chunk[:, None, :] - projections,
+            axis=2,
+        )
+        best_segment = np.argmin(candidate_distances, axis=1)
+        rows = np.arange(len(chunk))
+        best_distance = candidate_distances[rows, best_segment]
+        best_arc = (
+            cumulative[best_segment]
+            + parameters[rows, best_segment] * segment_lengths[best_segment]
+        )
+        distances[chunk_start : chunk_start + len(chunk)] = best_distance
+        arcs[chunk_start : chunk_start + len(chunk)] = best_arc
+    return distances, arcs
 
 
 def _point_assignment_summary(
@@ -1165,6 +2080,8 @@ def _point_assignment_summary(
     base_tolerance: float,
     d_bar: float,
     analysis_above_base_count: int,
+    analysis_junction_report: dict,
+    full_junction_report: dict,
 ) -> dict:
     labels = np.asarray(labels, dtype=int)
     above_base = _coerce_exclusion_mask(above_base_mask, len(labels))
@@ -1202,6 +2119,10 @@ def _point_assignment_summary(
             "not_claimed_by_primary_or_selected_lateral": "The point was not in the segmented primary and was not within the assignment support of a selected lateral root.",
         },
         "uncertain_description": "The point is close enough to competing selected roots that ownership is ambiguous.",
+        "parent_owned_junction_assignment": {
+            "analysis": analysis_junction_report,
+            "full_resolution": full_junction_report,
+        },
     }
 
 
@@ -1212,7 +2133,8 @@ def _assign_full_root_labels(
     *,
     d_bar: float,
     excluded_mask: np.ndarray | None = None,
-) -> np.ndarray:
+    return_competing_labels: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     all_paths = [np.asarray(primary_path, dtype=float)] + [np.asarray(path.points, dtype=float) for path in lateral_paths]
     path_nodes = np.vstack(all_paths)
     node_labels = np.concatenate(
@@ -1230,6 +2152,7 @@ def _assign_full_root_labels(
     assigned = (distances[:, 0] <= radius) & ~excluded
     nearest = node_labels[node_indices[:, 0]]
     labels[assigned] = nearest[assigned]
+    competing_labels: dict[int, tuple[int, int]] = {}
     if query_k > 1:
         second = node_labels[node_indices[:, 1]]
         ambiguous = (
@@ -1238,6 +2161,19 @@ def _assign_full_root_labels(
             & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
         )
         labels[ambiguous] = -2
+        if return_competing_labels:
+            ambiguous_indices = np.flatnonzero(ambiguous)
+            competing_labels = {
+                int(vertex_index): (int(first_label), int(second_label))
+                for vertex_index, first_label, second_label in zip(
+                    ambiguous_indices,
+                    nearest[ambiguous],
+                    second[ambiguous],
+                    strict=True,
+                )
+            }
+    if return_competing_labels:
+        return labels, competing_labels
     return labels
 
 

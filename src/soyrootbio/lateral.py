@@ -22,6 +22,9 @@ class LateralStart:
     direction: np.ndarray | None = None
     radial_direction: np.ndarray | None = None
     extent_direction: np.ndarray | None = None
+    surface_contact: bool = False
+    surface_gap: float | None = None
+    surface_contact_count: int = 0
 
 
 def estimate_parent_radius_profile(
@@ -141,13 +144,46 @@ def is_parent_tracking_candidate(
     )
 
     enough_evidence = evidence_length >= minimum_evidence
+    net_direction = sampled[-1] - sampled[0]
+    net_direction /= max(float(np.linalg.norm(net_direction)), 1e-12)
+    signed_parent_alignment = float(
+        np.dot(
+            net_direction,
+            parent_tangents[int(nearest[0])],
+        )
+    )
+    basal_attachment_limit = max(
+        8.0 * float(d_bar),
+        1.5 * attachment_radius,
+    )
+    basal_reverse_stub = bool(
+        float(parent_arc[int(nearest[0])]) <= basal_attachment_limit
+        and signed_parent_alignment
+        <= -float(np.cos(np.radians(40.0)))
+    )
+    # A short trace is conclusive only when it begins at the parent's basal
+    # junction and runs backward toward the ancestor while remaining inside the
+    # parent envelope.  The signed reverse-direction requirement protects a
+    # genuine short orthogonal child that has not yet travelled a full parent
+    # radius.
+    contained_without_escape = bool(
+        not enough_evidence
+        and inside_fraction >= 0.90
+        and terminal_outside_fraction <= 0.10
+        and terminal_separation_gain <= 2.0 * float(d_bar)
+        and basal_reverse_stub
+    )
     # Collar-returning surface traces can briefly ride just outside the robust
     # diameter envelope at a flared crown.  The strong directed return along
     # the parent supplies the additional evidence, so this arm is deliberately
     # a little more permissive than the purely parallel-tracking arm below.
     collar_tracking = inside_fraction >= 0.65 and collarward_progress >= collarward_threshold
     parallel_tracking = inside_fraction >= 0.90 and parallel_fraction >= 0.65
-    rejected = bool(enough_evidence and not sustained_terminal_escape and (collar_tracking or parallel_tracking))
+    rejected = bool(
+        enough_evidence
+        and not sustained_terminal_escape
+        and (collar_tracking or parallel_tracking)
+    )
     metrics = {
         "parent_attachment_radius": attachment_radius,
         "parent_envelope_fraction": inside_fraction,
@@ -155,9 +191,90 @@ def is_parent_tracking_candidate(
         "parent_collarward_progress": collarward_progress,
         "parent_terminal_outside_fraction": terminal_outside_fraction,
         "parent_terminal_separation_gain": terminal_separation_gain,
+        "parent_signed_basal_alignment": signed_parent_alignment,
+        "parent_basal_reverse_stub": float(basal_reverse_stub),
+        "parent_short_contained_without_escape": float(
+            contained_without_escape
+        ),
         "parent_tracking_rejected": float(rejected),
     }
     return rejected, metrics
+
+
+def is_ancestor_inward_candidate(
+    path: RootPath,
+    ancestor_path: np.ndarray,
+    ancestor_radius_profile: np.ndarray,
+    d_bar: float,
+) -> tuple[bool, dict[str, float]]:
+    """Reject a child that terminates inside an ancestor tube.
+
+    The rule is directional: an outside-to-inside basal stub is invalid, while
+    an inside-to-outside path is retained as a plausible emerging lateral.
+    Every margin is expressed in the normalized sampling spacing.
+    """
+
+    ancestor = np.asarray(ancestor_path, dtype=float)
+    radii = np.asarray(ancestor_radius_profile, dtype=float)
+    if (
+        len(path.points) < 3
+        or len(ancestor) < 2
+        or radii.shape != (len(ancestor),)
+    ):
+        return False, {}
+    spacing = float(d_bar)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        return False, {}
+
+    sampled = resample_polyline(
+        path.points,
+        spacing=max(2.0 * spacing, path.length / 80.0),
+    )
+    if len(sampled) < 3:
+        return False, {}
+    distances, nearest = cKDTree(ancestor).query(
+        sampled,
+        k=1,
+        workers=worker_threads(),
+    )
+    envelope = radii[np.asarray(nearest, dtype=int)] + 2.0 * spacing
+    clearance = np.asarray(distances, dtype=float) - envelope
+    segments = np.linalg.norm(np.diff(sampled, axis=0), axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(segments)])
+    total_arc = float(arc[-1])
+    if total_arc <= 1e-12:
+        return False, {}
+
+    terminal_start = max(
+        0.65 * total_arc,
+        total_arc - max(8.0 * spacing, 0.30 * total_arc),
+    )
+    terminal = arc >= terminal_start
+    initial = arc <= min(0.25 * total_arc, max(8.0 * spacing, 0.15 * total_arc))
+    if not np.any(initial):
+        initial[0] = True
+    terminal_inside_fraction = float(np.mean(clearance[terminal] <= 0.0))
+    initial_clearance = float(np.median(clearance[initial]))
+    terminal_clearance = float(np.median(clearance[terminal]))
+    inward_gain = initial_clearance - terminal_clearance
+    final_clearance = float(clearance[-1])
+    maximum_clearance = float(np.max(clearance))
+    rejected = bool(
+        terminal_inside_fraction >= 0.75
+        and terminal_clearance <= 0.0
+        and final_clearance <= 0.0
+        and maximum_clearance >= 2.0 * spacing
+        and inward_gain >= 2.0 * spacing
+    )
+    return rejected, {
+        "ancestor_terminal_inside_fraction": terminal_inside_fraction,
+        "ancestor_initial_clearance": initial_clearance,
+        "ancestor_terminal_clearance": terminal_clearance,
+        "ancestor_final_clearance": final_clearance,
+        "ancestor_maximum_clearance": maximum_clearance,
+        "ancestor_inward_clearance_gain": float(inward_gain),
+        "ancestor_inward_rejected": float(rejected),
+    }
 
 
 def find_lateral_starting_points(
@@ -169,6 +286,8 @@ def find_lateral_starting_points(
     max_parent_distance: float | np.ndarray | None = None,
     minimum_branch_angle_degrees: float = 0.0,
     exclude_parent_tip_fraction: float = 0.0,
+    parent_surface_points: np.ndarray | None = None,
+    surface_contact_distance: float | None = None,
 ) -> list[LateralStart]:
     """Cluster non-primary points closest to the primary root as branch starts.
 
@@ -179,6 +298,38 @@ def find_lateral_starting_points(
     if len(non_primary) == 0:
         return []
     distances, primary_indices = point_to_polyline_distance(points[non_primary], primary_path)
+    primary_indices = np.asarray(primary_indices, dtype=int)
+    surface_contact = np.zeros(len(non_primary), dtype=bool)
+    surface_distances = np.full(len(non_primary), np.inf, dtype=float)
+    surface_parent_indices = primary_indices.copy()
+    surface = (
+        np.asarray(parent_surface_points, dtype=float)
+        if parent_surface_points is not None
+        else np.empty((0, 3), dtype=float)
+    )
+    if len(surface):
+        if surface.ndim != 2 or surface.shape[1] != 3:
+            raise ValueError("parent_surface_points must contain XYZ points")
+        contact_limit = float(surface_contact_distance or 0.0)
+        if not np.isfinite(contact_limit) or contact_limit <= 0.0:
+            raise ValueError(
+                "surface_contact_distance must be positive when "
+                "parent_surface_points are provided"
+            )
+        surface_distances, surface_matches = cKDTree(surface).query(
+            points[non_primary],
+            k=1,
+            workers=worker_threads(),
+        )
+        _, surface_to_parent = cKDTree(primary_path).query(
+            surface,
+            k=1,
+            workers=worker_threads(),
+        )
+        surface_parent_indices = np.asarray(surface_to_parent, dtype=int)[
+            np.asarray(surface_matches, dtype=int)
+        ]
+        surface_contact = np.asarray(surface_distances, dtype=float) <= contact_limit
     eligible = np.ones(len(distances), dtype=bool)
     if max_parent_distance is not None:
         parent_distance_limit = np.asarray(max_parent_distance, dtype=float)
@@ -190,7 +341,7 @@ def find_lateral_starting_points(
             raise ValueError(
                 "max_parent_distance must be a scalar or contain one value per parent-path node"
             )
-        eligible &= distances <= limits
+        eligible &= (distances <= limits) | surface_contact
         if np.count_nonzero(eligible) < max(2, int(min_cluster_size)):
             return []
     if max_parent_distance is not None:
@@ -218,15 +369,47 @@ def find_lateral_starting_points(
     starts: list[LateralStart] = []
     primary_tree = cKDTree(primary_path)
     primary_tangents = tangent_vectors(primary_path)
+    non_primary_positions = {
+        int(point_index): position
+        for position, point_index in enumerate(non_primary)
+    }
     for label in sorted(label for label in np.unique(labels) if label >= 0):
         members = seed_indices[labels == label]
         if len(members) == 0:
             continue
         cluster_points = points[members]
         distances_to_primary, primary_matches = primary_tree.query(cluster_points, k=1)
-        best_member = int(np.argmin(distances_to_primary))
+        member_positions = np.asarray(
+            [non_primary_positions[int(index)] for index in members],
+            dtype=int,
+        )
+        member_surface_contact = surface_contact[member_positions]
+        contact_count = int(np.count_nonzero(member_surface_contact))
+        if contact_count >= min(3, len(members)):
+            contacting_members = np.flatnonzero(member_surface_contact)
+            best_member = int(
+                contacting_members[
+                    np.argmin(
+                        surface_distances[
+                            member_positions[contacting_members]
+                        ]
+                    )
+                ]
+            )
+            primary_idx = int(
+                surface_parent_indices[member_positions[best_member]]
+            )
+            used_surface_contact = True
+            selected_surface_gap = float(
+                surface_distances[member_positions[best_member]]
+            )
+        else:
+            best_member = int(np.argmin(distances_to_primary))
+            primary_idx = int(primary_matches[best_member])
+            used_surface_contact = False
+            selected_surface_gap = None
+            contact_count = 0
         start_point = cluster_points[best_member]
-        primary_idx = int(primary_matches[best_member])
         tip_guard_nodes = int(np.ceil(float(exclude_parent_tip_fraction) * len(primary_path)))
         if tip_guard_nodes > 0 and primary_idx >= len(primary_path) - tip_guard_nodes:
             continue
@@ -314,14 +497,45 @@ def find_lateral_starting_points(
                 direction=direction,
                 radial_direction=radial_unit if radial_norm > 1e-12 else None,
                 extent_direction=extent_unit if extent_norm > 1e-12 else None,
+                surface_contact=used_surface_contact,
+                surface_gap=selected_surface_gap,
+                surface_contact_count=contact_count,
             )
         )
     valid_labels = [label for label in np.unique(labels) if label >= 0]
     if not starts and not valid_labels and len(seed_indices) >= max(2, int(min_cluster_size)):
         seed_points = points[seed_indices]
         distances_to_primary, primary_matches = primary_tree.query(seed_points, k=1)
-        best_member = int(np.argmin(distances_to_primary))
-        primary_idx = int(primary_matches[best_member])
+        member_positions = np.asarray(
+            [non_primary_positions[int(index)] for index in seed_indices],
+            dtype=int,
+        )
+        member_surface_contact = surface_contact[member_positions]
+        contact_count = int(np.count_nonzero(member_surface_contact))
+        if contact_count >= min(3, len(seed_indices)):
+            contacting_members = np.flatnonzero(member_surface_contact)
+            best_member = int(
+                contacting_members[
+                    np.argmin(
+                        surface_distances[
+                            member_positions[contacting_members]
+                        ]
+                    )
+                ]
+            )
+            primary_idx = int(
+                surface_parent_indices[member_positions[best_member]]
+            )
+            used_surface_contact = True
+            selected_surface_gap = float(
+                surface_distances[member_positions[best_member]]
+            )
+        else:
+            best_member = int(np.argmin(distances_to_primary))
+            primary_idx = int(primary_matches[best_member])
+            used_surface_contact = False
+            selected_surface_gap = None
+            contact_count = 0
         tip_guard_nodes = int(np.ceil(float(exclude_parent_tip_fraction) * len(primary_path)))
         if tip_guard_nodes > 0 and primary_idx >= len(primary_path) - tip_guard_nodes:
             return starts
@@ -348,6 +562,9 @@ def find_lateral_starting_points(
                 primary_idx,
                 seed_indices,
                 direction,
+                surface_contact=used_surface_contact,
+                surface_gap=selected_surface_gap,
+                surface_contact_count=contact_count,
             )
         )
     return starts
@@ -365,6 +582,7 @@ def grow_lateral_candidates(
     search_radius_factor: float = 2.2,
     cooperate: Callable[[], None] | None = None,
     parent_radius_profile: np.ndarray | None = None,
+    ancestor_exclusion_mask: np.ndarray | None = None,
 ) -> list[RootPath]:
     point_tree = cKDTree(points)
     primary_tangents = tangent_vectors(primary_path)
@@ -377,6 +595,16 @@ def grow_lateral_candidates(
         parent_radius_profile=parent_radius_profile,
         d_bar=d_bar,
     )
+    if ancestor_exclusion_mask is not None:
+        ancestor_exclusion = np.asarray(
+            ancestor_exclusion_mask,
+            dtype=bool,
+        )
+        if ancestor_exclusion.shape != (len(points),):
+            raise ValueError(
+                "ancestor_exclusion_mask must contain one value per point"
+            )
+        novel_support_mask &= ~ancestor_exclusion
     candidates: list[RootPath] = []
     for start in starts:
         if cooperate is not None:
@@ -435,6 +663,7 @@ def grow_lateral_candidates(
                         open_angle=open_angle,
                         max_steps=max_steps,
                         search_radius=search_radius_factor * step_length,
+                        limit_primary_angle_to_insertion=True,
                         density_support_mask=novel_support_mask,
                         cooperate=cooperate,
                     )
@@ -442,13 +671,6 @@ def grow_lateral_candidates(
                         path.root_id = (
                             f"lateral_{start.start_id}_{direction_label}"
                             f"_s{multiplier:g}_a{int(open_angle)}"
-                        )
-                        path.score = _path_density_score(
-                            points,
-                            point_tree,
-                            path.points,
-                            radius=max(2.0 * d_bar, 0.004),
-                            support_mask=novel_support_mask,
                         )
                         path.novel_support_indices = _path_support_indices(
                             point_tree,
@@ -458,6 +680,24 @@ def grow_lateral_candidates(
                         )
                         path.score_components["novel_density_support"] = float(
                             len(path.novel_support_indices)
+                        )
+                        growth_length = float(
+                            path.score_components.get(
+                                "trace_growth_arc",
+                                path.length,
+                            )
+                        )
+                        longest_path_reward = (
+                            0.35 * growth_length / max(float(d_bar), 1e-12)
+                        )
+                        path.score_components["longest_path_reward"] = float(
+                            longest_path_reward
+                        )
+                        path.score = float(
+                            len(path.novel_support_indices)
+                            + 20.0 * growth_length
+                            + longest_path_reward
+                            + path.score_components.get("trace_rank_score", 0.0)
                         )
                         path.start_index = start.start_id
                         candidates.append(path)
@@ -494,76 +734,365 @@ def _grow_one_candidate(
     open_angle: float,
     max_steps: int,
     search_radius: float,
+    limit_primary_angle_to_insertion: bool = False,
     max_turn_degrees: float = 70.0,
     minimum_local_support: int = 1,
     cooperate: Callable[[], None] | None = None,
     density_support_mask: np.ndarray | None = None,
 ) -> RootPath:
-    nodes = [start.primary_point, start.point]
-    current = start.point.copy()
-    direction = initial_direction.copy()
+    """Grow one greedy trace while following its evolving local tangent.
+
+    Only one hypothesis is emitted for each parameter combination.  Radius
+    continuity is a soft tie-breaker, and curvature terms affect only the
+    final path score; neither can create an alternate fork or child root.
+    """
+
+    initial = np.asarray(initial_direction, dtype=float).copy()
+    initial /= max(float(np.linalg.norm(initial)), 1e-12)
+    parent_tangent = np.asarray(primary_tangent, dtype=float).copy()
+    parent_tangent /= max(float(np.linalg.norm(parent_tangent)), 1e-12)
+    nodes = [
+        np.asarray(start.primary_point, dtype=float).copy(),
+        np.asarray(start.point, dtype=float).copy(),
+    ]
+    current = nodes[-1].copy()
+    direction = initial
     covered: set[int] = set()
+    selected_indices: set[int] = set()
+    local_radius = _estimate_local_radius(
+        point_tree,
+        points,
+        current,
+        direction,
+        radius=0.75 * float(search_radius),
+        support_mask=density_support_mask,
+    )
+    growth_arc = 0.0
+    support_sum = 0.0
+    turn_squared_sum = 0.0
+    cumulative_turn_degrees = 0.0
+    cumulative_score = 0.0
+    radius_similarity_sum = 0.0
+    radius_observations = 0
+    fallback_steps = 0
+    covered_recovery_steps = 0
+    previous_turn_degrees = 0.0
+    travel_fractions: list[float] = []
+
     for step_index in range(max_steps):
         if cooperate is not None and step_index % 8 == 0:
             cooperate()
-        local = point_tree.query_ball_point(current, r=search_radius, workers=worker_threads())
-        local = [idx for idx in local if idx in allowed_indices and idx not in covered]
+        nearby_indices = point_tree.query_ball_point(
+            current,
+            r=search_radius,
+            workers=worker_threads(),
+        )
+        local = np.asarray(
+            [index for index in nearby_indices if index in allowed_indices],
+            dtype=int,
+        )
         if len(local) < max(1, int(minimum_local_support)):
             break
+
         vectors = points[local] - current
         distances = np.linalg.norm(vectors, axis=1)
-        valid = distances >= 0.35 * step_length
-        if not np.any(valid):
+        nonzero = distances > 1e-12
+        if not np.any(nonzero):
             break
-        local = np.asarray(local, dtype=int)[valid]
-        vectors = vectors[valid]
-        distances = distances[valid]
+        local = local[nonzero]
+        vectors = vectors[nonzero]
+        distances = distances[nonzero]
         unit = vectors / distances[:, None]
         turn_cos = unit @ direction
         turn_ok = turn_cos >= np.cos(np.radians(float(max_turn_degrees)))
-        open_angle_to_primary = np.degrees(np.arccos(np.clip(np.abs(unit @ primary_tangent), -1.0, 1.0)))
-        open_ok = open_angle_to_primary <= open_angle
-        if not np.any(turn_ok & open_ok):
-            ok = turn_ok
-        else:
-            ok = turn_ok & open_ok
-        if not np.any(ok):
-            break
-        local = local[ok]
-        unit = unit[ok]
-        distances = distances[ok]
-        density = np.asarray(
-            [
-                _local_support_count(
-                    point_tree,
-                    points[idx],
-                    radius=0.75 * search_radius,
-                    support_mask=density_support_mask,
+
+        if step_index == 0 or not limit_primary_angle_to_insertion:
+            open_angle_to_primary = np.degrees(
+                np.arccos(
+                    np.clip(
+                        np.abs(unit @ parent_tangent),
+                        -1.0,
+                        1.0,
+                    )
                 )
-                for idx in local
-            ],
-            dtype=float,
+            )
+            open_ok = open_angle_to_primary <= float(open_angle)
+            direction_ok = (
+                turn_ok & open_ok
+                if np.any(turn_ok & open_ok)
+                else turn_ok
+            )
+        else:
+            direction_ok = turn_ok
+
+        travel_fraction = _adaptive_minimum_travel_fraction(
+            step_index=step_index,
+            previous_turn_degrees=previous_turn_degrees,
+            max_turn_degrees=max_turn_degrees,
         )
-        distance_score = -np.abs(distances - step_length) / max(step_length, 1e-12)
-        direction_score = unit @ direction
-        score = 0.55 * direction_score + 0.30 * _normalize(density) + 0.15 * distance_score
-        best_pos = int(np.argmax(score))
-        next_idx = int(local[best_pos])
-        next_point = points[next_idx]
-        new_direction = next_point - current
-        new_direction /= max(np.linalg.norm(new_direction), 1e-12)
-        direction = 0.65 * direction + 0.35 * new_direction
-        direction /= max(np.linalg.norm(direction), 1e-12)
+        uncovered = np.asarray(
+            [int(index) not in covered for index in local],
+            dtype=bool,
+        )
+        valid = (
+            direction_ok
+            & uncovered
+            & (distances >= travel_fraction * float(step_length))
+        )
+        if not np.any(valid) and travel_fraction > 0.30:
+            fallback_fraction = _adaptive_minimum_travel_fraction(
+                step_index=step_index,
+                previous_turn_degrees=previous_turn_degrees,
+                max_turn_degrees=max_turn_degrees,
+                fallback=True,
+            )
+            valid = (
+                direction_ok
+                & uncovered
+                & (distances >= fallback_fraction * float(step_length))
+            )
+            if np.any(valid):
+                travel_fraction = fallback_fraction
+                fallback_steps += 1
+        if not np.any(valid):
+            # The accepted-node halo deliberately clears an entire sampled
+            # cross-section so a trace cannot crawl across a fused surface.
+            # If that also masks the only forward continuation at a tight
+            # bend or sparse gap, recover a short step without permitting a
+            # return to an earlier centerline node.
+            recovery_fraction = _adaptive_minimum_travel_fraction(
+                step_index=step_index,
+                previous_turn_degrees=previous_turn_degrees,
+                max_turn_degrees=max_turn_degrees,
+                fallback=True,
+            )
+            not_selected = np.asarray(
+                [int(index) not in selected_indices for index in local],
+                dtype=bool,
+            )
+            recovery = (
+                direction_ok
+                & not_selected
+                & (distances >= recovery_fraction * float(step_length))
+            )
+            if np.any(recovery) and len(nodes) > 2:
+                prior_distances, _ = cKDTree(
+                    np.asarray(nodes[:-1], dtype=float)
+                ).query(
+                    points[local],
+                    k=1,
+                    workers=worker_threads(),
+                )
+                recovery &= np.asarray(prior_distances, dtype=float) >= (
+                    0.29 * float(step_length)
+                )
+            if np.any(recovery):
+                valid = recovery
+                travel_fraction = recovery_fraction
+                fallback_steps += 1
+                covered_recovery_steps += 1
+        if not np.any(valid):
+            break
+
+        local = local[valid]
+        unit = unit[valid]
+        distances = distances[valid]
+        turn_cos = turn_cos[valid]
+        density = _local_support_counts(
+            point_tree,
+            points[local],
+            radius=0.75 * float(search_radius),
+            support_mask=density_support_mask,
+        )
+        distance_score = -np.abs(distances - step_length) / max(
+            float(step_length),
+            1e-12,
+        )
+        base_score = (
+            0.47 * turn_cos
+            + 0.30 * _normalize(density)
+            + 0.15 * distance_score
+        )
+
+        # Radius estimation is deliberately limited to the strongest few
+        # proposals.  It rewards a coherent tube scale without making radius
+        # a rejection threshold or restoring a multi-hypothesis beam.
+        shortlist_size = min(6, len(local))
+        shortlist = np.argsort(-base_score, kind="stable")[:shortlist_size]
+        shortlisted_radii = _local_radius_estimates(
+            point_tree,
+            points,
+            points[local[shortlist]],
+            unit[shortlist],
+            radius=0.75 * float(search_radius),
+            support_mask=density_support_mask,
+        )
+        radius_similarity = np.full(len(local), 0.5, dtype=float)
+        radius_similarity[shortlist] = _radius_continuity_scores(
+            shortlisted_radii,
+            local_radius,
+        )
+        score = base_score + 0.08 * radius_similarity
+        best_position = int(np.argmax(score))
+        next_index = int(local[best_position])
+        next_point = np.asarray(points[next_index], dtype=float)
+        segment = next_point - current
+        segment_length = float(np.linalg.norm(segment))
+        new_direction = segment / max(segment_length, 1e-12)
+        turn_angle = float(
+            np.degrees(
+                np.arccos(
+                    np.clip(
+                        np.dot(direction, new_direction),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+        )
+
+        proposed_radius = np.nan
+        shortlist_match = np.flatnonzero(shortlist == best_position)
+        if len(shortlist_match):
+            proposed_radius = float(shortlisted_radii[int(shortlist_match[0])])
+        if np.isfinite(proposed_radius) and proposed_radius > 0.0:
+            similarity_value = float(radius_similarity[best_position])
+            local_radius = (
+                0.65 * float(local_radius) + 0.35 * proposed_radius
+                if np.isfinite(local_radius) and local_radius > 0.0
+                else proposed_radius
+            )
+            radius_similarity_sum += similarity_value
+            radius_observations += 1
+
+        evolved_direction = 0.65 * direction + 0.35 * new_direction
+        direction = evolved_direction / max(
+            float(np.linalg.norm(evolved_direction)),
+            1e-12,
+        )
         current = next_point
-        nodes.append(current)
-        nearby = point_tree.query_ball_point(current, r=0.9 * search_radius, workers=worker_threads())
-        covered.update(idx for idx in nearby if idx in allowed_indices)
-    return RootPath(
+        nodes.append(current.copy())
+        selected_indices.add(next_index)
+        local_covered = point_tree.query_ball_point(
+            current,
+            # Inspect a full local cross-section after accepting a step.  Only
+            # points at or behind that section are consumed below; forward
+            # points remain available to the ordinary adaptive travel rule.
+            r=0.90 * float(search_radius),
+            workers=worker_threads(),
+        )
+        local_covered_array = np.asarray(local_covered, dtype=int)
+        if len(local_covered_array):
+            axial_progress = (
+                points[local_covered_array] - current
+            ) @ direction
+            local_covered_array = local_covered_array[
+                axial_progress <= 0.29 * float(step_length)
+            ]
+        covered.update(
+            int(index)
+            for index in local_covered_array
+            if int(index) in allowed_indices
+        )
+        growth_arc += segment_length
+        support_sum += float(density[best_position])
+        turn_squared_sum += turn_angle**2
+        cumulative_turn_degrees += turn_angle
+        cumulative_score += float(score[best_position])
+        previous_turn_degrees = turn_angle
+        travel_fractions.append(float(travel_fraction))
+
+    steps = max(0, len(nodes) - 2)
+    turn_rms = float(
+        np.sqrt(turn_squared_sum / max(1, steps))
+    )
+    radius_similarity_mean = (
+        float(radius_similarity_sum / radius_observations)
+        if radius_observations
+        else 0.5
+    )
+    supported_steps = growth_arc / max(float(step_length), 1e-12)
+    turn_scale = max(float(max_turn_degrees), 1.0)
+    curvature_penalty = (turn_rms / turn_scale) ** 2
+    cumulative_turn_penalty = (
+        cumulative_turn_degrees
+        / max(turn_scale * max(1, steps), 1e-12)
+    )
+    trace_rank_score = float(
+        cumulative_score
+        + 0.35 * supported_steps
+        + 0.20 * np.log1p(support_sum)
+        + 0.12 * radius_similarity_mean
+        - 0.25 * curvature_penalty
+        - 0.06 * cumulative_turn_penalty
+    )
+    path = RootPath(
         root_id="candidate",
-        points=np.asarray(nodes),
+        points=np.asarray(nodes, dtype=float),
         raw_start_point=np.asarray(start.point, dtype=float).copy(),
         covered_indices=covered,
     )
+    path.score_components.update(
+        {
+            "trace_growth_arc": float(growth_arc),
+            "trace_supported_arc": float(growth_arc),
+            "trace_mean_support": float(support_sum / max(1, steps)),
+            "trace_turn_rms_degrees": turn_rms,
+            "trace_cumulative_turn_degrees": float(
+                cumulative_turn_degrees
+            ),
+            "trace_smoothness": float(
+                np.exp(-(turn_rms / turn_scale) ** 2)
+            ),
+            "trace_local_radius": (
+                float(local_radius)
+                if np.isfinite(local_radius)
+                else 0.0
+            ),
+            "trace_radius_similarity": radius_similarity_mean,
+            "trace_radius_observations": float(radius_observations),
+            "trace_cumulative_score": float(cumulative_score),
+            "trace_rank_score": trace_rank_score,
+            "adaptive_travel_fallback_steps": float(fallback_steps),
+            "adaptive_travel_covered_recovery_steps": float(
+                covered_recovery_steps
+            ),
+            "adaptive_travel_fraction_min": float(
+                min(travel_fractions, default=0.0)
+            ),
+            "adaptive_travel_fraction_max": float(
+                max(travel_fractions, default=0.0)
+            ),
+            "surface_aware_seed": float(start.surface_contact),
+            "surface_seed_gap": (
+                float(start.surface_gap)
+                if start.surface_gap is not None
+                else 0.0
+            ),
+            "surface_seed_contact_count": float(
+                start.surface_contact_count
+            ),
+        }
+    )
+    return path
+
+
+def _adaptive_minimum_travel_fraction(
+    *,
+    step_index: int,
+    previous_turn_degrees: float,
+    max_turn_degrees: float,
+    fallback: bool = False,
+) -> float:
+    """Return a step-relative travel threshold with no physical units."""
+
+    if fallback:
+        return 0.30
+    if int(step_index) < 2:
+        return 0.30
+    if float(previous_turn_degrees) >= 0.50 * float(max_turn_degrees):
+        return 0.30
+    return 0.375
 
 
 def extend_lateral_tip(
@@ -725,7 +1254,9 @@ def _forward_supported_indices(
         return np.empty(0, dtype=int)
     vectors = points[local] - current
     distances = np.linalg.norm(vectors, axis=1)
-    valid_distance = distances >= 0.35 * float(target_step)
+    valid_distance = distances >= 0.375 * float(target_step)
+    if not np.any(valid_distance):
+        valid_distance = distances >= 0.30 * float(target_step)
     if not np.any(valid_distance):
         return np.empty(0, dtype=int)
     local = local[valid_distance]
@@ -799,8 +1330,11 @@ def _endpoint_consensus_variants(members: list[RootPath]) -> list[RootPath]:
 
     representatives: list[RootPath] = []
     for cluster in supported:
-        representative = _endpoint_consensus_variant([members[index] for index in cluster])
-        representative.score_components["variant_endpoint_mode_support"] = float(len(cluster))
+        cluster_members = [members[index] for index in cluster]
+        representative = _endpoint_consensus_variant(cluster_members)
+        representative.score_components["variant_endpoint_mode_support"] = float(
+            len(cluster)
+        )
         representative.score_components["variant_endpoint_outliers_rejected"] = float(rejected_count)
         representatives.append(representative)
     representatives.sort(
@@ -940,6 +1474,9 @@ def select_non_overlapping_paths(
     d_bar: float,
     max_paths: int | None = None,
     overlap_penalty: float = 1.25,
+    *,
+    rename_selected: bool = True,
+    initial_used: set[int] | None = None,
 ) -> list[RootPath]:
     if not candidates:
         return []
@@ -952,12 +1489,21 @@ def select_non_overlapping_paths(
                 covered.update(tree.query_ball_point(node, r=radius, workers=worker_threads()))
             candidate.covered_indices = covered
     selected: list[RootPath] = []
-    used: set[int] = set()
+    used: set[int] = set(initial_used or ())
     pool = sorted(candidates, key=lambda p: (p.score, p.length), reverse=True)
     while pool:
         best_path = None
         best_value = 0.0
         for path in pool:
+            if any(
+                _is_truncated_path_duplicate(
+                    path,
+                    retained,
+                    d_bar=d_bar,
+                )
+                for retained in selected
+            ):
+                continue
             covered = (
                 path.novel_support_indices
                 if path.novel_support_indices is not None
@@ -967,7 +1513,18 @@ def select_non_overlapping_paths(
                 continue
             overlap = len(covered & used)
             novel = len(covered - used)
-            value = novel - overlap_penalty * overlap + 10.0 * path.length
+            growth_length = float(
+                path.score_components.get("trace_growth_arc", path.length)
+            )
+            longest_path_reward = (
+                0.35 * growth_length / max(float(d_bar), 1e-12)
+            )
+            value = (
+                novel
+                - overlap_penalty * overlap
+                + 10.0 * growth_length
+                + longest_path_reward
+            )
             if value > best_value:
                 best_value = value
                 best_path = path
@@ -983,9 +1540,35 @@ def select_non_overlapping_paths(
         pool = [path for path in pool if path is not best_path]
         if max_paths is not None and len(selected) >= max_paths:
             break
-    for idx, path in enumerate(selected, start=1):
-        path.root_id = f"lateral_{idx:03d}"
+    if rename_selected:
+        for idx, path in enumerate(selected, start=1):
+            path.root_id = f"lateral_{idx:03d}"
     return selected
+
+
+def _is_truncated_path_duplicate(
+    candidate: RootPath,
+    retained: RootPath,
+    *,
+    d_bar: float,
+) -> bool:
+    """Return whether a short trace stays on the basal prefix of a longer one."""
+
+    if candidate.length > 0.35 * retained.length or len(candidate.points) < 2:
+        return False
+    candidate_direction = _candidate_net_direction(candidate)
+    retained_direction = _candidate_net_direction(retained)
+    if float(np.dot(candidate_direction, retained_direction)) < float(
+        np.cos(np.radians(35.0))
+    ):
+        return False
+    distances, _ = cKDTree(retained.points).query(
+        candidate.points,
+        k=1,
+        workers=worker_threads(),
+    )
+    tolerance = max(6.0 * float(d_bar), 0.05 * float(retained.length))
+    return bool(float(np.quantile(distances, 0.90)) <= tolerance)
 
 
 def backtrace_to_primary(paths: list[RootPath], primary_path: np.ndarray, primary_points: np.ndarray | None = None) -> list[RootPath]:
@@ -1000,8 +1583,9 @@ def backtrace_to_primary(paths: list[RootPath], primary_path: np.ndarray, primar
         junction = target[int(idx)]
         new_points = path.points.copy()
         new_points[0] = junction
-        if np.linalg.norm(new_points[1] - junction) > np.linalg.norm(new_points[1] - new_points[0]) * 2.5:
-            new_points = np.vstack([junction, new_points[1:]])
+        path.score_components["synthetic_attachment_length"] = float(
+            np.linalg.norm(new_points[1] - junction)
+        )
         path.points = resample_polyline(new_points, spacing=max(path.length / max(len(new_points), 2), 1e-5))
         refined.append(path)
     return refined
@@ -1074,6 +1658,135 @@ def _local_support_count(
         return int(len(nearby))
     mask = np.asarray(support_mask, dtype=bool)
     return int(np.count_nonzero(mask[nearby]))
+
+
+def _local_support_counts(
+    tree: cKDTree,
+    query_points: np.ndarray,
+    *,
+    radius: float,
+    support_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Batch local-density queries and optionally count only valid support."""
+
+    query = np.asarray(query_points, dtype=float)
+    if not len(query):
+        return np.empty(0, dtype=float)
+    if support_mask is None:
+        return np.asarray(
+            tree.query_ball_point(
+                query,
+                r=float(radius),
+                workers=worker_threads(),
+                return_length=True,
+            ),
+            dtype=float,
+        )
+    neighborhoods = tree.query_ball_point(
+        query,
+        r=float(radius),
+        workers=worker_threads(),
+    )
+    mask = np.asarray(support_mask, dtype=bool)
+    return np.fromiter(
+        (
+            np.count_nonzero(mask[np.asarray(nearby, dtype=int)])
+            for nearby in neighborhoods
+        ),
+        dtype=float,
+        count=len(query),
+    )
+
+
+def _estimate_local_radius(
+    tree: cKDTree,
+    points: np.ndarray,
+    query_point: np.ndarray,
+    direction: np.ndarray,
+    *,
+    radius: float,
+    support_mask: np.ndarray | None,
+) -> float:
+    return float(
+        _local_radius_estimates(
+            tree,
+            points,
+            np.asarray(query_point, dtype=float)[None, :],
+            np.asarray(direction, dtype=float)[None, :],
+            radius=radius,
+            support_mask=support_mask,
+        )[0]
+    )
+
+
+def _local_radius_estimates(
+    tree: cKDTree,
+    points: np.ndarray,
+    query_points: np.ndarray,
+    directions: np.ndarray,
+    *,
+    radius: float,
+    support_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Estimate a robust local tube scale perpendicular to each trace tangent.
+
+    The value is used only through a ratio to the preceding estimate.  It does
+    not claim a calibrated physical radius and cannot reject a proposal.
+    """
+
+    query = np.asarray(query_points, dtype=float)
+    axes = np.asarray(directions, dtype=float)
+    if query.ndim != 2 or query.shape[1] != 3:
+        raise ValueError("query_points must have shape (n, 3)")
+    if axes.shape != query.shape:
+        raise ValueError("directions must match query_points")
+    neighborhoods = tree.query_ball_point(
+        query,
+        r=float(radius),
+        workers=worker_threads(),
+    )
+    mask = None if support_mask is None else np.asarray(support_mask, dtype=bool)
+    estimates = np.full(len(query), np.nan, dtype=float)
+    source = np.asarray(points, dtype=float)
+    for index, nearby_raw in enumerate(neighborhoods):
+        nearby = np.asarray(nearby_raw, dtype=int)
+        if mask is not None and len(nearby):
+            nearby = nearby[mask[nearby]]
+        if len(nearby) < 6:
+            continue
+        axis = axes[index]
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm <= 1e-12:
+            continue
+        axis = axis / axis_norm
+        samples = source[nearby]
+        centered = samples - np.median(samples, axis=0)
+        axial = centered @ axis
+        perpendicular = centered - axial[:, None] * axis
+        radial = np.linalg.norm(perpendicular, axis=1)
+        estimate = float(np.quantile(radial, 0.70))
+        if np.isfinite(estimate) and estimate > 1e-12:
+            estimates[index] = estimate
+    return estimates
+
+
+def _radius_continuity_scores(
+    estimates: np.ndarray,
+    reference_radius: float,
+) -> np.ndarray:
+    """Return soft [0, 1] similarity scores with neutral missing evidence."""
+
+    values = np.asarray(estimates, dtype=float)
+    scores = np.full(values.shape, 0.5, dtype=float)
+    reference = float(reference_radius)
+    if not np.isfinite(reference) or reference <= 1e-12:
+        return scores
+    valid = np.isfinite(values) & (values > 1e-12)
+    if np.any(valid):
+        smaller = np.minimum(values[valid], reference)
+        larger = np.maximum(values[valid], reference)
+        scores[valid] = smaller / np.maximum(larger, 1e-12)
+    return scores
 
 
 def _path_support_count(

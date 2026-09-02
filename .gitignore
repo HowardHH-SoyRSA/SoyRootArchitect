@@ -4,6 +4,9 @@
 *.pyd
 .Python
 .pytest_cache/
+.pytest-runs/
+.pytest-tmp-editor-tests/
+.tmp_editor_*/
 .mypy_cache/
 .ruff_cache/
 .tmp/

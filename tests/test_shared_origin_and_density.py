@@ -6,9 +6,11 @@ from scipy.spatial import cKDTree
 
 from soyrootbio.lateral import (
     LateralStart,
+    _adaptive_minimum_travel_fraction,
     _grow_one_candidate,
     _novel_support_mask,
     _path_density_score,
+    _radius_continuity_scores,
 )
 from soyrootbio.topology import repair_root_hierarchy, validate_root_tree
 from soyrootbio.types import RootPath
@@ -264,3 +266,229 @@ def test_growth_density_chooses_novel_branch_over_denser_excluded_branch() -> No
     )
 
     np.testing.assert_allclose(selected.points[-1], lower)
+
+
+def test_growth_keeps_primary_angle_constraint_at_insertion() -> None:
+    def direction(angle_degrees: float) -> np.ndarray:
+        angle = np.radians(angle_degrees)
+        return np.array([np.sin(angle), 0.0, np.cos(angle)])
+
+    inside_cone = direction(20.0)
+    dense_outside_cone = direction(80.0)
+    support_offsets = np.column_stack(
+        [
+            np.zeros(16),
+            np.linspace(-0.01, 0.01, 16),
+            np.zeros(16),
+        ]
+    )
+    outside_support = dense_outside_cone + support_offsets
+    points = np.vstack([inside_cone, dense_outside_cone, outside_support])
+    support_mask = np.ones(len(points), dtype=bool)
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([0.0, 0.0, -0.25]),
+        primary_index=0,
+        member_indices=np.array([0, 1]),
+        direction=direction(50.0),
+    )
+
+    selected = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_indices={0, 1},
+        start=start,
+        initial_direction=direction(50.0),
+        primary_tangent=np.array([0.0, 0.0, 1.0]),
+        step_length=1.0,
+        open_angle=35.0,
+        max_steps=1,
+        search_radius=1.05,
+        limit_primary_angle_to_insertion=True,
+        density_support_mask=support_mask,
+    )
+
+    np.testing.assert_allclose(selected.points[-1], inside_cone)
+
+
+def test_growth_follows_evolving_tangent_after_insertion() -> None:
+    def direction(angle_degrees: float) -> np.ndarray:
+        angle = np.radians(angle_degrees)
+        return np.array([np.sin(angle), 0.0, np.cos(angle)])
+
+    insertion_step = direction(30.0)
+    curved_continuation = insertion_step + direction(60.0)
+    short_primary_aligned_child = insertion_step + direction(10.0)
+    support_offsets = np.column_stack(
+        [
+            np.zeros(20),
+            np.linspace(-0.01, 0.01, 20),
+            np.zeros(20),
+        ]
+    )
+    continuation_support = curved_continuation + support_offsets
+    points = np.vstack(
+        [
+            insertion_step,
+            curved_continuation,
+            short_primary_aligned_child,
+            continuation_support,
+        ]
+    )
+    support_mask = np.ones(len(points), dtype=bool)
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([0.0, 0.0, -0.25]),
+        primary_index=0,
+        member_indices=np.array([0, 1, 2]),
+        direction=direction(10.0),
+    )
+
+    selected = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_indices={0, 1, 2},
+        start=start,
+        initial_direction=direction(10.0),
+        primary_tangent=np.array([0.0, 0.0, 1.0]),
+        step_length=1.0,
+        open_angle=35.0,
+        max_steps=2,
+        search_radius=1.05,
+        limit_primary_angle_to_insertion=True,
+        density_support_mask=support_mask,
+    )
+
+    np.testing.assert_allclose(selected.points[-1], curved_continuation)
+
+    fixed_reference = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_indices={0, 1, 2},
+        start=start,
+        initial_direction=direction(10.0),
+        primary_tangent=np.array([0.0, 0.0, 1.0]),
+        step_length=1.0,
+        open_angle=35.0,
+        max_steps=2,
+        search_radius=1.05,
+        limit_primary_angle_to_insertion=False,
+        density_support_mask=support_mask,
+    )
+
+    np.testing.assert_allclose(fixed_reference.points[-1], short_primary_aligned_child)
+
+
+def test_single_path_tracer_does_not_emit_fork_hypotheses() -> None:
+    points = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [2.0, 0.6, 0.0],
+            [2.0, -0.6, 0.0],
+            [3.0, 1.2, 0.0],
+            [3.0, -1.2, 0.0],
+        ]
+    )
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.zeros(3),
+        primary_index=0,
+        member_indices=np.arange(len(points)),
+        direction=np.array([1.0, 0.0, 0.0]),
+    )
+
+    path = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_indices=set(range(len(points))),
+        start=start,
+        initial_direction=np.array([1.0, 0.0, 0.0]),
+        primary_tangent=np.array([1.0, 0.0, 0.0]),
+        step_length=1.0,
+        open_angle=35.0,
+        max_steps=3,
+        search_radius=1.3,
+        limit_primary_angle_to_insertion=True,
+    )
+
+    assert isinstance(path, RootPath)
+    assert len(path.points) == 5
+    assert abs(float(path.points[-1, 1])) > 0.5
+    assert "trace_hypothesis_rank" not in path.score_components
+
+
+def test_adaptive_minimum_travel_policy_stays_in_requested_ranges() -> None:
+    assert _adaptive_minimum_travel_fraction(
+        step_index=0,
+        previous_turn_degrees=0.0,
+        max_turn_degrees=70.0,
+    ) == pytest.approx(0.30)
+    assert _adaptive_minimum_travel_fraction(
+        step_index=4,
+        previous_turn_degrees=5.0,
+        max_turn_degrees=70.0,
+    ) == pytest.approx(0.375)
+    assert _adaptive_minimum_travel_fraction(
+        step_index=4,
+        previous_turn_degrees=40.0,
+        max_turn_degrees=70.0,
+    ) == pytest.approx(0.30)
+    assert _adaptive_minimum_travel_fraction(
+        step_index=4,
+        previous_turn_degrees=5.0,
+        max_turn_degrees=70.0,
+        fallback=True,
+    ) == pytest.approx(0.30)
+
+
+def test_stable_trace_falls_back_to_shorter_travel() -> None:
+    points = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.34, 0.0, 0.0],
+        ]
+    )
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([-0.2, 0.0, 0.0]),
+        primary_index=0,
+        member_indices=np.arange(len(points)),
+        direction=np.array([1.0, 0.0, 0.0]),
+    )
+    path = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_indices=set(range(len(points))),
+        start=start,
+        initial_direction=np.array([1.0, 0.0, 0.0]),
+        primary_tangent=np.array([1.0, 0.0, 0.0]),
+        step_length=1.0,
+        open_angle=90.0,
+        max_steps=3,
+        search_radius=1.05,
+        limit_primary_angle_to_insertion=True,
+    )
+
+    np.testing.assert_allclose(path.points[-1], [2.34, 0.0, 0.0])
+    assert path.score_components["adaptive_travel_fallback_steps"] == 1.0
+    assert (
+        path.score_components[
+            "adaptive_travel_covered_recovery_steps"
+        ]
+        == 0.0
+    )
+    assert path.score_components["adaptive_travel_fraction_min"] == pytest.approx(
+        0.30
+    )
+
+
+def test_radius_continuity_remains_a_soft_similarity_reward() -> None:
+    np.testing.assert_allclose(
+        _radius_continuity_scores(np.array([0.02, 0.04, np.nan]), 0.02),
+        [1.0, 0.5, 0.5],
+    )

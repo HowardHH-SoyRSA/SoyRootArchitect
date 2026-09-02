@@ -13,6 +13,7 @@ The project prioritizes the measurement objectives in this repository over exact
 - Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
 - Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
 - Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and primary guidance, ETA/progress, hardware-aware concurrency, pause/resume, and cancellation.
+- Provides a local, GPU-accelerated 3D result viewer and graph editor with per-root inspection, nine topology/geometry tools, durable undo/redo, and non-destructive materialisation.
 - Keeps the full mesh by default. Automatic analysis reduction is allowed only when the runtime/memory preflight crosses the configured limit; the default runtime limit is 30 minutes.
 
 ## Installation
@@ -28,7 +29,7 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-The main dependencies are Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, and tkinterdnd2. A normal Python.org Windows installation includes Tcl/Tk for the desktop interface.
+The main dependencies are Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, Flask, and tkinterdnd2. A normal Python.org Windows installation includes Tcl/Tk for the desktop interface.
 
 For development and tests:
 
@@ -73,6 +74,58 @@ If a sample fails, its output directory contains `processing_error.log` with the
 The displayed memory summary distinguishes currently available RAM from installed RAM, and automatic concurrency is budgeted against the available value with a reserve for the desktop. Manual concurrency/thread overrides are honored and can intentionally oversubscribe the machine. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
 
 Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` and are reused for future ETAs. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
+
+## Interactive 3D result editor
+
+Open any completed SoyRootBio output bundle with one command:
+
+```powershell
+soyrootbio editor --output "D:\results\sample"
+```
+
+The command starts a loopback-only local server and opens the editor in the browser. The viewer downloads and parses `segmented_root_structure.ply` off the UI thread, retains every vertex and face, requests the browser's high-performance GPU, computes smooth normals in a worker, and builds a background BVH for fast picking. It does not downsample the result. The status area reports the detected host GPU, the browser WebGL renderer, vertex/face counts, and full-resolution state.
+
+Hovering the surface shows root ID, length, mean diameter, and tip–gravity angle. Selecting a root from the surface or hierarchy highlights its complete centreline, direct parent, direct children, insertion point, and tip, then frames the full path in the 3D view. The hierarchy also lists every triangle-connected uncertain and unassigned mesh patch for direct highlighting, framing, and patch-level inspection. The inspector shows path and chord length, all three directional angles, mean diameter, surface area, volume, tortuosity, parent ID, and a direct-children list that is collapsed by default.
+
+The surface, centreline, hierarchy, hover card, and inspector use the same root-order colours written to the exported PLY and `csv/root_label_map.csv`. The hierarchy side panel includes their exact hex-code legend and retains compact colour swatches when collapsed. Selection preserves those base colours and uses line width to distinguish the selected root and its direct relationships. Mouse-wheel and trackpad scrolling zoom continuously in both directions.
+
+The toolbar provides:
+
+- creation of a new root by drawing a base-to-tip path through grey unassigned points, with a configurable claim radius and automatic attachment to the selected parent;
+- split;
+- merge using a scale-checked, directed tip-to-start join;
+- assign surface points with a 3D radius brush;
+- reconnect;
+- reparent;
+- delete;
+- redraw; and
+- root-order correction.
+
+Every accepted edit is validated for missing parents, cycles, label integrity, and exact geometric attachment before it becomes visible. `Ctrl+Z`/`Ctrl+Shift+Z` and the toolbar buttons provide undo/redo. Point assignments are resolved against the full vertex array on the local Python process; Shift + left-dragging the assignment brush creates one continuous region and one atomic history operation, while ordinary left-drag retains rotation.
+
+After a successful edit, undo, or redo, the camera keeps the same orbit, zoom, and target used to make the edit while retaining the current root selection and highlight. The initial full-system orbit target is the geometric centre of the primary root.
+
+The automatic output files are opened read-only in memory. By default, editor state is written under:
+
+```text
+<automatic output>\.soyrootbio-editor\
+  session.json
+  operations.jsonl
+  blobs\
+  materialised\
+```
+
+`operations.jsonl` is append-only; large point selections use hashed NumPy sidecar blobs so the log remains compact and replayable. Undo and redo are also recorded as events. **Export edits** writes an edited hierarchy, traits, numeric-label map, full-resolution labelled PLY, nested RSML, operation log, and manifest under the session directory. It never overwrites the automatic hierarchy, traits, label map, or PLY.
+
+Use a separate session location when desired:
+
+```powershell
+soyrootbio editor `
+  --output "D:\results\sample" `
+  --session-dir "D:\root-edit-sessions\sample-review"
+```
+
+The editor deliberately binds only to `localhost`/loopback addresses. Its mutation API uses a per-launch, same-site session cookie and rejects cross-origin requests. Run `soyrootbio editor --help` for port and browser-launch options.
 
 ## Command-line use
 
@@ -254,13 +307,13 @@ An **unassigned** point is either deliberately above the selected base or was no
 
 | Class | Colour |
 |---|---|
-| Primary / order 0 | Blue |
+| Primary / order 0 | Blue (`#0D3BE0`) |
 | Order 1 | Magenta (`#FF00FF`) |
 | Order 2 | Green (`#009E73`) |
-| Order 3 | Purple |
-| Order 4+ | Gold |
-| Uncertain | Orange |
-| Unassigned/original background | Grey |
+| Order 3 | Purple (`#8C33D1`) |
+| Order 4+ | Gold (`#F2A614`) |
+| Uncertain | Orange (`#FA7A0D`) |
+| Unassigned/original background | Grey (`#8C8C8C`) |
 
 ## Resolution, runtime, and reduction policy
 
@@ -282,7 +335,7 @@ The external test folder `E:\Seafile\Test files for BioInsAlgo` contains six mat
 
 A final full-resolution suite ran all six PLY samples without reduction or a lateral-count cap. Per-run metadata recorded 11.91–59.83 seconds on the development machine for 101,102–526,324 vertices; the six runs completed in 156 seconds wall time including all 600-dpi figures and exports. Every run produced all 30 declared artefacts, and all six RSML files passed the official [RootSystemML XSD](https://raw.githubusercontent.com/RootSystemML/RSMLValidator/master/rsml.xsd). A separate matched BaxiNo2 STL run produced the same per-root rows as its PLY input. These are engineering/performance and contract checks, not biological ground truth: automatic counts, orders, assigned fraction, and any future physical calibration still require expert validation.
 
-The 62-test automated suite covers synthetic end-to-end export, above-base assignment exclusion, directional angles, primary candidate ranking, higher-order junction ground truth, hierarchy invariants and corrections, RSML nesting, XLSX/CSV contracts, labelled PLY properties, 600-dpi figures, metadata, scheduling, and hardware allocation. A production-path smoke test also completed two real samples concurrently through `BatchScheduler` with four threads per sample and verified both complete export bundles. Measurement-quality validation still requires expert annotation or manual measurements for each genotype, age, scan protocol, and reconstruction workflow.
+The automated suite covers synthetic end-to-end export, above-base assignment exclusion, directional angles, primary candidate ranking, higher-order junction ground truth, hierarchy invariants and corrections, editor history/replay and source immutability, RSML nesting, XLSX/CSV contracts, labelled PLY properties, 600-dpi figures, metadata, scheduling, and hardware allocation. A production-path smoke test also completed two real samples concurrently through `BatchScheduler` with four threads per sample and verified both complete export bundles. Measurement-quality validation still requires expert annotation or manual measurements for each genotype, age, scan protocol, and reconstruction workflow.
 
 ## Known limitations
 
@@ -291,7 +344,7 @@ The 62-test automated suite covers synthetic end-to-end export, above-base assig
 - The automatic primary scorer assumes the coordinate system has meaningful Z orientation and gravity is `(0,0,-1)`.
 - Fine laterals below the reconstruction/mesh resolution cannot be recovered reliably.
 - Per-root diameter and volume are centreline/assignment estimates, not voxel-exact organ measurements.
-- The GUI is currently Tk-based and the compute path is CPU based. GPU discovery is informational.
+- The batch GUI is currently Tk-based and the scientific analysis path is CPU based. The 3D editor uses the browser GPU for rendering and worker/BVH acceleration for parsing and picking; trait recomputation remains CPU based.
 - STL contains no portable unit standard. Source-unit hints may be recorded as provenance, but this temporary build does not apply them to traits or thresholds.
 
 ## Research lineage and licensing

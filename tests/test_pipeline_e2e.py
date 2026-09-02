@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pandas as pd
 
+import soyrootbio.pipeline as pipeline_module
 from soyrootbio.pipeline import PipelineConfig, run_pipeline
 from soyrootbio.synthetic import write_synthetic_dataset
 
@@ -122,4 +123,102 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
         + assignment["uncertain_vertex_count"]
         + assignment["unassigned_vertex_count"]
         == assignment["total_vertex_count"]
+    )
+
+
+def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
+    tmp_path: Path,
+    monkeypatch,
+):
+    points_path, endpoint_path = write_synthetic_dataset(
+        tmp_path / "synthetic-contact-root.csv",
+        primary_points=120,
+        lateral_points=55,
+        lateral_count=3,
+        noise=0.001,
+        seed=31,
+    )
+    events: list[str] = []
+    real_assign_analysis = pipeline_module._assign_lateral_points
+    real_assign_full = pipeline_module._assign_full_root_labels
+
+    def assign_analysis_spy(*args, **kwargs):
+        if kwargs.get("return_competing_labels", False):
+            events.append("analysis_assignment")
+        return real_assign_analysis(*args, **kwargs)
+
+    def assign_full_spy(*args, **kwargs):
+        events.append("full_assignment")
+        return real_assign_full(*args, **kwargs)
+
+    expected_decision: dict[str, object] = {
+        "decision": "swap",
+        "reason": "monkeypatched internal O1 contact",
+    }
+
+    def report_swap(
+        surface_points,
+        root_labels,
+        lateral_paths,
+        *,
+        d_bar,
+    ):
+        events.append("internal_contact_swap")
+        assert len(surface_points) == len(root_labels)
+        assert d_bar > 0.0
+        assert lateral_paths
+        changed_id = lateral_paths[0].root_id
+        expected_decision["changed_root_ids"] = [changed_id]
+        return {changed_id}, [dict(expected_decision)]
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_assign_lateral_points",
+        assign_analysis_spy,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_assign_full_root_labels",
+        assign_full_spy,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "uncross_internal_primary_sibling_contacts",
+        report_swap,
+    )
+
+    output_dir = tmp_path / "contact-swap-output"
+    run_pipeline(
+        PipelineConfig(
+            input_path=points_path,
+            output_dir=output_dir,
+            endpoint_file=endpoint_path,
+            sample_points=800,
+            lateral_max_paths=6,
+            max_root_order=1,
+            random_seed=31,
+        )
+    )
+
+    assert events == [
+        "analysis_assignment",
+        "full_assignment",
+        "internal_contact_swap",
+        "analysis_assignment",
+        "full_assignment",
+    ]
+    metadata = json.loads(
+        (output_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["internal_o1_contact_decisions"] == [
+        expected_decision
+    ]
+    assert metadata["internal_o1_contact_changed_root_ids"] == (
+        expected_decision["changed_root_ids"]
+    )
+    assert (
+        metadata["lateral_tracing_policy"][
+            "internal_o1_contact_uncrossing"
+        ]
+        is True
     )

@@ -41,6 +41,6 @@ Likewise, a Creative Commons license on an article normally governs the article,
 
 ## Runtime dependencies
 
-The application declares Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, and tkinterdnd2 as install-time dependencies. They are not vendored in this repository. Consult each installed distribution's metadata and license when redistributing a packaged application.
+The application declares Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, Flask, and tkinterdnd2 as Python install-time dependencies. The interactive editor frontend uses React, Three.js, three-mesh-bvh, Zustand, and the Vinext build tool. These packages are not source-code lineages of SoyRootBio and remain under their respective licenses; consult the installed distributions and lockfile when redistributing a packaged application.
 
 This notice lists research and design references; it is not a claim that every linked project, paper, or remote branch is required at runtime. The authoritative dependency list for this source tree is the `[project.dependencies]` table in `pyproject.toml`.

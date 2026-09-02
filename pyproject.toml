@@ -19,6 +19,7 @@ dependencies = [
   "matplotlib",
   "openpyxl",
   "psutil",
+  "flask>=3.0",
   "tkinterdnd2",
 ]
 
@@ -30,4 +31,7 @@ soyrootbio = "soyrootbio.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"soyrootbio.editor" = ["web/*", "web/**/*"]
 

@@ -17,6 +17,29 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("--input", type=Path, help="Optional root file to prefill in the desktop application.")
     gui.add_argument("--output", type=Path, help="Optional output directory to prefill in the desktop application.")
 
+    editor = subparsers.add_parser(
+        "editor",
+        help="Open an existing SoyRootBio output in the interactive 3D graph editor.",
+    )
+    editor.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="SoyRootBio output directory containing the labelled PLY and root hierarchy.",
+    )
+    editor.add_argument(
+        "--session-dir",
+        type=Path,
+        help="Optional directory for the append-only operation log and materialised exports.",
+    )
+    editor.add_argument("--host", default="127.0.0.1")
+    editor.add_argument("--port", type=int, default=8765)
+    editor.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Start the local editor server without opening a browser.",
+    )
+
     run = subparsers.add_parser("run", help="Run the full segmentation, skeletonization, and trait pipeline.")
     run.add_argument("--input", required=True, type=Path, help="Root-only point cloud or mesh exported from VG Studio.")
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
@@ -58,6 +81,17 @@ def main(argv: list[str] | None = None) -> int:
         from .desktop_gui import launch_gui
 
         return launch_gui(args.input, args.output)
+    if args.command == "editor":
+        from .editor.server import launch_editor
+
+        launch_editor(
+            args.output,
+            session_dir=args.session_dir,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+        return 0
     if args.command == "generate-synthetic":
         point_path, endpoint_path = write_synthetic_dataset(
             args.output,

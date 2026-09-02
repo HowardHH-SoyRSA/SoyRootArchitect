@@ -7,7 +7,11 @@ from soyrootbio.lateral import (
     extend_lateral_tip,
     is_parent_tracking_candidate,
 )
-from soyrootbio.pipeline import _prune_parent_tracking_paths
+from soyrootbio.pipeline import (
+    _is_parent_owned_basal_connector,
+    _merge_parent_owned_basal_connectors,
+    _prune_parent_tracking_paths,
+)
 from soyrootbio.types import RootPath
 
 
@@ -175,6 +179,193 @@ def test_parent_tracking_filter_rejects_surface_traces_and_keeps_departing_later
     assert collarward_metrics["parent_collarward_progress"] > 0.20
     assert not departing_rejected
     assert departing_metrics["parent_terminal_outside_fraction"] > 0.70
+
+
+def test_parent_tracking_filter_rejects_short_contained_stub() -> None:
+    z = np.linspace(1.0, 0.0, 101)
+    parent = np.column_stack([np.zeros_like(z), np.zeros_like(z), z])
+    support = _z_tube(parent)
+    radii = estimate_parent_radius_profile(parent, support, d_bar=0.001)
+    short_stub = RootPath(
+        root_id="short-contained-stub",
+        points=np.array(
+            [
+                [0.000, 0.000, 1.00],
+                [0.006, 0.000, 1.015],
+                [0.012, 0.003, 1.030],
+            ]
+        ),
+    )
+
+    rejected, metrics = is_parent_tracking_candidate(
+        short_stub,
+        parent,
+        radii,
+        d_bar=0.001,
+    )
+
+    assert not rejected
+    assert metrics["parent_short_contained_without_escape"] == 1.0
+    assert metrics["parent_signed_basal_alignment"] < -0.75
+    assert metrics["parent_terminal_outside_fraction"] <= 0.10
+
+
+def test_parent_tracking_filter_keeps_short_orthogonal_child() -> None:
+    z = np.linspace(1.0, 0.0, 101)
+    parent = np.column_stack([np.zeros_like(z), np.zeros_like(z), z])
+    support = _z_tube(parent)
+    radii = estimate_parent_radius_profile(parent, support, d_bar=0.001)
+    short_child = RootPath(
+        root_id="short-orthogonal-child",
+        points=np.array(
+            [
+                [0.000, 0.000, 1.000],
+                [0.015, 0.000, 0.995],
+                [0.030, 0.000, 0.990],
+            ]
+        ),
+    )
+
+    rejected, metrics = is_parent_tracking_candidate(
+        short_child,
+        parent,
+        radii,
+        d_bar=0.001,
+    )
+
+    assert not rejected
+    assert metrics["parent_short_contained_without_escape"] == 0.0
+    assert metrics["parent_signed_basal_alignment"] > -0.80
+
+
+def test_parent_owned_basal_connector_is_merged_with_support() -> None:
+    ancestor = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.8],
+            [0.0, 0.0, 0.6],
+        ]
+    )
+    parent = RootPath(
+        root_id="parent",
+        points=np.array(
+            [
+                [0.03, 0.00, 0.80],
+                [0.10, 0.00, 0.76],
+                [0.30, 0.00, 0.70],
+            ]
+        ),
+        covered_indices={10, 11},
+        novel_support_indices={10, 11},
+        order=1,
+        parent_id="primary",
+        parent_points=ancestor,
+    )
+    connector = RootPath(
+        root_id="reverse-connector",
+        points=np.array(
+            [
+                [0.030, 0.000, 0.800],
+                [0.020, 0.002, 0.800],
+                [0.004, 0.000, 0.800],
+            ]
+        ),
+        covered_indices={20, 21, 22},
+        novel_support_indices={20, 21, 22},
+        score=12.0,
+        order=2,
+        parent_id="parent",
+        parent_points=parent.points,
+        score_components={
+            "parent_short_contained_without_escape": 1.0,
+            "parent_terminal_outside_fraction": 0.0,
+            "parent_attachment_radius": 0.020,
+        },
+    )
+    old_tip = parent.points[-1].copy()
+
+    assert _is_parent_owned_basal_connector(
+        connector,
+        parent,
+        d_bar=0.001,
+    )
+    _merge_parent_owned_basal_connectors(
+        parent,
+        [connector],
+        d_bar=0.001,
+    )
+
+    np.testing.assert_allclose(parent.points[0], [0.0, 0.0, 0.8])
+    np.testing.assert_allclose(parent.points[-1], old_tip)
+    assert parent.covered_indices == {10, 11, 20, 21, 22}
+    assert parent.novel_support_indices == {10, 11, 20, 21, 22}
+    assert parent.score_components[
+        "parent_owned_basal_connector_merged"
+    ] == 1.0
+    assert parent.score_components[
+        "parent_owned_basal_connector_support_added"
+    ] == 3.0
+
+
+def test_parent_owned_connector_rejects_corridor_divergence_and_distal_child() -> None:
+    ancestor = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.8],
+            [0.0, 0.0, 0.6],
+        ]
+    )
+    parent = RootPath(
+        root_id="parent",
+        points=np.array(
+            [
+                [0.03, 0.00, 0.80],
+                [0.10, 0.00, 0.76],
+                [0.30, 0.00, 0.70],
+            ]
+        ),
+        order=1,
+        parent_id="primary",
+        parent_points=ancestor,
+    )
+    common = {
+        "parent_short_contained_without_escape": 1.0,
+        "parent_terminal_outside_fraction": 0.0,
+        "parent_attachment_radius": 0.020,
+    }
+    diverging = RootPath(
+        root_id="diverging",
+        points=np.array(
+            [
+                [0.030, 0.000, 0.800],
+                [0.030, 0.020, 0.800],
+                [0.030, 0.040, 0.800],
+            ]
+        ),
+        score_components=dict(common),
+    )
+    distal = RootPath(
+        root_id="distal",
+        points=np.array(
+            [
+                [0.300, 0.000, 0.700],
+                [0.290, 0.000, 0.710],
+                [0.280, 0.000, 0.720],
+            ]
+        ),
+        score_components=dict(common),
+    )
+
+    assert not _is_parent_owned_basal_connector(
+        diverging,
+        parent,
+        d_bar=0.001,
+    )
+    assert not _is_parent_owned_basal_connector(
+        distal,
+        parent,
+        d_bar=0.001,
+    )
 
 
 def test_pruning_parent_tracking_path_promotes_its_real_child() -> None:
