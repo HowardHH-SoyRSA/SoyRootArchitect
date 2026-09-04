@@ -7,13 +7,87 @@ from scipy.spatial import cKDTree
 from soyrootbio.lateral import (
     LateralStart,
     _adaptive_minimum_travel_fraction,
+    _build_support_index,
     _grow_one_candidate,
+    _local_support_counts,
     _novel_support_mask,
     _path_density_score,
+    _path_support_indices,
     _radius_continuity_scores,
 )
 from soyrootbio.topology import repair_root_hierarchy, validate_root_tree
 from soyrootbio.types import RootPath
+
+
+def _index_mask(point_count: int, *indices: int) -> np.ndarray:
+    mask = np.zeros(point_count, dtype=bool)
+    mask[list(indices)] = True
+    return mask
+
+
+class _RecordingTree:
+    def __init__(self, points: np.ndarray) -> None:
+        self.tree = cKDTree(points)
+        self.calls: list[tuple[tuple[int, ...], bool]] = []
+
+    def query_ball_point(self, query: np.ndarray, **kwargs: object) -> object:
+        self.calls.append(
+            (np.asarray(query).shape, bool(kwargs.get("return_length", False)))
+        )
+        return self.tree.query_ball_point(query, **kwargs)
+
+
+def test_support_queries_use_filtered_count_only_index_and_batched_path_nodes() -> None:
+    points = np.asarray(
+        [
+            [0.00, 0.00, 0.00],
+            [0.05, 0.00, 0.00],
+            [0.10, 0.00, 0.00],
+            [0.15, 0.00, 0.00],
+            [0.20, 0.00, 0.00],
+            [0.25, 0.00, 0.00],
+        ],
+        dtype=float,
+    )
+    support_mask = _index_mask(len(points), 0, 2, 3, 5)
+    query_points = points[[1, 3, 4]]
+    path = points[[0, 2, 5]]
+    radius = 0.076
+
+    baseline_counts = _local_support_counts(
+        cKDTree(points),
+        query_points,
+        radius=radius,
+        support_mask=support_mask,
+    )
+    baseline_indices = _path_support_indices(
+        cKDTree(points),
+        path,
+        radius=radius,
+        support_mask=support_mask,
+    )
+
+    support_index = _build_support_index(points, support_mask)
+    count_tree = _RecordingTree(support_index.points)
+    batched_counts = _local_support_counts(
+        count_tree,
+        query_points,
+        radius=radius,
+        support_mask=None,
+    )
+    path_tree = _RecordingTree(support_index.points)
+    batched_indices = _path_support_indices(
+        path_tree,
+        path,
+        radius=radius,
+        support_mask=None,
+        source_indices=support_index.source_indices,
+    )
+
+    np.testing.assert_array_equal(batched_counts, baseline_counts)
+    assert batched_indices == baseline_indices
+    assert count_tree.calls == [((len(query_points), 3), True)]
+    assert path_tree.calls == [((len(path), 3), False)]
 
 
 def _primary() -> np.ndarray:
@@ -254,7 +328,7 @@ def test_growth_density_chooses_novel_branch_over_denser_excluded_branch() -> No
     selected = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices={0, 1},
+        allowed_mask=_index_mask(len(points), 0, 1),
         start=start,
         initial_direction=np.array([1.0, 0.0, 0.0]),
         primary_tangent=np.array([0.0, 0.0, 1.0]),
@@ -264,8 +338,25 @@ def test_growth_density_chooses_novel_branch_over_denser_excluded_branch() -> No
         search_radius=1.1,
         density_support_mask=support_mask,
     )
+    indexed = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_mask=_index_mask(len(points), 0, 1),
+        start=start,
+        initial_direction=np.array([1.0, 0.0, 0.0]),
+        primary_tangent=np.array([0.0, 0.0, 1.0]),
+        step_length=1.0,
+        open_angle=90.0,
+        max_steps=1,
+        search_radius=1.1,
+        density_support_mask=support_mask,
+        density_support_index=_build_support_index(points, support_mask),
+    )
 
     np.testing.assert_allclose(selected.points[-1], lower)
+    np.testing.assert_array_equal(indexed.points, selected.points)
+    assert indexed.score == selected.score
+    assert indexed.score_components == selected.score_components
 
 
 def test_growth_keeps_primary_angle_constraint_at_insertion() -> None:
@@ -297,7 +388,7 @@ def test_growth_keeps_primary_angle_constraint_at_insertion() -> None:
     selected = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices={0, 1},
+        allowed_mask=_index_mask(len(points), 0, 1),
         start=start,
         initial_direction=direction(50.0),
         primary_tangent=np.array([0.0, 0.0, 1.0]),
@@ -349,7 +440,7 @@ def test_growth_follows_evolving_tangent_after_insertion() -> None:
     selected = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices={0, 1, 2},
+        allowed_mask=_index_mask(len(points), 0, 1, 2),
         start=start,
         initial_direction=direction(10.0),
         primary_tangent=np.array([0.0, 0.0, 1.0]),
@@ -366,7 +457,7 @@ def test_growth_follows_evolving_tangent_after_insertion() -> None:
     fixed_reference = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices={0, 1, 2},
+        allowed_mask=_index_mask(len(points), 0, 1, 2),
         start=start,
         initial_direction=direction(10.0),
         primary_tangent=np.array([0.0, 0.0, 1.0]),
@@ -403,7 +494,7 @@ def test_single_path_tracer_does_not_emit_fork_hypotheses() -> None:
     path = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices=set(range(len(points))),
+        allowed_mask=np.ones(len(points), dtype=bool),
         start=start,
         initial_direction=np.array([1.0, 0.0, 0.0]),
         primary_tangent=np.array([1.0, 0.0, 0.0]),
@@ -463,7 +554,7 @@ def test_stable_trace_falls_back_to_shorter_travel() -> None:
     path = _grow_one_candidate(
         points=points,
         point_tree=cKDTree(points),
-        allowed_indices=set(range(len(points))),
+        allowed_mask=np.ones(len(points), dtype=bool),
         start=start,
         initial_direction=np.array([1.0, 0.0, 0.0]),
         primary_tangent=np.array([1.0, 0.0, 0.0]),

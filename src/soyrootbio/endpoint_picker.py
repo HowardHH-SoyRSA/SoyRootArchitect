@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 import threading
 import time
@@ -10,18 +9,8 @@ import numpy as np
 import pandas as pd
 
 from .io import load_root_geometry_with_progress
+from .primary_guidance import PrimaryGuidance
 from .types import PointCloudData
-
-
-@dataclass(frozen=True)
-class PrimaryGuidance:
-    """Manual biological constraints selected from the 3-D point cloud."""
-
-    start: np.ndarray
-    end: np.ndarray
-    soil_z: float | None
-    guides: np.ndarray
-    use_endpoints: bool = True
 
 
 def _wheel_zoom_factor(button, step: float | int | None = None) -> float | None:
@@ -33,6 +22,31 @@ def _wheel_zoom_factor(button, step: float | int | None = None) -> float | None:
     if button == "down" or numeric_step < 0.0:
         return 1.35
     return None
+
+
+def _maximize_figure_window(figure) -> bool:
+    """Maximize a Matplotlib selection window using its active GUI backend."""
+
+    manager = getattr(getattr(figure, "canvas", None), "manager", None)
+    window = getattr(manager, "window", None)
+    if window is None:
+        return False
+    for method_name, arguments in (
+        ("showMaximized", ()),
+        ("state", ("zoomed",)),
+        ("wm_state", ("zoomed",)),
+        ("Maximize", (True,)),
+        ("maximize", ()),
+    ):
+        method = getattr(window, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method(*arguments)
+        except Exception:
+            continue
+        return True
+    return False
 
 
 def _zoom_3d_axis(axis, factor: float, canvas=None) -> None:
@@ -170,6 +184,7 @@ def _run_endpoint_picker(
 
     sample_points = _parse_sample_count(str(sample_points))
     figure = plt.figure(figsize=(15, 10))
+    _maximize_figure_window(figure)
     axis = figure.add_axes([0.045, 0.095, 0.665, 0.80], projection="3d")
     figure.text(0.045, 0.952, title, fontsize=16, weight="bold")
     status_text = figure.text(0.045, 0.921, "Preparing endpoint picker...", fontsize=11)
@@ -818,6 +833,7 @@ def select_primary_sections_gui(
     }
 
     figure = plt.figure(figsize=(15, 10))
+    _maximize_figure_window(figure)
     figure.canvas.manager.set_window_title(title)
     axis = figure.add_axes([0.045, 0.095, 0.665, 0.80], projection="3d")
     figure.text(0.045, 0.952, title, fontsize=16, weight="bold")

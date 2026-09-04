@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +26,7 @@ from .endpoint_picker import (
 )
 from .hardware import allocate_resources, detect_hardware, format_bytes
 from .pipeline import PipelineConfig, run_pipeline
+from .primary_guidance import read_primary_guidance
 
 
 SUPPORTED_INPUTS = {".ply", ".stl", ".obj", ".xyz", ".csv"}
@@ -106,7 +107,7 @@ class BioInsAlgoBatchApp:
         self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=1)
+        outer.rowconfigure(4, weight=1)
 
         ttk.Label(outer, text="SoyRootBio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(outer, textvariable=self.hardware_var, foreground="#4b5563").grid(row=1, column=0, sticky="w", pady=(1, 9))
@@ -118,12 +119,18 @@ class BioInsAlgoBatchApp:
         ttk.Button(toolbar, text="Set selected output", command=self.set_selected_output).pack(side="left", padx=5)
         ttk.Button(toolbar, text="Open output folder", command=self.open_output_folder).pack(side="left", padx=5)
         ttk.Button(toolbar, text="Configure selected primary…", command=self.configure_selected_primary).pack(side="left", padx=5)
-        ttk.Label(toolbar, text="Output root:").pack(side="left", padx=(18, 4))
-        ttk.Entry(toolbar, textvariable=self.output_root_var, width=38).pack(side="left", fill="x", expand=True)
-        ttk.Button(toolbar, text="Browse", command=self.choose_output_root).pack(side="left", padx=(5, 0))
+
+        # Keep selection import and output-root controls on a second row so
+        # they remain visible at the application's minimum window width.
+        output_toolbar = ttk.Frame(outer)
+        output_toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(output_toolbar, text="Load endpoints + guides…", command=self.load_selected_guidance).pack(side="left")
+        ttk.Label(output_toolbar, text="Output root:").pack(side="left", padx=(18, 4))
+        ttk.Entry(output_toolbar, textvariable=self.output_root_var, width=38).pack(side="left", fill="x", expand=True)
+        ttk.Button(output_toolbar, text="Browse", command=self.choose_output_root).pack(side="left", padx=(5, 0))
 
         body = ttk.Panedwindow(outer, orient="horizontal")
-        body.grid(row=3, column=0, sticky="nsew")
+        body.grid(row=4, column=0, sticky="nsew")
         queue_frame = ttk.Frame(body, padding=(0, 0, 8, 0))
         settings_frame = ttk.Frame(body, padding=(8, 0, 0, 0))
         body.add(queue_frame, weight=4)
@@ -131,7 +138,7 @@ class BioInsAlgoBatchApp:
         queue_frame.rowconfigure(0, weight=1)
         queue_frame.columnconfigure(0, weight=1)
 
-        columns = ("sample", "output", "primary", "status", "progress", "eta", "threads")
+        columns = ("sample", "output", "primary", "status", "progress", "runtime")
         self.tree = ttk.Treeview(queue_frame, columns=columns, show="headings", selectmode="extended")
         headings = {
             "sample": "Sample",
@@ -139,10 +146,9 @@ class BioInsAlgoBatchApp:
             "primary": "Primary method",
             "status": "Status",
             "progress": "Progress",
-            "eta": "ETA",
-            "threads": "Threads",
+            "runtime": "Total run time",
         }
-        widths = {"sample": 190, "output": 260, "primary": 170, "status": 110, "progress": 75, "eta": 80, "threads": 60}
+        widths = {"sample": 180, "output": 225, "primary": 180, "status": 95, "progress": 70, "runtime": 110}
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], minwidth=55, stretch=False)
@@ -160,13 +166,15 @@ class BioInsAlgoBatchApp:
         self._build_settings(settings_frame)
 
         controls = ttk.Frame(outer)
-        controls.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        controls.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(controls, text="Start batch", style="Primary.TButton", command=self.start_batch).pack(side="left")
         ttk.Button(controls, text="Pause selected", command=self.pause_selected).pack(side="left", padx=5)
         ttk.Button(controls, text="Resume selected", command=self.resume_selected).pack(side="left", padx=5)
         ttk.Button(controls, text="Cancel selected", command=self.cancel_selected).pack(side="left", padx=5)
         ttk.Button(controls, text="Cancel all", command=self.cancel_all).pack(side="left", padx=5)
-        ttk.Label(controls, textvariable=self.status_var).pack(side="right")
+        ttk.Label(outer, textvariable=self.status_var, wraplength=1000).grid(
+            row=6, column=0, sticky="ew", pady=(6, 0),
+        )
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -248,7 +256,7 @@ class BioInsAlgoBatchApp:
             return
         output_root = self._output_root_default()
         used = {entry.output_dir for entry in self.entries.values()}
-        added = 0
+        added: list[str] = []
         for path in paths:
             path = Path(path)
             if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUTS:
@@ -260,12 +268,16 @@ class BioInsAlgoBatchApp:
             item = self.tree.insert(
                 "",
                 "end",
-                values=(path.name, str(output), self.primary_method_var.get(), "Queued", "0%", "--", "Auto"),
+                values=(path.name, str(output), self.primary_method_var.get(), "Queued", "0%", "--"),
             )
             self.entries[item] = SampleEntry(item, path, output)
-            added += 1
+            added.append(item)
         if added:
-            self.status_var.set(f"Added {added} sample(s) to the queue.")
+            self.tree.selection_set(added)
+            self.tree.see(added[-1])
+            self.status_var.set(
+                f"Added {len(added)} sample(s). Select one and use Load endpoints + guides to reuse a previous selection."
+            )
 
     def _output_root_default(self) -> Path:
         text = self.output_root_var.get().strip()
@@ -369,7 +381,40 @@ class BioInsAlgoBatchApp:
         else:
             subprocess.Popen(["xdg-open", str(path)])
 
+    def load_selected_guidance(self) -> None:
+        if self.scheduler is not None and not self.scheduler.all_done:
+            messagebox.showinfo("Batch active", "Wait for the batch to finish before changing primary guidance.")
+            return
+        selected = self.tree.selection()
+        if len(selected) != 1:
+            messagebox.showinfo("Select one sample", "Select exactly one sample to load its endpoints and guides.")
+            return
+        entry = self.entries[selected[0]]
+        value = filedialog.askopenfilename(
+            title=f"Load endpoints and guides — {entry.input_path.name}",
+            initialdir=str(entry.output_dir if entry.output_dir.is_dir() else self._output_root_default()),
+            filetypes=[("Primary guidance", "*.json")],
+        )
+        if not value:
+            return
+        try:
+            guidance = read_primary_guidance(value, expected_input=entry.input_path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot load primary guidance", str(exc))
+            return
+        entry.guidance = guidance
+        self.tree.set(
+            entry.item_id,
+            "primary",
+            f"Loaded endpoints + {len(guidance.guides)} guides"
+            if guidance.use_endpoints else "Loaded soil line + guides",
+        )
+        self.status_var.set(f"Loaded saved primary guidance for {entry.input_path.name}.")
+
     def configure_selected_primary(self) -> None:
+        if self.scheduler is not None and not self.scheduler.all_done:
+            messagebox.showinfo("Batch active", "Wait for the batch to finish before changing primary guidance.")
+            return
         selected = self.tree.selection()
         if len(selected) != 1:
             messagebox.showinfo("Select one sample", "Select exactly one sample to configure.")
@@ -446,7 +491,8 @@ class BioInsAlgoBatchApp:
                 job = new_scheduler.submit(entry.input_path, entry.output_dir, payload=payload)
                 entry.job_id = job.job_id
                 new_job_to_item[job.job_id] = item
-                self.tree.set(item, "threads", allocation.threads_per_sample)
+                self.tree.set(item, "runtime", "--")
+                self.tree.set(item, "progress", "0%")
                 self.tree.set(item, "status", "Queued")
             if self.scheduler is not None:
                 self.scheduler.shutdown(wait=False)
@@ -572,24 +618,33 @@ class BioInsAlgoBatchApp:
                 snapshot = event.job
                 self.tree.set(item, "status", snapshot.state.value.title())
                 self.tree.set(item, "progress", f"{snapshot.progress_percent:.0f}%")
-                self.tree.set(item, "eta", self._format_eta(snapshot.eta_seconds))
                 if event.kind == BatchEventType.FAILED:
                     self.tree.set(item, "status", "Failed")
                     self.status_var.set(f"{self.entries[item].input_path.name}: {snapshot.error}")
-            if self.scheduler.all_done and self.scheduler.jobs:
-                completed = sum(job.state == BatchJobState.COMPLETED for job in self.scheduler.jobs)
-                failed = sum(job.state == BatchJobState.FAILED for job in self.scheduler.jobs)
+            jobs = self.scheduler.jobs
+            # Stages can run for minutes without a progress event. Refresh
+            # the monotonic active duration independently on every GUI poll.
+            for job in jobs:
+                item = self.job_to_item.get(job.job_id)
+                if item is not None and self.tree.exists(item):
+                    self.tree.set(
+                        item, "runtime",
+                        self._format_runtime(job.elapsed_seconds if job.started_at is not None else None),
+                    )
+            if self.scheduler.all_done and jobs:
+                completed = sum(job.state == BatchJobState.COMPLETED for job in jobs)
+                failed = sum(job.state == BatchJobState.FAILED for job in jobs)
                 if failed:
                     self.status_var.set(
-                        f"Batch finished: {completed}/{len(self.scheduler.jobs)} completed; "
+                        f"Batch finished: {completed}/{len(jobs)} completed; "
                         f"{failed} failed. See processing_error.log in each failed output folder."
                     )
                 else:
-                    self.status_var.set(f"Batch finished: {completed}/{len(self.scheduler.jobs)} completed.")
+                    self.status_var.set(f"Batch finished: {completed}/{len(jobs)} completed.")
         self.root.after(120, self._poll_scheduler)
 
     @staticmethod
-    def _format_eta(seconds: float | None) -> str:
+    def _format_runtime(seconds: float | None) -> str:
         if seconds is None:
             return "--"
         seconds = max(0, int(round(seconds)))

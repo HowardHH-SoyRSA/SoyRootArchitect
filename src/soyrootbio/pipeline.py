@@ -14,6 +14,11 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from .export import export_results
+from .primary_guidance import (
+    PRIMARY_GUIDANCE_FILENAME,
+    PrimaryGuidance,
+    write_primary_guidance,
+)
 from .geometry import mean_nearest_neighbor_distance, normalize_unit_box
 from .io import load_root_geometry
 from .lateral import (
@@ -96,6 +101,8 @@ def _ancestor_tube_mask(
     ancestor_path: np.ndarray,
     ancestor_radius_profile: np.ndarray,
     d_bar: float,
+    *,
+    ancestor_tree: cKDTree | None = None,
 ) -> np.ndarray:
     """Return vertices inside a sampling-scaled ancestor surface envelope."""
 
@@ -106,7 +113,8 @@ def _ancestor_tube_mask(
         raise ValueError(
             "ancestor_radius_profile must contain one value per path node"
         )
-    distances, nearest = cKDTree(ancestor).query(
+    tree = ancestor_tree if ancestor_tree is not None else cKDTree(ancestor)
+    distances, nearest = tree.query(
         source,
         k=1,
         workers=worker_threads(),
@@ -207,6 +215,15 @@ def _run_pipeline_impl(
 
     cooperate()
     _report_progress(progress_callback, "Preparing analysis", 0.02)
+    # Snapshot external selection files once, then save and use exactly those
+    # same source-coordinate values even if the original files later move.
+    manual_guidance = _manual_primary_guidance(config)
+    if manual_guidance is not None:
+        write_primary_guidance(
+            config.output_dir / PRIMARY_GUIDANCE_FILENAME,
+            manual_guidance,
+            input_path=config.input_path,
+        )
     np.random.seed(config.random_seed)
     LOGGER.info("Loading input geometry: %s", config.input_path)
     if preloaded_cloud is None:
@@ -239,6 +256,7 @@ def _run_pipeline_impl(
         d_bar,
         config,
         cooperate=cooperate,
+        manual_guidance=manual_guidance,
     )
     selected_base = np.asarray(coarse_primary.points[0], dtype=float).copy()
     direction_index = max(
@@ -614,6 +632,9 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "primary_detection_method": _primary_method(config),
+        "primary_guidance_file": (
+            PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None
+        ),
         "point_assignment": _point_assignment_summary(
             full_root_labels,
             full_above_base_mask,
@@ -737,6 +758,8 @@ def _trace_lateral_orders(
     parent_paths: list[tuple[str, np.ndarray]] = [("primary", primary_path)]
     labels = np.zeros(len(points), dtype=int)
     extension_tree = cKDTree(points)
+    primary_tree = cKDTree(primary_path)
+    parent_tree_cache: dict[str, cKDTree] = {"primary": primary_tree}
     total_starts = 0
     total_candidates = 0
     order_counts: dict[int, int] = {}
@@ -749,12 +772,17 @@ def _trace_lateral_orders(
         primary_path,
         primary_support_points,
         d_bar,
+        parent_tree=primary_tree,
     )
+    parent_radius_cache: dict[str, np.ndarray] = {
+        "primary": primary_ancestor_radius_profile,
+    }
     primary_ancestor_mask = _ancestor_tube_mask(
         points,
         primary_path,
         primary_ancestor_radius_profile,
         d_bar,
+        ancestor_tree=primary_tree,
     )
 
     for order in range(1, max(1, int(max_root_order)) + 1):
@@ -786,11 +814,19 @@ def _trace_lateral_orders(
             parent_support_points = points[parent_support_mask]
             if len(parent_support_points) < 3:
                 parent_support_points = np.asarray(parent_path, dtype=float)
-            parent_radius_profile = estimate_parent_radius_profile(
-                parent_path,
-                parent_support_points,
-                d_bar,
-            )
+            parent_tree = parent_tree_cache.get(parent_id)
+            if parent_tree is None:
+                parent_tree = cKDTree(parent_path)
+                parent_tree_cache[parent_id] = parent_tree
+            parent_radius_profile = parent_radius_cache.get(parent_id)
+            if parent_radius_profile is None:
+                parent_radius_profile = estimate_parent_radius_profile(
+                    parent_path,
+                    parent_support_points,
+                    d_bar,
+                    parent_tree=parent_tree,
+                )
+                parent_radius_cache[parent_id] = parent_radius_profile
             # Attachment distance must follow the local parent thickness.  A
             # fixed centreline gate rejects valid branches on a thick/flared
             # collar even when their surface touches the parent.  Add a
@@ -824,6 +860,7 @@ def _trace_lateral_orders(
                     if order == 1 and parent_id == "primary"
                     else None
                 ),
+                parent_tree=parent_tree,
             )
             order_starts += len(starts)
             max_steps = 80 if order == 1 else 35
@@ -839,6 +876,8 @@ def _trace_lateral_orders(
                     primary_ancestor_mask if order > 1 else None
                 ),
                 cooperate=cooperate,
+                point_tree=extension_tree,
+                parent_tree=parent_tree,
             )
             order_candidate_count += len(candidates)
             evaluated_groups: dict[int | str, list[tuple[RootPath, bool]]] = {}
@@ -853,6 +892,7 @@ def _trace_lateral_orders(
                             primary_path,
                             primary_ancestor_radius_profile,
                             d_bar,
+                            ancestor_tree=primary_tree,
                         )
                     )
                     candidate.score_components.update(ancestor_metrics)
@@ -864,6 +904,7 @@ def _trace_lateral_orders(
                     parent_path,
                     parent_radius_profile,
                     d_bar,
+                    parent_tree=parent_tree,
                 )
                 candidate.score_components.update(tracking_metrics)
                 if rejected:
@@ -913,6 +954,7 @@ def _trace_lateral_orders(
             max_paths=remaining,
             rename_selected=False,
             initial_used=existing_order_support,
+            point_tree=extension_tree,
         )
         connectors_by_parent: dict[str, list[RootPath]] = {}
         ordinary_selected: list[RootPath] = []
@@ -962,6 +1004,7 @@ def _trace_lateral_orders(
                 [path],
                 path.parent_points,
                 primary_points=path.parent_points,
+                target_tree=parent_tree_cache.get(str(path.parent_id)),
             )
             for traced in traced_paths:
                 local_mask = np.zeros(len(points), dtype=bool)
@@ -1036,6 +1079,7 @@ def _trace_lateral_orders(
                         primary_path,
                         primary_ancestor_radius_profile,
                         d_bar,
+                        ancestor_tree=primary_tree,
                     )
                 )
                 traced.score_components.update(ancestor_metrics)
@@ -1050,6 +1094,8 @@ def _trace_lateral_orders(
         if not refined:
             break
         selected_all.extend(refined)
+        for path in refined:
+            parent_tree_cache[str(path.root_id)] = cKDTree(path.points)
         order_counts[order] = sum(int(path.order) == order for path in selected_all)
         labels = _assign_lateral_points(
             points,
@@ -1327,6 +1373,16 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("worker_threads must be a positive integer when provided")
 
 
+def _manual_primary_guidance(config: PipelineConfig) -> PrimaryGuidance | None:
+    if config.endpoint_file is not None:
+        start, end = read_endpoint_file(config.endpoint_file)
+    elif config.start is not None and config.end is not None:
+        start, end = np.asarray(config.start, dtype=float), np.asarray(config.end, dtype=float)
+    else:
+        return None
+    return PrimaryGuidance(start, end, config.soil_z, _read_primary_guides(config))
+
+
 def _resolve_primary_path(
     original_points: np.ndarray,
     normalized_points: np.ndarray,
@@ -1335,22 +1391,18 @@ def _resolve_primary_path(
     config: PipelineConfig,
     *,
     cooperate: Callable[[], None] | None = None,
+    manual_guidance: PrimaryGuidance | None = None,
 ) -> tuple[RootPath, list[PrimaryCandidate]]:
     gravity = np.asarray(config.gravity, dtype=float)
     gravity /= np.linalg.norm(gravity)
-    guides = _read_primary_guides(config)
+    guidance = manual_guidance if manual_guidance is not None else _manual_primary_guidance(config)
+    guides = guidance.guides if guidance is not None else _read_primary_guides(config)
     normalized_guides = (
         normalization.transform_points(guides) if len(guides) else np.empty((0, 3), dtype=float)
     )
-    manual = config.endpoint_file is not None or (config.start is not None and config.end is not None)
     candidates: list[PrimaryCandidate] = []
-    if manual:
-        if config.endpoint_file is not None:
-            start_original, end_original = read_endpoint_file(config.endpoint_file)
-        else:
-            start_original = np.asarray(config.start, dtype=float)
-            end_original = np.asarray(config.end, dtype=float)
-        start, end = _validate_and_transform_endpoints(start_original, end_original, normalization)
+    if guidance is not None:
+        start, end = _validate_and_transform_endpoints(guidance.start, guidance.end, normalization)
         start, end = _orient_collar_to_tip(start, end, gravity)
         path = estimate_primary_path(
             normalized_points,

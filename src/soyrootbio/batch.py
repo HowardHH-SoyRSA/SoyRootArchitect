@@ -358,6 +358,7 @@ class BatchJob:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _started_monotonic: float | None = field(default=None, init=False, repr=False)
     _finished_monotonic: float | None = field(default=None, init=False, repr=False)
+    _paused_seconds_at_start: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.input_path = Path(self.input_path)
@@ -386,7 +387,8 @@ class BatchJob:
                 end = self._finished_monotonic or time.monotonic()
             else:
                 end = time.monotonic()
-            return max(0.0, end - self._started_monotonic - self._control.paused_seconds)
+            paused_during_run = self._control.paused_seconds - self._paused_seconds_at_start
+            return max(0.0, end - self._started_monotonic - paused_during_run)
 
     def snapshot(self) -> BatchJobSnapshot:
         with self._lock:
@@ -882,6 +884,7 @@ class BatchScheduler:
                 return
             job.started_at = time.time()
             job._started_monotonic = started_monotonic
+            job._paused_seconds_at_start = paused_at_start
             if control.paused:
                 job.state = BatchJobState.PAUSED
                 job.step = "Paused"

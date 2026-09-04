@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.spatial import cKDTree
 
 from soyrootbio.geometry import mean_nearest_neighbor_distance, normalize_unit_box
 from soyrootbio.lateral import find_lateral_starting_points, grow_lateral_candidates, select_non_overlapping_paths
@@ -30,6 +31,71 @@ def test_primary_and_lateral_steps_on_synthetic_cloud():
     selected = select_non_overlapping_paths(candidates, points, d_bar=d_bar, max_paths=3)
     assert selected
     assert selected[0].length > 0.05
+
+
+def test_reused_spatial_indexes_preserve_lateral_candidates():
+    points, _ = normalize_unit_box(synthetic_root_points())
+    d_bar = mean_nearest_neighbor_distance(points)
+    primary = estimate_primary_path(
+        points,
+        points[np.argmin(points[:, 2])],
+        points[np.argmax(points[:, 2])],
+        d_bar=d_bar,
+    )
+    primary_mask = tangent_plane_primary_segmentation(
+        points,
+        primary.points,
+        d_bar=d_bar,
+    )
+    baseline_starts = find_lateral_starting_points(
+        points,
+        primary_mask,
+        primary.points,
+        closest_fraction=0.15,
+        min_cluster_size=4,
+    )
+    parent_tree = cKDTree(primary.points)
+    reused_starts = find_lateral_starting_points(
+        points,
+        primary_mask,
+        primary.points,
+        closest_fraction=0.15,
+        min_cluster_size=4,
+        parent_tree=parent_tree,
+    )
+    assert [start.start_id for start in reused_starts] == [
+        start.start_id for start in baseline_starts
+    ]
+    for baseline, reused in zip(baseline_starts, reused_starts, strict=True):
+        np.testing.assert_array_equal(reused.point, baseline.point)
+        np.testing.assert_array_equal(reused.primary_point, baseline.primary_point)
+        np.testing.assert_array_equal(reused.member_indices, baseline.member_indices)
+
+    baseline = grow_lateral_candidates(
+        points,
+        baseline_starts,
+        primary.points,
+        primary_mask,
+        d_bar=d_bar,
+        max_steps=20,
+    )
+    reused = grow_lateral_candidates(
+        points,
+        reused_starts,
+        primary.points,
+        primary_mask,
+        d_bar=d_bar,
+        max_steps=20,
+        point_tree=cKDTree(points),
+        parent_tree=parent_tree,
+    )
+    assert [path.root_id for path in reused] == [path.root_id for path in baseline]
+    for baseline_path, reused_path in zip(baseline, reused, strict=True):
+        np.testing.assert_array_equal(reused_path.points, baseline_path.points)
+        assert reused_path.covered_indices == baseline_path.covered_indices
+        assert reused_path.novel_support_indices == baseline_path.novel_support_indices
+        assert reused_path.score == baseline_path.score
+        assert reused_path.score_components == baseline_path.score_components
 
 
 def test_lateral_start_gate_accepts_a_local_parent_radius_profile():
@@ -84,4 +150,3 @@ def test_lateral_start_gate_disables_diameter_bridge_for_a_strongly_flared_paren
     # only the local-radius-plus-sampling envelope (r + 9*d_bar).
     assert np.allclose(flared_limits[:-2], 23.0 * d_bar)
     assert np.allclose(flared_limits[-2:], 28.0 * d_bar)
-

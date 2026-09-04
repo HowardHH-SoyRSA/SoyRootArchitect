@@ -13,7 +13,7 @@ The project prioritizes the measurement objectives in this repository over exact
 - Produces an oriented centreline tree, stable root IDs, insertion locations, confidence values, and QC flags.
 - Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
 - Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
-- Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and primary guidance, ETA/progress, hardware-aware concurrency, pause/resume, and cancellation.
+- Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and reusable primary guidance, elapsed run time/progress, hardware-aware concurrency, pause/resume, and cancellation.
 - Provides a local, GPU-accelerated 3D result viewer and graph editor with per-root inspection, nine topology/geometry tools, durable undo/redo, and non-destructive materialisation.
 - Keeps the full mesh by default. Automatic analysis reduction is allowed only when the runtime/memory preflight crosses the configured limit; the default runtime limit is 30 minutes.
 
@@ -70,11 +70,15 @@ The GUI supports these primary-root modes:
 
 Add multiple STL/PLY files with **Add files** or drag/drop them onto the queue. Each sample receives a unique output directory, which can be changed individually. Select one sample and use **Open output folder** to open that directory. The queue/status table has both vertical and horizontal scrollbars for long paths and status messages. Automatic resource allocation reserves a logical CPU for the desktop, considers physical/logical CPU counts and available RAM, and assigns concurrent samples and threads per sample. Both values can be overridden.
 
+To reuse a previous collar/tip selection, add the geometry, select its row, and choose **Load endpoints + guides…**. Open that sample's exported `primary_guidance.json`. The file stores the original source-coordinate endpoints, ordered guides, optional soil-line Z, and source sample name; it does not depend on the previous output folder or any external guide file. Loading checks the sample filename and coordinates before replacing its per-sample guidance. The loaded selection overrides the global primary method for that row.
+
+Runs with manual endpoints automatically save `primary_guidance.json` in the output directory before geometry processing begins, including runs with no optional guides. This keeps the selected points available even if processing later fails. The **Total run time** column updates throughout processing and retains the final duration; queued time and deliberate pauses are excluded. ETA and thread-count columns are no longer shown; **Threads / sample** remains an analysis setting.
+
 If a sample fails, its output directory contains `processing_error.log` with the failure time, input/output paths, exception, traceback, and non-sensitive pipeline configuration. Cancelled jobs are not reported as processing failures. GUI batch clustering avoids nested HDBSCAN worker pools, so sample-level concurrency remains within the scheduler's resource allocation.
 
 The displayed memory summary distinguishes currently available RAM from installed RAM, and automatic concurrency is budgeted against the available value with a reserve for the desktop. Manual concurrency/thread overrides are honored and can intentionally oversubscribe the machine. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
 
-Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` and are reused for future ETAs. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
+Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` for timing history. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
 
 ## Interactive 3D result editor
 
@@ -290,6 +294,7 @@ Every run writes a self-contained output directory. Class-specific PLY files are
 - `root_hierarchy.json`: editable topology and polylines.
 - `root_system.rsml`: nested, hierarchy-preserving RSML with source-mesh geometry, `mesh_unit` labels, and selected properties.
 - `metadata.json`: configuration, provenance, primary candidates, mesh audit, topology report, stage timings, system summary, and output inventory.
+- `primary_guidance.json` (manual-endpoint runs): standalone source-coordinate collar/tip endpoints, ordered guides, and optional soil-line Z for reuse in the GUI.
 
 ### Geometry and validation figures
 

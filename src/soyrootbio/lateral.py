@@ -27,10 +27,21 @@ class LateralStart:
     surface_contact_count: int = 0
 
 
+@dataclass(frozen=True)
+class _SupportIndex:
+    """Spatial index over a filtered subset of the source point cloud."""
+
+    points: np.ndarray
+    tree: cKDTree
+    source_indices: np.ndarray
+
+
 def estimate_parent_radius_profile(
     parent_path: np.ndarray,
     parent_support_points: np.ndarray,
     d_bar: float,
+    *,
+    parent_tree: cKDTree | None = None,
 ) -> np.ndarray:
     """Estimate a robust local surface radius at every parent-path node.
 
@@ -48,7 +59,8 @@ def estimate_parent_radius_profile(
     if support.ndim != 2 or support.shape[1] != 3 or len(support) < 3:
         return np.full(len(parent_path), radius_floor, dtype=float)
 
-    distances, nearest = cKDTree(parent_path).query(support, k=1, workers=worker_threads())
+    tree = parent_tree if parent_tree is not None else cKDTree(parent_path)
+    distances, nearest = tree.query(support, k=1, workers=worker_threads())
     profile = np.full(len(parent_path), np.nan, dtype=float)
     for node_index in np.unique(nearest):
         values = distances[nearest == node_index]
@@ -75,6 +87,8 @@ def is_parent_tracking_candidate(
     parent_path: np.ndarray,
     parent_radius_profile: np.ndarray,
     d_bar: float,
+    *,
+    parent_tree: cKDTree | None = None,
 ) -> tuple[bool, dict[str, float]]:
     """Return whether a candidate is an offset trace of its parent surface.
 
@@ -94,8 +108,8 @@ def is_parent_tracking_candidate(
     sampled = resample_polyline(path.points, spacing=spacing)
     if len(sampled) < 3:
         return False, {}
-    parent_tree = cKDTree(parent_path)
-    distances, nearest = parent_tree.query(sampled, k=1, workers=worker_threads())
+    tree = parent_tree if parent_tree is not None else cKDTree(parent_path)
+    distances, nearest = tree.query(sampled, k=1, workers=worker_threads())
     nearest = np.asarray(nearest, dtype=int)
 
     segment_lengths = np.linalg.norm(np.diff(sampled, axis=0), axis=1)
@@ -206,6 +220,8 @@ def is_ancestor_inward_candidate(
     ancestor_path: np.ndarray,
     ancestor_radius_profile: np.ndarray,
     d_bar: float,
+    *,
+    ancestor_tree: cKDTree | None = None,
 ) -> tuple[bool, dict[str, float]]:
     """Reject a child that terminates inside an ancestor tube.
 
@@ -232,7 +248,8 @@ def is_ancestor_inward_candidate(
     )
     if len(sampled) < 3:
         return False, {}
-    distances, nearest = cKDTree(ancestor).query(
+    tree = ancestor_tree if ancestor_tree is not None else cKDTree(ancestor)
+    distances, nearest = tree.query(
         sampled,
         k=1,
         workers=worker_threads(),
@@ -288,6 +305,7 @@ def find_lateral_starting_points(
     exclude_parent_tip_fraction: float = 0.0,
     parent_surface_points: np.ndarray | None = None,
     surface_contact_distance: float | None = None,
+    parent_tree: cKDTree | None = None,
 ) -> list[LateralStart]:
     """Cluster non-primary points closest to the primary root as branch starts.
 
@@ -297,7 +315,12 @@ def find_lateral_starting_points(
     non_primary = np.flatnonzero(~primary_mask)
     if len(non_primary) == 0:
         return []
-    distances, primary_indices = point_to_polyline_distance(points[non_primary], primary_path)
+    primary_tree = parent_tree if parent_tree is not None else cKDTree(primary_path)
+    distances, primary_indices = point_to_polyline_distance(
+        points[non_primary],
+        primary_path,
+        path_tree=primary_tree,
+    )
     primary_indices = np.asarray(primary_indices, dtype=int)
     surface_contact = np.zeros(len(non_primary), dtype=bool)
     surface_distances = np.full(len(non_primary), np.inf, dtype=float)
@@ -321,7 +344,7 @@ def find_lateral_starting_points(
             k=1,
             workers=worker_threads(),
         )
-        _, surface_to_parent = cKDTree(primary_path).query(
+        _, surface_to_parent = primary_tree.query(
             surface,
             k=1,
             workers=worker_threads(),
@@ -367,7 +390,6 @@ def find_lateral_starting_points(
         return []
     labels = cluster_hdbscan(points[seed_indices], min_cluster_size=min(min_cluster_size, max(2, len(seed_indices) // 2)))
     starts: list[LateralStart] = []
-    primary_tree = cKDTree(primary_path)
     primary_tangents = tangent_vectors(primary_path)
     non_primary_positions = {
         int(point_index): position
@@ -583,17 +605,21 @@ def grow_lateral_candidates(
     cooperate: Callable[[], None] | None = None,
     parent_radius_profile: np.ndarray | None = None,
     ancestor_exclusion_mask: np.ndarray | None = None,
+    point_tree: cKDTree | None = None,
+    parent_tree: cKDTree | None = None,
 ) -> list[RootPath]:
-    point_tree = cKDTree(points)
+    if not starts:
+        return []
+    point_tree = point_tree if point_tree is not None else cKDTree(points)
     primary_tangents = tangent_vectors(primary_path)
-    non_primary = np.flatnonzero(~primary_mask)
-    allowed_indices = set(non_primary.tolist())
+    allowed_mask = ~np.asarray(primary_mask, dtype=bool)
     novel_support_mask = _novel_support_mask(
         points,
         occupied_mask=primary_mask,
         parent_path=primary_path,
         parent_radius_profile=parent_radius_profile,
         d_bar=d_bar,
+        parent_tree=parent_tree,
     )
     if ancestor_exclusion_mask is not None:
         ancestor_exclusion = np.asarray(
@@ -605,6 +631,9 @@ def grow_lateral_candidates(
                 "ancestor_exclusion_mask must contain one value per point"
             )
         novel_support_mask &= ~ancestor_exclusion
+    # Count only biologically eligible support in SciPy's batched
+    # ``return_length`` path, without materialising full-cloud neighbor lists.
+    novel_support_index = _build_support_index(points, novel_support_mask)
     candidates: list[RootPath] = []
     for start in starts:
         if cooperate is not None:
@@ -655,7 +684,7 @@ def grow_lateral_candidates(
                     path = _grow_one_candidate(
                         points=points,
                         point_tree=point_tree,
-                        allowed_indices=allowed_indices,
+                        allowed_mask=allowed_mask,
                         start=start,
                         initial_direction=initial_direction,
                         primary_tangent=primary_tangent,
@@ -664,7 +693,7 @@ def grow_lateral_candidates(
                         max_steps=max_steps,
                         search_radius=search_radius_factor * step_length,
                         limit_primary_angle_to_insertion=True,
-                        density_support_mask=novel_support_mask,
+                        density_support_index=novel_support_index,
                         cooperate=cooperate,
                     )
                     if len(path.points) >= 3:
@@ -673,10 +702,11 @@ def grow_lateral_candidates(
                             f"_s{multiplier:g}_a{int(open_angle)}"
                         )
                         path.novel_support_indices = _path_support_indices(
-                            point_tree,
+                            novel_support_index.tree,
                             path.points,
                             radius=max(2.0 * d_bar, 0.004),
-                            support_mask=novel_support_mask,
+                            support_mask=None,
+                            source_indices=novel_support_index.source_indices,
                         )
                         path.score_components["novel_density_support"] = float(
                             len(path.novel_support_indices)
@@ -726,7 +756,7 @@ def grow_lateral_candidates(
 def _grow_one_candidate(
     points: np.ndarray,
     point_tree: cKDTree,
-    allowed_indices: set[int],
+    allowed_mask: np.ndarray,
     start: LateralStart,
     initial_direction: np.ndarray,
     primary_tangent: np.ndarray,
@@ -739,6 +769,7 @@ def _grow_one_candidate(
     minimum_local_support: int = 1,
     cooperate: Callable[[], None] | None = None,
     density_support_mask: np.ndarray | None = None,
+    density_support_index: _SupportIndex | None = None,
 ) -> RootPath:
     """Grow one greedy trace while following its evolving local tangent.
 
@@ -747,6 +778,9 @@ def _grow_one_candidate(
     final path score; neither can create an alternate fork or child root.
     """
 
+    allowed = np.asarray(allowed_mask, dtype=bool)
+    if allowed.shape != (len(points),):
+        raise ValueError("allowed_mask must contain one value per point")
     initial = np.asarray(initial_direction, dtype=float).copy()
     initial /= max(float(np.linalg.norm(initial)), 1e-12)
     parent_tangent = np.asarray(primary_tangent, dtype=float).copy()
@@ -757,15 +791,23 @@ def _grow_one_candidate(
     ]
     current = nodes[-1].copy()
     direction = initial
-    covered: set[int] = set()
-    selected_indices: set[int] = set()
+    covered_mask = np.zeros(len(points), dtype=bool)
+    selected_mask = np.zeros(len(points), dtype=bool)
+    covered_members: list[int] = []
+    support_tree = point_tree
+    support_points = np.asarray(points, dtype=float)
+    support_mask = density_support_mask
+    if density_support_index is not None:
+        support_tree = density_support_index.tree
+        support_points = density_support_index.points
+        support_mask = None
     local_radius = _estimate_local_radius(
-        point_tree,
-        points,
+        support_tree,
+        support_points,
         current,
         direction,
         radius=0.75 * float(search_radius),
-        support_mask=density_support_mask,
+        support_mask=support_mask,
     )
     growth_arc = 0.0
     support_sum = 0.0
@@ -787,10 +829,9 @@ def _grow_one_candidate(
             r=search_radius,
             workers=worker_threads(),
         )
-        local = np.asarray(
-            [index for index in nearby_indices if index in allowed_indices],
-            dtype=int,
-        )
+        local = np.asarray(nearby_indices, dtype=int)
+        if len(local):
+            local = local[allowed[local]]
         if len(local) < max(1, int(minimum_local_support)):
             break
 
@@ -830,10 +871,7 @@ def _grow_one_candidate(
             previous_turn_degrees=previous_turn_degrees,
             max_turn_degrees=max_turn_degrees,
         )
-        uncovered = np.asarray(
-            [int(index) not in covered for index in local],
-            dtype=bool,
-        )
+        uncovered = ~covered_mask[local]
         valid = (
             direction_ok
             & uncovered
@@ -866,10 +904,7 @@ def _grow_one_candidate(
                 max_turn_degrees=max_turn_degrees,
                 fallback=True,
             )
-            not_selected = np.asarray(
-                [int(index) not in selected_indices for index in local],
-                dtype=bool,
-            )
+            not_selected = ~selected_mask[local]
             recovery = (
                 direction_ok
                 & not_selected
@@ -899,10 +934,10 @@ def _grow_one_candidate(
         distances = distances[valid]
         turn_cos = turn_cos[valid]
         density = _local_support_counts(
-            point_tree,
+            support_tree,
             points[local],
             radius=0.75 * float(search_radius),
-            support_mask=density_support_mask,
+            support_mask=support_mask,
         )
         distance_score = -np.abs(distances - step_length) / max(
             float(step_length),
@@ -920,12 +955,12 @@ def _grow_one_candidate(
         shortlist_size = min(6, len(local))
         shortlist = np.argsort(-base_score, kind="stable")[:shortlist_size]
         shortlisted_radii = _local_radius_estimates(
-            point_tree,
-            points,
+            support_tree,
+            support_points,
             points[local[shortlist]],
             unit[shortlist],
             radius=0.75 * float(search_radius),
-            support_mask=density_support_mask,
+            support_mask=support_mask,
         )
         radius_similarity = np.full(len(local), 0.5, dtype=float)
         radius_similarity[shortlist] = _radius_continuity_scores(
@@ -972,7 +1007,7 @@ def _grow_one_candidate(
         )
         current = next_point
         nodes.append(current.copy())
-        selected_indices.add(next_index)
+        selected_mask[next_index] = True
         local_covered = point_tree.query_ball_point(
             current,
             # Inspect a full local cross-section after accepting a step.  Only
@@ -989,11 +1024,12 @@ def _grow_one_candidate(
             local_covered_array = local_covered_array[
                 axial_progress <= 0.29 * float(step_length)
             ]
-        covered.update(
-            int(index)
-            for index in local_covered_array
-            if int(index) in allowed_indices
-        )
+        if len(local_covered_array):
+            local_covered_array = local_covered_array[allowed[local_covered_array]]
+        if len(local_covered_array):
+            newly_covered = local_covered_array[~covered_mask[local_covered_array]]
+            covered_mask[local_covered_array] = True
+            covered_members.extend(newly_covered.tolist())
         growth_arc += segment_length
         support_sum += float(density[best_position])
         turn_squared_sum += turn_angle**2
@@ -1030,7 +1066,7 @@ def _grow_one_candidate(
         root_id="candidate",
         points=np.asarray(nodes, dtype=float),
         raw_start_point=np.asarray(start.point, dtype=float).copy(),
-        covered_indices=covered,
+        covered_indices=set(covered_members),
     )
     path.score_components.update(
         {
@@ -1168,7 +1204,7 @@ def extend_lateral_tip(
     candidate = _grow_one_candidate(
         points=points,
         point_tree=tree,
-        allowed_indices=set(np.flatnonzero(available).tolist()),
+        allowed_mask=available,
         start=continuation_start,
         initial_direction=direction,
         primary_tangent=direction,
@@ -1477,10 +1513,11 @@ def select_non_overlapping_paths(
     *,
     rename_selected: bool = True,
     initial_used: set[int] | None = None,
+    point_tree: cKDTree | None = None,
 ) -> list[RootPath]:
     if not candidates:
         return []
-    tree = cKDTree(points)
+    tree = point_tree if point_tree is not None else cKDTree(points)
     radius = max(2.5 * d_bar, 0.004)
     for candidate in candidates:
         if not candidate.covered_indices:
@@ -1571,9 +1608,15 @@ def _is_truncated_path_duplicate(
     return bool(float(np.quantile(distances, 0.90)) <= tolerance)
 
 
-def backtrace_to_primary(paths: list[RootPath], primary_path: np.ndarray, primary_points: np.ndarray | None = None) -> list[RootPath]:
+def backtrace_to_primary(
+    paths: list[RootPath],
+    primary_path: np.ndarray,
+    primary_points: np.ndarray | None = None,
+    *,
+    target_tree: cKDTree | None = None,
+) -> list[RootPath]:
     target = primary_points if primary_points is not None and len(primary_points) else primary_path
-    tree = cKDTree(target)
+    tree = target_tree if target_tree is not None else cKDTree(target)
     refined: list[RootPath] = []
     for path in paths:
         if len(path.points) < 2:
@@ -1608,6 +1651,7 @@ def _novel_support_mask(
     parent_path: np.ndarray,
     parent_radius_profile: np.ndarray | None,
     d_bar: float,
+    parent_tree: cKDTree | None = None,
 ) -> np.ndarray:
     """Return support that is both unoccupied and outside the parent tube.
 
@@ -1632,7 +1676,8 @@ def _novel_support_mask(
     )
     if radii.shape != (len(parent),) or not np.all(np.isfinite(radii)):
         radii = np.full(len(parent), max(2.5 * float(d_bar), 0.002), dtype=float)
-    distances, nearest = cKDTree(parent).query(points, k=1, workers=worker_threads())
+    tree = parent_tree if parent_tree is not None else cKDTree(parent)
+    distances, nearest = tree.query(points, k=1, workers=worker_threads())
     # Include a sampling margin beyond the robust surface radius so missed
     # parent-shell points at a flared collar are not treated as novel evidence.
     envelope = np.maximum(
@@ -1658,6 +1703,27 @@ def _local_support_count(
         return int(len(nearby))
     mask = np.asarray(support_mask, dtype=bool)
     return int(np.count_nonzero(mask[nearby]))
+
+
+def _build_support_index(
+    points: np.ndarray,
+    support_mask: np.ndarray,
+) -> _SupportIndex:
+    """Build an index containing only points that may count as support."""
+
+    source = np.asarray(points, dtype=float)
+    mask = np.asarray(support_mask, dtype=bool)
+    if source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("points must have shape (n, 3)")
+    if mask.shape != (len(source),):
+        raise ValueError("support_mask must contain one value per point")
+    source_indices = np.flatnonzero(mask)
+    support_points = source[source_indices]
+    return _SupportIndex(
+        points=support_points,
+        tree=cKDTree(support_points),
+        source_indices=source_indices,
+    )
 
 
 def _local_support_counts(
@@ -1812,15 +1878,35 @@ def _path_support_indices(
     *,
     radius: float,
     support_mask: np.ndarray | None,
+    source_indices: np.ndarray | None = None,
 ) -> set[int]:
+    """Collect path support with one batched query over all centerline nodes.
+
+    ``source_indices`` maps a filtered tree back to indices in the source cloud.
+    """
+
+    nodes = np.asarray(path, dtype=float)
+    if not len(nodes):
+        return set()
+    if nodes.ndim != 2 or nodes.shape[1] != 3:
+        raise ValueError("path must have shape (n, 3)")
+    neighborhoods = tree.query_ball_point(
+        nodes,
+        r=float(radius),
+        workers=worker_threads(),
+    )
     covered: set[int] = set()
     mask = None if support_mask is None else np.asarray(support_mask, dtype=bool)
-    for node in path:
-        nearby = tree.query_ball_point(node, r=radius, workers=worker_threads())
-        if mask is None:
-            covered.update(int(index) for index in nearby)
-        else:
-            covered.update(int(index) for index in nearby if mask[int(index)])
+    index_map = (
+        None if source_indices is None else np.asarray(source_indices, dtype=int)
+    )
+    for nearby_raw in neighborhoods:
+        nearby = np.asarray(nearby_raw, dtype=int)
+        if mask is not None and len(nearby):
+            nearby = nearby[mask[nearby]]
+        if index_map is not None and len(nearby):
+            nearby = index_map[nearby]
+        covered.update(nearby.tolist())
     return covered
 
 

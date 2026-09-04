@@ -94,13 +94,18 @@ def tangent_vectors(path: np.ndarray) -> np.ndarray:
     return tangents
 
 
-def point_to_polyline_distance(points: np.ndarray, path: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def point_to_polyline_distance(
+    points: np.ndarray,
+    path: np.ndarray,
+    *,
+    path_tree: cKDTree | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     if len(path) == 0:
         raise ValueError("path cannot be empty")
     if len(path) == 1:
         distances = np.linalg.norm(points - path[0], axis=1)
         return distances, np.zeros(len(points), dtype=int)
-    tree = cKDTree(path)
+    tree = path_tree if path_tree is not None else cKDTree(path)
     distances, nearest = tree.query(points, k=1, workers=worker_threads())
     return distances.astype(float), nearest.astype(int)
 

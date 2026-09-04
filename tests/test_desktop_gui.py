@@ -17,6 +17,7 @@ from soyrootbio.endpoint_picker import (
     _camera_pan_shift,
     _configure_selection_axis,
     _inverted_drag_rotation,
+    _maximize_figure_window,
     _parse_sample_count,
     _wheel_zoom_factor,
     _zoom_3d_axis,
@@ -49,6 +50,32 @@ def test_primary_section_wheel_zoom_supports_backend_event_variants() -> None:
     assert np.diff(axis.get_xlim())[0] == pytest.approx(6.0)
     assert np.diff(axis.get_ylim())[0] == pytest.approx(3.0)
     assert np.diff(axis.get_zlim())[0] == pytest.approx(3.0)
+
+
+def test_selection_windows_are_maximized_for_common_gui_backends() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class QtWindow:
+        def showMaximized(self) -> None:
+            calls.append(("qt", None))
+
+    class TkWindow:
+        def state(self, value: str) -> None:
+            calls.append(("tk", value))
+
+    for window, expected in (
+        (QtWindow(), ("qt", None)),
+        (TkWindow(), ("tk", "zoomed")),
+    ):
+        figure = SimpleNamespace(
+            canvas=SimpleNamespace(
+                manager=SimpleNamespace(window=window),
+            )
+        )
+        assert _maximize_figure_window(figure)
+        assert calls[-1] == expected
+
+    assert not _maximize_figure_window(SimpleNamespace(canvas=None))
 
 
 def test_selection_views_share_sparse_grid_and_inverted_drag_directions() -> None:
@@ -123,6 +150,8 @@ def test_batch_gui_source_exposes_required_controls():
         "Remove selected",
         "Set selected output",
         "Open output folder",
+        "Load endpoints + guides",
+        "Total run time",
         "Scored automatic",
         "Manual soil line + scorer",
         "Interactive endpoints + sections",
@@ -142,6 +171,8 @@ def test_batch_gui_source_exposes_required_controls():
     assert "Voxel size (mm)" not in source
     assert "Mesh unit → mm" not in source
     assert "from threadpoolctl import threadpool_limits" not in source
+    assert '"eta": "ETA"' not in source
+    assert '"threads": "Threads"' not in source
 
 
 def test_batch_gui_opens_only_one_existing_output_folder(tmp_path: Path, monkeypatch):

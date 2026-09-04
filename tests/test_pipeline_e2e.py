@@ -7,6 +7,7 @@ import pandas as pd
 
 import soyrootbio.pipeline as pipeline_module
 from soyrootbio.pipeline import PipelineConfig, run_pipeline
+from soyrootbio.primary_guidance import read_primary_guidance
 from soyrootbio.synthetic import write_synthetic_dataset
 
 
@@ -46,6 +47,11 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert "tip_angle_parent_deg" in traits.columns
     assert "tip_angle_z_deg" in traits.columns
     assert (output_dir / "metadata.json").exists()
+    guidance = read_primary_guidance(output_dir / "primary_guidance.json", expected_input=points_path)
+    start, end = pipeline_module.read_endpoint_file(endpoint_path)
+    np.testing.assert_array_equal(guidance.start, start)
+    np.testing.assert_array_equal(guidance.end, end)
+    assert guidance.guides.shape == (0, 3)
     assert (output_dir / "overview.png").exists()
     assert not (output_dir / "tip_angles_front_view_600dpi.png").exists()
     assert (output_dir / "tip_gravity_front_view_600dpi.png").exists()
@@ -67,6 +73,7 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
             continue
         assert float(row.length) <= float(length_by_id[str(row.parent_id)]) + 1e-9
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["primary_guidance_file"] == "primary_guidance.json"
     assert metadata["lateral_tracing_policy"][
         "child_length_may_not_exceed_parent"
     ] is True
