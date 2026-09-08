@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from typing import Callable
 
 import numpy as np
@@ -607,6 +608,7 @@ def grow_lateral_candidates(
     ancestor_exclusion_mask: np.ndarray | None = None,
     point_tree: cKDTree | None = None,
     parent_tree: cKDTree | None = None,
+    surface=None,
 ) -> list[RootPath]:
     if not starts:
         return []
@@ -671,6 +673,7 @@ def grow_lateral_candidates(
                 outward_directions.append(("extent", extent))
         primary_tangent = primary_tangents[start.primary_index]
         candidate_count_before = len(candidates)
+        mesh_variant_cache = {}
 
         def trace_variants(
             initial_direction: np.ndarray,
@@ -681,21 +684,28 @@ def grow_lateral_candidates(
             for multiplier in multipliers:
                 step_length = max(multiplier * d_bar, 0.004)
                 for open_angle in angles:
-                    path = _grow_one_candidate(
-                        points=points,
-                        point_tree=point_tree,
-                        allowed_mask=allowed_mask,
-                        start=start,
-                        initial_direction=initial_direction,
-                        primary_tangent=primary_tangent,
-                        step_length=step_length,
-                        open_angle=open_angle,
-                        max_steps=max_steps,
-                        search_radius=search_radius_factor * step_length,
-                        limit_primary_angle_to_insertion=True,
-                        density_support_index=novel_support_index,
-                        cooperate=cooperate,
-                    )
+                    cache_key = (direction_label, float(step_length), float(open_angle))
+                    if surface is not None and cache_key in mesh_variant_cache:
+                        path = deepcopy(mesh_variant_cache[cache_key])
+                    else:
+                        path = _grow_one_candidate(
+                            points=points,
+                            point_tree=point_tree,
+                            allowed_mask=allowed_mask,
+                            start=start,
+                            initial_direction=initial_direction,
+                            primary_tangent=primary_tangent,
+                            step_length=step_length,
+                            open_angle=open_angle,
+                            max_steps=max_steps,
+                            search_radius=search_radius_factor * step_length,
+                            limit_primary_angle_to_insertion=True,
+                            surface=surface,
+                            density_support_index=novel_support_index,
+                            cooperate=cooperate,
+                        )
+                        if surface is not None:
+                            mesh_variant_cache[cache_key] = deepcopy(path)
                     if len(path.points) >= 3:
                         path.root_id = (
                             f"lateral_{start.start_id}_{direction_label}"
@@ -770,6 +780,7 @@ def _grow_one_candidate(
     cooperate: Callable[[], None] | None = None,
     density_support_mask: np.ndarray | None = None,
     density_support_index: _SupportIndex | None = None,
+    surface=None,
 ) -> RootPath:
     """Grow one greedy trace while following its evolving local tangent.
 
@@ -830,6 +841,8 @@ def _grow_one_candidate(
             workers=worker_threads(),
         )
         local = np.asarray(nearby_indices, dtype=int)
+        if surface is not None:
+            local = surface.retain(current, local, search_radius, direction=direction)
         if len(local):
             local = local[allowed[local]]
         if len(local) < max(1, int(minimum_local_support)):
@@ -1017,6 +1030,8 @@ def _grow_one_candidate(
             workers=worker_threads(),
         )
         local_covered_array = np.asarray(local_covered, dtype=int)
+        if surface is not None:
+            local_covered_array = surface.retain(current, local_covered_array, search_radius, direction=direction)
         if len(local_covered_array):
             axial_progress = (
                 points[local_covered_array] - current
@@ -1070,6 +1085,9 @@ def _grow_one_candidate(
     )
     path.score_components.update(
         {
+            "trace_steps": float(steps),
+            "trace_step_limit": float(max_steps),
+            "trace_hit_step_limit": float(steps >= max_steps),
             "trace_growth_arc": float(growth_arc),
             "trace_supported_arc": float(growth_arc),
             "trace_mean_support": float(support_sum / max(1, steps)),
@@ -1141,6 +1159,7 @@ def extend_lateral_tip(
     min_support: int = 4,
     point_tree: cKDTree | None = None,
     cooperate: Callable[[], None] | None = None,
+    surface=None,
 ) -> RootPath:
     """Continue a selected path when dense unclaimed support exists ahead.
 
@@ -1183,6 +1202,8 @@ def extend_lateral_tip(
         support_radius=support_radius,
         min_support=min_support,
     )
+    if surface is not None:
+        initial = surface.retain(current, initial, search_radius, direction=direction)
     if len(initial):
         residual_distances, _ = original_tree.query(points[initial], k=1, workers=worker_threads())
         initial = initial[residual_distances > 0.90 * assignment_radius]
@@ -1215,6 +1236,7 @@ def extend_lateral_tip(
         max_turn_degrees=45.0,
         minimum_local_support=min_support,
         cooperate=cooperate,
+        surface=surface,
     )
     appended = np.asarray(candidate.points[2:], dtype=float)
     candidate_extension_length = 0.0

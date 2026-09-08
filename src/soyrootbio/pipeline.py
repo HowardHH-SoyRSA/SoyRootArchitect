@@ -48,6 +48,7 @@ from .topology import (
 from .traits import compute_traits
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
+from .surface_tracking import LocalMeshConnectivity, TubeSectionTracker, resolve_endpoint_fragments
 from .visualize import save_angle_front_views, save_overview_plot
 
 
@@ -328,11 +329,15 @@ def _run_pipeline_impl(
     LOGGER.info("Primary segmentation assigned %d/%d points", int(primary_mask.sum()), len(primary_mask))
     checkpoint("primary_segmentation", "Segmented and refined primary root", 0.46)
 
+    surface = (LocalMeshConnectivity(normalized, cloud.triangles,
+               full_points=normalization.transform_points(cloud.export_points))
+               if cloud.triangles is not None and len(cloud.triangles) else None)
     selected, lateral_start_count, candidate_count, order_counts = _trace_lateral_orders(
         normalized,
         primary.points,
         primary_mask,
         d_bar,
+        surface=surface,
         max_root_order=config.max_root_order,
         max_paths=config.lateral_max_paths,
         excluded_mask=above_base_mask,
@@ -617,6 +622,11 @@ def _run_pipeline_impl(
             "contacted_primary_sibling_suffix_crop": True,
             "contacted_sibling_child_continuation_join": True,
             "internal_o1_contact_uncrossing": True,
+            "local_mesh_connectivity": surface is not None,
+            "mesh_endpoint_recovery_before_branching": surface is not None,
+            "joint_endpoint_fragment_association": surface is not None,
+            "persistent_multi_tube_cross_sections": surface is not None,
+            "connectivity_rejected_proposals": int(surface.rejected_points) if surface is not None else 0,
             "internal_o1_contact_uncrossing_labels": (
                 "pre-junction full-resolution root labels"
             ),
@@ -734,6 +744,21 @@ def _cooperate(
         _raise_if_cancelled(cancel_check)
 
 
+def _refine_lateral_surface(points, mask, traced, d_bar, surface, cooperate):
+    tracker = TubeSectionTracker() if surface is not None else None
+    centered = refine_primary_centerline(
+        points, mask, traced.points, d_bar=d_bar, max_stations=240,
+        min_slice_points=6, cooperate=cooperate, surface=surface,
+        section_tracker=tracker,
+    )
+    if tracker is not None:
+        traced.score_components["multi_tube_sections"] = float(tracker.multimode_sections)
+        traced.score_components["ambiguous_tube_sections"] = float(tracker.ambiguous_sections)
+        if tracker.ambiguous_sections and "fused_surface_identity_ambiguous" not in traced.qc_flags:
+            traced.qc_flags.append("fused_surface_identity_ambiguous")
+    return centered
+
+
 def _trace_lateral_orders(
     points: np.ndarray,
     primary_path: np.ndarray,
@@ -743,6 +768,7 @@ def _trace_lateral_orders(
     max_paths: int | None,
     excluded_mask: np.ndarray | None = None,
     cooperate: Callable[[], None] | None = None,
+    surface=None,
 ) -> tuple[list[RootPath], int, int, dict[int, int]]:
     """Trace lateral roots iteratively from parent skeletons.
 
@@ -871,6 +897,7 @@ def _trace_lateral_orders(
                 occupied_mask,
                 d_bar=d_bar,
                 max_steps=max_steps,
+                surface=surface,
                 parent_radius_profile=parent_radius_profile,
                 ancestor_exclusion_mask=(
                     primary_ancestor_mask if order > 1 else None
@@ -937,6 +964,11 @@ def _trace_lateral_orders(
             )
             break
         reduced = reduce_similar_paths(order_candidates)
+        reduced = resolve_endpoint_fragments(selected_all, reduced, surface, d_bar)
+        for existing in selected_all:
+            if existing.score_components.get("endpoint_fragments_joined", 0.) > 0:
+                parent_tree_cache[str(existing.root_id)] = cKDTree(existing.points)
+                parent_radius_cache.pop(str(existing.root_id), None)
         remaining = None if max_paths is None else max(0, max_paths - len(selected_all))
         existing_order_support: set[int] = set()
         for existing in selected_all:
@@ -1012,14 +1044,8 @@ def _trace_lateral_orders(
                 covered = covered[(covered >= 0) & (covered < len(points))]
                 local_mask[covered] = True
                 if np.count_nonzero(local_mask) >= 30:
-                    centered = refine_primary_centerline(
-                        points,
-                        local_mask,
-                        traced.points,
-                        d_bar=d_bar,
-                        max_stations=240,
-                        min_slice_points=6,
-                        cooperate=cooperate,
+                    centered = _refine_lateral_surface(
+                        points, local_mask, traced, d_bar, surface, cooperate
                     )
                     if len(centered) >= 2:
                         traced.points = centered
@@ -1038,38 +1064,38 @@ def _trace_lateral_orders(
             | excluded
             | (provisional_labels != 0)
         )
+        if surface is not None:
+            # Recover endpoints before provisional ownership creates false children.
+            continuation_blocked = np.asarray(primary_mask, dtype=bool) | excluded
         extended_count = 0
         for traced in refined:
             if traced.score_components.get("parent_tracking_rejected", 0.0) > 0.0:
                 continue
-            extend_lateral_tip(
-                points,
-                traced,
-                continuation_blocked,
-                d_bar,
-                point_tree=extension_tree,
-                cooperate=cooperate,
-            )
-            if traced.score_components.get("tip_continuation_accepted", 0.0) <= 0.0:
-                continue
-            extended_count += 1
-            covered = np.asarray(sorted(traced.covered_indices), dtype=int)
-            covered = covered[(covered >= 0) & (covered < len(points))]
-            continuation_blocked[covered] = True
-            local_mask = np.zeros(len(points), dtype=bool)
-            local_mask[covered] = True
-            if np.count_nonzero(local_mask) >= 30:
-                centered = refine_primary_centerline(
-                    points,
-                    local_mask,
-                    traced.points,
-                    d_bar=d_bar,
-                    max_stations=240,
-                    min_slice_points=6,
-                    cooperate=cooperate,
+            root_extended = False
+            for recovery_pass in range(3 if surface is not None else 1):
+                blocked = (np.asarray(primary_mask, dtype=bool) | excluded
+                           if surface is not None else continuation_blocked)
+                extend_lateral_tip(
+                    points, traced, blocked, d_bar, point_tree=extension_tree,
+                    surface=surface, cooperate=cooperate,
                 )
-                if len(centered) >= 2:
-                    traced.points = centered
+                if traced.score_components.get("tip_continuation_accepted", 0.0) <= 0.0:
+                    break
+                root_extended = True
+                traced.score_components["mesh_endpoint_recovery_passes"] = float(recovery_pass + 1)
+                covered = np.asarray(sorted(traced.covered_indices), dtype=int)
+                covered = covered[(covered >= 0) & (covered < len(points))]
+                local_mask = np.zeros(len(points), dtype=bool)
+                local_mask[covered] = True
+                if np.count_nonzero(local_mask) >= 30:
+                    centered = _refine_lateral_surface(
+                        points, local_mask, traced, d_bar, surface, cooperate
+                    )
+                    if len(centered) >= 2:
+                        traced.points = centered
+            if root_extended:
+                extended_count += 1
+                continuation_blocked[covered] = True
         if order > 1:
             final_refined: list[RootPath] = []
             for traced in refined:

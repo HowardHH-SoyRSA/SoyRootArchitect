@@ -560,6 +560,8 @@ def refine_primary_centerline(
     min_slice_points: int = 12,
     fit_circular_cross_sections: bool = False,
     cooperate: Callable[[], None] | None = None,
+    surface=None,
+    section_tracker=None,
 ) -> np.ndarray:
     """Recenter a coarse surface path using primary-root cross sections."""
     points = np.asarray(points, dtype=float)
@@ -569,6 +571,7 @@ def refine_primary_centerline(
         return primary_path.copy()
 
     primary_points = points[primary_mask]
+    source_indices = np.flatnonzero(primary_mask)
     if len(primary_points) < max(3 * min_slice_points, 30):
         return primary_path.copy()
 
@@ -592,6 +595,11 @@ def refine_primary_centerline(
         if cooperate is not None:
             cooperate()
         local_indices = tree.query_ball_point(station, r=search_radius)
+        if surface is not None and len(local_indices):
+            support_indices = source_indices[local_indices]
+            anchor_index = int(support_indices[np.argmin(np.linalg.norm(points[support_indices]-station, axis=1))])
+            retained = surface.retain(station, support_indices, search_radius, anchor_index=anchor_index, direction=tangent)
+            local_indices = np.searchsorted(source_indices, retained)
         if len(local_indices) < min_slice_points:
             continue
         offsets = primary_points[np.asarray(local_indices, dtype=int)] - station
@@ -607,6 +615,8 @@ def refine_primary_centerline(
             radial,
             fit_circle=fit_circular_cross_sections,
         )
+        if section_tracker is not None:
+            radial_center = section_tracker.update(radial, station, basis, radial_center)
         center_offset = np.median(axial) * tangent + radial_center @ basis
         if np.linalg.norm(center_offset) > 0.9 * search_radius:
             continue
