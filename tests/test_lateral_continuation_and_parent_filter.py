@@ -47,7 +47,7 @@ def _z_tube(centerline: np.ndarray, radius: float = 0.020, ring_points: int = 16
 
 
 def test_tip_continuation_crosses_assignment_halo_and_reaches_supported_tip() -> None:
-    main = _x_tube(np.arange(0.108, 0.401, 0.001))
+    main = _x_tube(np.arange(0.108, 0.601, 0.001))
     # A dense orthogonal branch is present, but a 45-degree continuation cone
     # must keep the selected path on the original forward axis.
     branch_y = np.arange(0.006, 0.081, 0.004)
@@ -79,16 +79,16 @@ def test_tip_continuation_crosses_assignment_halo_and_reaches_supported_tip() ->
         path,
         np.zeros(len(points), dtype=bool),
         d_bar=0.001,
-        max_steps=80,
     )
 
     assert result is path
     assert result.root_id == "root-a"
     assert result.order == 2
     assert result.parent_id == "root-parent"
-    assert result.points[-1, 0] > 0.36
+    assert result.points[-1, 0] > 0.56
     assert abs(float(result.points[-1, 1])) < 0.01
     assert result.score_components["tip_continuation_accepted"] == 1.0
+    assert result.score_components["tip_extension_steps"] > 80.0
     assert result.score_components["tip_extension_length"] > 0.20
     assert len(result.covered_indices) > 100
 

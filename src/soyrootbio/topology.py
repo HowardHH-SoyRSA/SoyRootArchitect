@@ -35,6 +35,22 @@ class _ContactedSiblingCrop:
     original_qc_flags: list[str]
 
 
+@dataclass
+class _ForkArmReconciliation:
+    parent: RootPath
+    short_child: RootPath
+    parent_order_before: int
+    parent_length_before: float
+    alternative_parent_length: float
+    long_arm_length: float
+    short_arm_length: float
+    short_child_parent_ratio_after: float
+    insertion_arc: float
+    child_parent_length_ratio: float
+    arm_angle_degrees: float
+    descendant_parent_changes: int
+
+
 def uncross_internal_primary_sibling_contacts(
     surface_points: np.ndarray,
     root_labels: np.ndarray,
@@ -730,6 +746,370 @@ def _prune_overlong_child_subtrees(
     return retained, violations, descendant_count
 
 
+def _point_at_arc(
+    points: np.ndarray,
+    cumulative_arc: np.ndarray,
+    target_arc: float,
+) -> np.ndarray:
+    """Interpolate one point at a distance along a polyline."""
+
+    target = float(np.clip(target_arc, 0.0, float(cumulative_arc[-1])))
+    right = int(np.searchsorted(cumulative_arc, target, side="right"))
+    if right <= 0:
+        return np.asarray(points[0], dtype=float).copy()
+    if right >= len(points):
+        return np.asarray(points[-1], dtype=float).copy()
+    left = right - 1
+    span = float(cumulative_arc[right] - cumulative_arc[left])
+    if span <= 1e-12:
+        return np.asarray(points[right], dtype=float).copy()
+    fraction = (target - float(cumulative_arc[left])) / span
+    return (
+        (1.0 - fraction) * np.asarray(points[left], dtype=float)
+        + fraction * np.asarray(points[right], dtype=float)
+    )
+
+
+def _reconcile_overlong_forks(
+    primary_path: np.ndarray,
+    paths: list[RootPath],
+    *,
+    d_bar: float,
+) -> tuple[list[_ForkArmReconciliation], set[str]]:
+    """Make a supported long child the continuation of its parent.
+
+    Greedy growth can follow the locally straighter, short arm at a fork and
+    rediscover the persistent arm during child tracing. The ordinary length
+    rule would then delete precisely the supported continuation. Reconcile only
+    high-separation internal forks with automatic surface and density evidence.
+    The same child-parent length control is applied to the alternative parent
+    route and its retained short child before committing the swap; all other
+    overlong children remain available to conservative pruning.
+    """
+
+    spacing = float(d_bar)
+    primary_length = path_length(np.asarray(primary_path, dtype=float))
+    reconciled: list[_ForkArmReconciliation] = []
+    reassigned: set[str] = set()
+    consumed: set[str] = set()
+    parents = sorted(
+        (
+            path
+            for path in paths
+            if int(path.order) >= 1
+            and len(path.points) >= 6
+            and (
+                (
+                    int(path.order) == 1
+                    and (
+                        path.score_components.get("surface_aware_seed", 0.0)
+                        > 0.0
+                        or path.score_components.get(
+                            "primary_surface_attachment",
+                            0.0,
+                        )
+                        > 0.0
+                    )
+                )
+                or (
+                    int(path.order) > 1
+                    and float(
+                        path.score_components.get(
+                            "novel_density_support",
+                            len(
+                                path.novel_support_indices
+                                if path.novel_support_indices is not None
+                                else path.covered_indices
+                            ),
+                        )
+                    )
+                    >= 30.0
+                )
+            )
+        ),
+        key=lambda path: (int(path.order), str(path.root_id)),
+    )
+    for parent in parents:
+        parent_points = np.asarray(parent.points, dtype=float)
+        parent_segments = np.linalg.norm(np.diff(parent_points, axis=0), axis=1)
+        parent_arc = np.concatenate([[0.0], np.cumsum(parent_segments)])
+        parent_length = float(parent_arc[-1])
+        if parent_length <= 0.0:
+            continue
+
+        supervisor = (
+            None
+            if parent.parent_id == PRIMARY_ID
+            else next(
+                (
+                    candidate
+                    for candidate in paths
+                    if str(candidate.root_id) == str(parent.parent_id)
+                ),
+                None,
+            )
+        )
+        supervisor_length = (
+            primary_length if supervisor is None else float(supervisor.length)
+        )
+        if parent.parent_id != PRIMARY_ID and supervisor is None:
+            continue
+        candidates: list[tuple[float, float, RootPath, dict[str, float]]] = []
+        for child in paths:
+            if (
+                str(child.parent_id) != str(parent.root_id)
+                or child.root_id in consumed
+                or int(child.order) != int(parent.order) + 1
+                or len(child.points) < 6
+                or child.insertion_index is None
+            ):
+                continue
+            child_length = float(child.length)
+            ratio = child_length / parent_length
+            if not child_length_exceeds_parent(child_length, parent_length):
+                continue
+            support = float(
+                child.score_components.get(
+                    "novel_density_support",
+                    len(
+                        child.novel_support_indices
+                        if child.novel_support_indices is not None
+                        else child.covered_indices
+                    ),
+                )
+            )
+            if not np.isfinite(support) or support < 30.0:
+                continue
+
+            insertion_index = int(
+                np.clip(child.insertion_index, 0, len(parent_points) - 1)
+            )
+            insertion_arc = float(parent_arc[insertion_index])
+            suffix_length = parent_length - insertion_arc
+            if (
+                insertion_arc < max(12.0 * spacing, 0.50 * parent_length)
+                or suffix_length < max(8.0 * spacing, 0.05 * parent_length)
+            ):
+                continue
+
+            alternative_parent_length = insertion_arc + child_length
+            if (
+                child_length_exceeds_parent(
+                    alternative_parent_length,
+                    supervisor_length,
+                )
+                or child_length_exceeds_parent(
+                    suffix_length,
+                    alternative_parent_length,
+                )
+            ):
+                continue
+
+            window = max(16.0 * spacing, 0.04 * parent_length)
+            short_end = _point_at_arc(
+                parent_points,
+                parent_arc,
+                insertion_arc + window,
+            )
+            short_direction = short_end - parent_points[insertion_index]
+            child_points = np.asarray(child.points, dtype=float)
+            child_segments = np.linalg.norm(np.diff(child_points, axis=0), axis=1)
+            child_arc = np.concatenate([[0.0], np.cumsum(child_segments)])
+            connector_skip = min(
+                max(4.0 * spacing, 0.01 * child_length),
+                0.20 * child_length,
+            )
+            long_start = _point_at_arc(child_points, child_arc, connector_skip)
+            long_end = _point_at_arc(
+                child_points,
+                child_arc,
+                connector_skip + window,
+            )
+            long_direction = long_end - long_start
+            arm_angle = vector_angle_degrees(short_direction, long_direction)
+            if (
+                not np.isfinite(arm_angle)
+                or float(arm_angle) < 45.0
+                or float(arm_angle) > 135.0
+            ):
+                continue
+
+            child_to_parent, _ = cKDTree(parent_points).query(child_points, k=1)
+            departure = float(np.quantile(child_to_parent, 0.75))
+            if departure < max(6.0 * spacing, 0.05 * child_length):
+                continue
+            evidence = {
+                "insertion_index": float(insertion_index),
+                "parent_order": float(parent.order),
+                "insertion_arc": insertion_arc,
+                "long_arm_length": child_length,
+                "short_arm_length": suffix_length,
+                "alternative_parent_length": alternative_parent_length,
+                "short_child_parent_ratio_after": (
+                    suffix_length / alternative_parent_length
+                    if alternative_parent_length > 0.0
+                    else 0.0
+                ),
+                "child_parent_length_ratio": ratio,
+                "arm_angle_degrees": float(arm_angle),
+                "long_arm_departure": departure,
+                "long_arm_support": support,
+            }
+            candidates.append((ratio, support, child, evidence))
+
+        if not candidates:
+            continue
+        _, _, long_child, evidence = max(
+            candidates,
+            key=lambda item: (item[0], item[1], str(item[2].root_id)),
+        )
+        insertion_index = int(evidence["insertion_index"])
+        junction = parent_points[insertion_index].copy()
+        short_points = np.asarray(parent_points[insertion_index:], dtype=float).copy()
+        long_points = np.asarray(long_child.points, dtype=float).copy()
+        if np.linalg.norm(long_points[0] - junction) > 1e-12:
+            long_points = np.vstack([junction, long_points])
+        else:
+            long_points[0] = junction
+        new_parent_points = np.vstack(
+            [parent_points[: insertion_index + 1], long_points[1:]]
+        )
+
+        parent_components = dict(parent.score_components)
+        parent_covered = set(parent.covered_indices)
+        parent_novel_support = (
+            None
+            if parent.novel_support_indices is None
+            else set(parent.novel_support_indices)
+        )
+        parent_qc_flags = list(parent.qc_flags)
+        long_components = dict(long_child.score_components)
+        parent.points = new_parent_points
+        parent.node_indices = None
+        parent.covered_indices = set(parent.covered_indices) | set(
+            long_child.covered_indices
+        )
+        if (
+            parent.novel_support_indices is not None
+            or long_child.novel_support_indices is not None
+        ):
+            parent.novel_support_indices = set(parent.novel_support_indices or ()) | set(
+                long_child.novel_support_indices or ()
+            )
+        for key in (
+            "tip_continuation_initial_support",
+            "tip_continuation_candidate_steps",
+            "tip_continuation_candidate_length",
+            "tip_continuation_new_support",
+            "tip_continuation_accepted",
+            "tip_extension_steps",
+            "tip_extension_length",
+            "tip_extension_hit_limit",
+        ):
+            if key in long_components:
+                parent.score_components[key] = long_components[key]
+        parent.score_components.update(
+            {
+                "fork_long_arm_reconciled": 1.0,
+                "fork_parent_length_before": parent_length,
+                **evidence,
+            }
+        )
+        if "fork_long_arm_reconciled" not in parent.qc_flags:
+            parent.qc_flags.append("fork_long_arm_reconciled")
+        if long_components.get("tip_extension_hit_limit", 0.0) > 0.0:
+            if "tip_extension_limit" not in parent.qc_flags:
+                parent.qc_flags.append("tip_extension_limit")
+
+        long_child.points = short_points
+        long_child.node_indices = None
+        long_child.raw_start_point = junction.copy()
+        long_child.covered_indices = parent_covered
+        long_child.novel_support_indices = parent_novel_support
+        long_child.score_components = parent_components
+        long_child.score_components.update(
+            {
+                "fork_short_arm_retained": 1.0,
+                "fork_former_long_arm_length": float(evidence["long_arm_length"]),
+                "fork_short_arm_length": float(evidence["short_arm_length"]),
+                "fork_arm_angle_degrees": float(evidence["arm_angle_degrees"]),
+            }
+        )
+        long_child.qc_flags = [
+            flag for flag in parent_qc_flags if flag != "tip_extension_limit"
+        ]
+        if "fork_short_arm_retained" not in long_child.qc_flags:
+            long_child.qc_flags.append("fork_short_arm_retained")
+        long_child.confidence = min(
+            float(parent.confidence),
+            float(long_child.confidence),
+        )
+
+        changed_descendants = 0
+        parent_tree = cKDTree(parent.points)
+        short_tree = cKDTree(long_child.points)
+        for descendant in paths:
+            if (
+                descendant is parent
+                or descendant is long_child
+                or descendant.parent_id
+                not in {str(parent.root_id), str(long_child.root_id)}
+            ):
+                continue
+            attachment = (
+                np.asarray(descendant.raw_start_point, dtype=float)
+                if descendant.raw_start_point is not None
+                else np.asarray(descendant.points[0], dtype=float)
+            )
+            parent_gap, parent_index = parent_tree.query(attachment, k=1)
+            short_gap, short_index = short_tree.query(attachment, k=1)
+            new_parent = parent if float(parent_gap) <= float(short_gap) else long_child
+            new_index = int(parent_index if new_parent is parent else short_index)
+            old_parent_id = str(descendant.parent_id)
+            descendant.parent_id = str(new_parent.root_id)
+            descendant.parent_points = new_parent.points
+            descendant.insertion_index = new_index
+            descendant.insertion_point = new_parent.points[new_index].copy()
+            descendant.points[0] = descendant.insertion_point
+            if descendant.parent_id != old_parent_id:
+                changed_descendants += 1
+                reassigned.add(str(descendant.root_id))
+                descendant.score_components[
+                    "fork_descendant_attachment_reassessed"
+                ] = 1.0
+                if "fork_descendant_attachment_reassessed" not in descendant.qc_flags:
+                    descendant.qc_flags.append(
+                        "fork_descendant_attachment_reassessed"
+                    )
+
+        consumed.add(str(long_child.root_id))
+        reconciled.append(
+            _ForkArmReconciliation(
+                parent=parent,
+                short_child=long_child,
+                parent_order_before=int(evidence["parent_order"]),
+                parent_length_before=parent_length,
+                alternative_parent_length=float(
+                    evidence["alternative_parent_length"]
+                ),
+                long_arm_length=float(evidence["long_arm_length"]),
+                short_arm_length=float(evidence["short_arm_length"]),
+                short_child_parent_ratio_after=float(
+                    evidence["short_child_parent_ratio_after"]
+                ),
+                insertion_arc=float(evidence["insertion_arc"]),
+                child_parent_length_ratio=float(
+                    evidence["child_parent_length_ratio"]
+                ),
+                arm_angle_degrees=float(evidence["arm_angle_degrees"]),
+                descendant_parent_changes=changed_descendants,
+            )
+        )
+        _assign_recursive_orders(paths)
+
+    return reconciled, reassigned
+
+
 def repair_root_hierarchy(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
@@ -927,10 +1307,41 @@ def repair_root_hierarchy(
         d_bar=d_bar,
     )
     reassigned_roots.update(duplicate_promotions)
-    report.parents_reassigned = len(reassigned_roots)
+    _refresh_parent_references(primary_path, repaired)
+    fork_reconciliations, fork_reassignments = (
+        _reconcile_overlong_forks(
+            primary_path,
+            repaired,
+            d_bar=d_bar,
+        )
+    )
+    reassigned_roots.update(fork_reassignments)
     _assign_recursive_orders(repaired)
     _assign_stable_ids(repaired)
     _refresh_parent_references(primary_path, repaired)
+    report.fork_arms_reconciled = len(fork_reconciliations)
+    report.fork_arm_details = [
+        {
+            "parent_id": item.parent.root_id,
+            "short_child_id": item.short_child.root_id,
+            "parent_order_before": item.parent_order_before,
+            "parent_length_before_normalized": item.parent_length_before,
+            "long_arm_length_normalized": item.long_arm_length,
+            "short_arm_length_normalized": item.short_arm_length,
+            "alternative_parent_length_normalized": (
+                item.alternative_parent_length
+            ),
+            "short_child_parent_ratio_after": (
+                item.short_child_parent_ratio_after
+            ),
+            "insertion_arc_normalized": item.insertion_arc,
+            "child_parent_length_ratio_before": item.child_parent_length_ratio,
+            "arm_angle_degrees": item.arm_angle_degrees,
+            "descendant_parent_changes": item.descendant_parent_changes,
+        }
+        for item in fork_reconciliations
+    ]
+    report.parents_reassigned = len(reassigned_roots)
     (
         repaired,
         report.overlong_child_details,
@@ -1513,7 +1924,7 @@ def _reparent_same_insertion_divergences(
                 if left_radius >= right_radius
                 else (right, left)
             )
-            if float(host.confidence) < float(branch.confidence) + 0.05:
+            if float(host.confidence) + 0.05 < float(branch.confidence):
                 continue
             host_radius_similarity = float(
                 host.score_components.get(

@@ -14,6 +14,7 @@ from soyrootbio.topology import (
     _join_contacted_sibling_continuations,
     _merge_parallel_parent_duplicates,
     _merge_same_insertion_primary_duplicates,
+    _reconcile_overlong_forks,
     _reparent_same_insertion_divergences,
     _swap_internal_contact_suffixes,
     repair_root_hierarchy,
@@ -902,6 +903,231 @@ def test_same_insertion_similar_radius_siblings_remain_o1() -> None:
     assert retained == [first, second]
     assert reassigned == set()
     assert all(path.parent_id == "primary" for path in retained)
+
+
+def test_supported_overlong_child_becomes_order1_continuation() -> None:
+    parent = _root(
+        "parent",
+        [[float(x), 0.0, 0.0] for x in range(11)],
+        order=1,
+        parent_id="primary",
+    )
+    parent.insertion_index = 0
+    parent.score_components["surface_aware_seed"] = 1.0
+
+    long_arm = _root(
+        "long-arm",
+        [[8.0, 0.0, 0.0]]
+        + [[8.0, float(y), 0.0] for y in range(1, 25)],
+        order=2,
+        parent_id="parent",
+    )
+    long_arm.insertion_index = 8
+    long_arm.score_components["novel_density_support"] = 240.0
+
+    long_descendant = _root(
+        "long-descendant",
+        [[8.0, 12.0, 0.0], [9.0, 12.0, 0.0]],
+        order=3,
+        parent_id="long-arm",
+    )
+    short_descendant = _root(
+        "short-descendant",
+        [[9.0, 0.0, 0.0], [9.0, 0.0, 1.0]],
+        order=2,
+        parent_id="parent",
+    )
+
+    reconciled, reassigned = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [parent, long_arm, long_descendant, short_descendant],
+        d_bar=0.05,
+    )
+
+    assert len(reconciled) == 1
+    np.testing.assert_allclose(parent.points[-1], [8.0, 24.0, 0.0])
+    np.testing.assert_allclose(
+        long_arm.points,
+        [[8.0, 0.0, 0.0], [9.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+    )
+    assert long_arm.parent_id == "parent"
+    assert long_descendant.parent_id == "parent"
+    assert short_descendant.parent_id == "long-arm"
+    assert reassigned == {"long-descendant", "short-descendant"}
+    assert parent.score_components["fork_long_arm_reconciled"] == 1.0
+    assert long_arm.score_components["fork_short_arm_retained"] == 1.0
+    assert reconciled[0].descendant_parent_changes == 2
+
+
+def test_overlong_child_without_supported_internal_fork_is_not_reconciled() -> None:
+    parent = _root(
+        "parent",
+        [[float(x), 0.0, 0.0] for x in range(11)],
+        order=1,
+        parent_id="primary",
+    )
+    parent.score_components["surface_aware_seed"] = 1.0
+    terminal_child = _root(
+        "terminal-child",
+        [[10.0, 0.0, 0.0]]
+        + [[10.0, float(y), 0.0] for y in range(1, 25)],
+        order=2,
+        parent_id="parent",
+    )
+    terminal_child.insertion_index = 10
+    terminal_child.score_components["novel_density_support"] = 240.0
+
+    reconciled, reassigned = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [parent, terminal_child],
+        d_bar=0.05,
+    )
+
+    assert reconciled == []
+    assert reassigned == set()
+    np.testing.assert_allclose(parent.points[-1], [10.0, 0.0, 0.0])
+    np.testing.assert_allclose(terminal_child.points[-1], [10.0, 24.0, 0.0])
+
+
+def test_overlong_child_below_twice_parent_length_resurveys_alternative_parent() -> None:
+    parent = _root(
+        "parent",
+        [[float(x), 0.0, 0.0] for x in range(11)],
+        order=1,
+        parent_id="primary",
+    )
+    parent.score_components["surface_aware_seed"] = 1.0
+    alternative = _root(
+        "alternative",
+        [[8.0, 0.0, 0.0]]
+        + [[8.0, float(y), 0.0] for y in range(1, 13)],
+        order=2,
+        parent_id="parent",
+    )
+    alternative.insertion_index = 8
+    alternative.score_components["novel_density_support"] = 120.0
+
+    reconciled, reassigned = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [parent, alternative],
+        d_bar=0.05,
+    )
+
+    assert reassigned == set()
+    assert len(reconciled) == 1
+    assert reconciled[0].child_parent_length_ratio == 1.2
+    assert reconciled[0].alternative_parent_length == 20.0
+    assert reconciled[0].short_child_parent_ratio_after == 0.1
+    np.testing.assert_allclose(parent.points[-1], [8.0, 12.0, 0.0])
+    np.testing.assert_allclose(
+        alternative.points,
+        [[8.0, 0.0, 0.0], [9.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+    )
+
+
+def test_alternative_parent_accepts_substantial_retained_child_arm() -> None:
+    parent = _root(
+        "parent",
+        [[float(x), 0.0, 0.0] for x in range(11)],
+        order=1,
+        parent_id="primary",
+    )
+    parent.score_components["surface_aware_seed"] = 1.0
+    alternative = _root(
+        "alternative",
+        [[6.0, 0.0, 0.0]]
+        + [[6.0, float(y), 0.0] for y in range(1, 13)],
+        order=2,
+        parent_id="parent",
+    )
+    alternative.insertion_index = 6
+    alternative.score_components["novel_density_support"] = 120.0
+
+    reconciled, _ = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [parent, alternative],
+        d_bar=0.05,
+    )
+
+    assert len(reconciled) == 1
+    assert reconciled[0].short_arm_length == 4.0
+    assert reconciled[0].alternative_parent_length == 18.0
+    assert reconciled[0].short_child_parent_ratio_after == 4.0 / 18.0
+
+
+def test_alternative_parent_that_violates_primary_length_is_not_used() -> None:
+    parent = _root(
+        "parent",
+        [[float(x), 0.0, 0.0] for x in range(11)],
+        order=1,
+        parent_id="primary",
+    )
+    parent.score_components["surface_aware_seed"] = 1.0
+    alternative = _root(
+        "alternative",
+        [[8.0, 0.0, 0.0]]
+        + [[8.0, float(y), 0.0] for y in range(1, 13)],
+        order=2,
+        parent_id="parent",
+    )
+    alternative.insertion_index = 8
+    alternative.score_components["novel_density_support"] = 120.0
+
+    reconciled, reassigned = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 15.0]]),
+        [parent, alternative],
+        d_bar=0.05,
+    )
+
+    assert reconciled == []
+    assert reassigned == set()
+    np.testing.assert_allclose(parent.points[-1], [10.0, 0.0, 0.0])
+    np.testing.assert_allclose(alternative.points[-1], [8.0, 12.0, 0.0])
+
+
+def test_overlong_later_order_child_resurveys_against_revised_parent() -> None:
+    first_order = _root(
+        "first-order",
+        [[float(x), 0.0, 0.0] for x in range(21)],
+        order=1,
+        parent_id="primary",
+    )
+    first_order.score_components["surface_aware_seed"] = 1.0
+    second_order = _root(
+        "second-order",
+        [[15.0, float(y), 0.0] for y in range(11)],
+        order=2,
+        parent_id="first-order",
+    )
+    second_order.insertion_index = 15
+    second_order.score_components["novel_density_support"] = 100.0
+    third_order = _root(
+        "third-order",
+        [[15.0, 6.0, 0.0]]
+        + [[15.0, 6.0, float(z)] for z in range(1, 13)],
+        order=3,
+        parent_id="second-order",
+    )
+    third_order.insertion_index = 6
+    third_order.score_components["novel_density_support"] = 120.0
+
+    reconciled, _ = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [first_order, second_order, third_order],
+        d_bar=0.05,
+    )
+
+    assert len(reconciled) == 1
+    assert reconciled[0].parent is second_order
+    assert reconciled[0].parent_order_before == 2
+    assert reconciled[0].alternative_parent_length == 18.0
+    assert third_order.parent_id == second_order.root_id
+    np.testing.assert_allclose(second_order.points[-1], [15.0, 6.0, 12.0])
+    np.testing.assert_allclose(
+        third_order.points,
+        [[15.0, 6.0, 0.0], [15.0, 7.0, 0.0], [15.0, 8.0, 0.0],
+         [15.0, 9.0, 0.0], [15.0, 10.0, 0.0]],
+    )
 
 
 def test_brief_primary_sibling_crossing_is_not_cropped() -> None:

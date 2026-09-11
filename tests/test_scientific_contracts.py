@@ -379,6 +379,57 @@ def test_hierarchy_repair_removes_overlong_child_and_its_descendants():
         assert detail["child_parent_length_ratio"] > 1.0
 
 
+def test_hierarchy_repair_reconciles_supported_order1_fork_before_pruning():
+    primary = np.array(
+        [
+            [0.0, 0.0, 100.0],
+            [0.0, 0.0, 50.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    parent = RootPath(
+        root_id="candidate-parent",
+        points=np.array([[float(x), 0.0, 50.0] for x in range(11)]),
+        raw_start_point=np.array([0.0, 0.0, 50.0]),
+        covered_indices=set(range(50)),
+        novel_support_indices=set(range(50)),
+        score=20.0,
+        order=1,
+        parent_id="primary",
+        score_components={"surface_aware_seed": 1.0},
+    )
+    long_arm = RootPath(
+        root_id="candidate-long-arm",
+        points=np.array(
+            [[8.0, 0.0, 50.0]]
+            + [[8.0, float(y), 50.0] for y in range(1, 25)]
+        ),
+        raw_start_point=np.array([8.0, 0.0, 50.0]),
+        covered_indices=set(range(100)),
+        novel_support_indices=set(range(100)),
+        score=20.0,
+        order=2,
+        parent_id="candidate-parent",
+        score_components={"novel_density_support": 240.0},
+    )
+
+    repaired, report = repair_root_hierarchy(
+        primary,
+        [parent, long_arm],
+        d_bar=0.05,
+    )
+
+    assert report.fork_arms_reconciled == 1
+    assert report.overlong_children_removed == 0
+    assert report.overlong_descendants_removed == 0
+    assert validate_root_tree(repaired, primary_path=primary) == []
+    by_order = {root.order: root for root in repaired}
+    np.testing.assert_allclose(by_order[1].points[-1], [8.0, 24.0, 50.0])
+    np.testing.assert_allclose(by_order[2].points[-1], [10.0, 0.0, 50.0])
+    assert by_order[2].parent_id == by_order[1].root_id
+    assert report.fork_arm_details[0]["parent_id"] == by_order[1].root_id
+
+
 def _surface_samples(path: np.ndarray, radius: float) -> np.ndarray:
     """Sample circular sections normal to the local centreline tangent."""
 

@@ -111,6 +111,8 @@ class TopologyReport:
     roots_reoriented: int = 0
     parents_reassigned: int = 0
     cycles_removed: int = 0
+    fork_arms_reconciled: int = 0
+    fork_arm_details: list[dict[str, Any]] = field(default_factory=list)
     overlong_children_removed: int = 0
     overlong_descendants_removed: int = 0
     overlong_child_details: list[dict[str, Any]] = field(default_factory=list)

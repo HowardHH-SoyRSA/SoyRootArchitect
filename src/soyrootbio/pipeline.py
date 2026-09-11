@@ -22,6 +22,8 @@ from .primary_guidance import (
 from .geometry import mean_nearest_neighbor_distance, normalize_unit_box
 from .io import load_root_geometry
 from .lateral import (
+    MAIN_TRACER_MAX_TURN_DEGREES,
+    TIP_EXTENSION_MAX_STEPS,
     backtrace_to_primary,
     estimate_parent_radius_profile,
     extend_lateral_tip,
@@ -608,6 +610,8 @@ def _run_pipeline_impl(
                 "0.29 * step_length"
             ),
             "covered_forward_recovery": True,
+            "main_tracer_max_turn_degrees": MAIN_TRACER_MAX_TURN_DEGREES,
+            "tip_extension_max_steps": TIP_EXTENSION_MAX_STEPS,
             "local_radius_continuity_reward": 0.08,
             "longest_path_reward_per_d_bar": 0.35,
             "rms_curvature_penalty": 0.25,
@@ -622,9 +626,14 @@ def _run_pipeline_impl(
             ),
             "ancestor_inward_terminal_rejection": True,
             "child_length_may_not_exceed_parent": True,
+            "overlong_child_alternative_parent_resurvey": True,
             "overlong_child_action": (
-                "remove the violating automatic child and its descendant subtree; "
-                "reject manual hierarchy edits"
+                "at a supported internal fork, resurvey the overlong "
+                "child arm as the alternative parent continuation and retain "
+                "both arms only when the resulting parent and child satisfy "
+                "the same length control; otherwise remove the violating "
+                "automatic child and its descendant subtree; reject manual "
+                "hierarchy edits"
             ),
         },
         "internal_o1_contact_changed_root_ids": sorted(

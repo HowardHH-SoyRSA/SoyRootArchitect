@@ -472,6 +472,42 @@ def test_growth_follows_evolving_tangent_after_insertion() -> None:
     np.testing.assert_allclose(fixed_reference.points[-1], short_primary_aligned_child)
 
 
+def test_main_tracer_default_accepts_a_95_degree_turn() -> None:
+    angle = np.radians(95.0)
+    candidate = np.array([np.cos(angle), np.sin(angle), 0.0])
+    points = candidate[None, :]
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([0.0, 0.0, -0.25]),
+        primary_index=0,
+        member_indices=np.array([0]),
+        direction=np.array([1.0, 0.0, 0.0]),
+    )
+    arguments = {
+        "points": points,
+        "point_tree": cKDTree(points),
+        "allowed_mask": np.ones(len(points), dtype=bool),
+        "start": start,
+        "initial_direction": np.array([1.0, 0.0, 0.0]),
+        "primary_tangent": np.array([0.0, 0.0, 1.0]),
+        "step_length": 1.0,
+        "open_angle": 90.0,
+        "max_steps": 1,
+        "search_radius": 1.05,
+    }
+
+    accepted = _grow_one_candidate(**arguments)
+    rejected_at_old_threshold = _grow_one_candidate(
+        **arguments,
+        max_turn_degrees=90.0,
+    )
+
+    np.testing.assert_allclose(accepted.points[-1], candidate)
+    assert len(accepted.points) == 3
+    assert len(rejected_at_old_threshold.points) == 2
+
+
 def test_single_path_tracer_does_not_emit_fork_hypotheses() -> None:
     points = np.array(
         [

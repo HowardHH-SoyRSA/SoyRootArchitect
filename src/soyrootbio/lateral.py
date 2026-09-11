@@ -12,6 +12,9 @@ from .types import RootPath
 from .runtime import worker_threads
 
 
+MAIN_TRACER_MAX_TURN_DEGREES = 100.0
+
+
 @dataclass
 class LateralStart:
     start_id: int
@@ -765,7 +768,7 @@ def _grow_one_candidate(
     max_steps: int,
     search_radius: float,
     limit_primary_angle_to_insertion: bool = False,
-    max_turn_degrees: float = 70.0,
+    max_turn_degrees: float = MAIN_TRACER_MAX_TURN_DEGREES,
     minimum_local_support: int = 1,
     cooperate: Callable[[], None] | None = None,
     density_support_mask: np.ndarray | None = None,
@@ -1131,13 +1134,16 @@ def _adaptive_minimum_travel_fraction(
     return 0.375
 
 
+TIP_EXTENSION_MAX_STEPS = 90
+
+
 def extend_lateral_tip(
     points: np.ndarray,
     path: RootPath,
     blocked_mask: np.ndarray,
     d_bar: float,
     *,
-    max_steps: int = 80,
+    max_steps: int = TIP_EXTENSION_MAX_STEPS,
     min_support: int = 4,
     point_tree: cKDTree | None = None,
     cooperate: Callable[[], None] | None = None,
