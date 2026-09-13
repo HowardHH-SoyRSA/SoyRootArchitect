@@ -13,6 +13,12 @@ from .runtime import worker_threads
 
 
 MAIN_TRACER_MAX_TURN_DEGREES = 100.0
+MAIN_TRACER_TURN_ALIGNMENT_WEIGHT = 0.57
+MAIN_TRACER_LOCAL_DENSITY_WEIGHT = 0.20
+MAIN_TRACER_STEP_DISTANCE_WEIGHT = 0.15
+MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT = 0.08
+MAIN_TRACER_OLD_DIRECTION_WEIGHT = 0.75
+MAIN_TRACER_NEW_DIRECTION_WEIGHT = 0.25
 
 
 @dataclass
@@ -947,9 +953,9 @@ def _grow_one_candidate(
             1e-12,
         )
         base_score = (
-            0.47 * turn_cos
-            + 0.30 * _normalize(density)
-            + 0.15 * distance_score
+            MAIN_TRACER_TURN_ALIGNMENT_WEIGHT * turn_cos
+            + MAIN_TRACER_LOCAL_DENSITY_WEIGHT * _normalize(density)
+            + MAIN_TRACER_STEP_DISTANCE_WEIGHT * distance_score
         )
 
         # Radius estimation is deliberately limited to the strongest few
@@ -970,7 +976,10 @@ def _grow_one_candidate(
             shortlisted_radii,
             local_radius,
         )
-        score = base_score + 0.08 * radius_similarity
+        score = (
+            base_score
+            + MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT * radius_similarity
+        )
         best_position = int(np.argmax(score))
         next_index = int(local[best_position])
         next_point = np.asarray(points[next_index], dtype=float)
@@ -1003,7 +1012,10 @@ def _grow_one_candidate(
             radius_similarity_sum += similarity_value
             radius_observations += 1
 
-        evolved_direction = 0.65 * direction + 0.35 * new_direction
+        evolved_direction = (
+            MAIN_TRACER_OLD_DIRECTION_WEIGHT * direction
+            + MAIN_TRACER_NEW_DIRECTION_WEIGHT * new_direction
+        )
         direction = evolved_direction / max(
             float(np.linalg.norm(evolved_direction)),
             1e-12,

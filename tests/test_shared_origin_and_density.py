@@ -472,6 +472,82 @@ def test_growth_follows_evolving_tangent_after_insertion() -> None:
     np.testing.assert_allclose(fixed_reference.points[-1], short_primary_aligned_child)
 
 
+def test_step_score_prefers_straighter_arm_over_denser_sixty_degree_turn() -> None:
+    angle = np.radians(60.0)
+    straight = np.array([1.0, 0.0, 0.0])
+    dense_turn = np.array([np.cos(angle), np.sin(angle), 0.0])
+    support_offsets = np.column_stack(
+        [
+            np.zeros(20),
+            np.linspace(-0.04, 0.04, 20),
+            np.zeros(20),
+        ]
+    )
+    points = np.vstack([straight, dense_turn, dense_turn + support_offsets])
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([0.0, 0.0, -0.25]),
+        primary_index=0,
+        member_indices=np.array([0, 1]),
+        direction=straight,
+    )
+
+    selected = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_mask=_index_mask(len(points), 0, 1),
+        start=start,
+        initial_direction=straight,
+        primary_tangent=np.array([0.0, 0.0, 1.0]),
+        step_length=1.0,
+        open_angle=90.0,
+        max_steps=1,
+        search_radius=1.1,
+        density_support_mask=np.ones(len(points), dtype=bool),
+    )
+
+    np.testing.assert_allclose(selected.points[-1], straight)
+
+
+def test_direction_update_keeps_more_history_at_a_following_fork() -> None:
+    def direction(angle_degrees: float) -> np.ndarray:
+        angle = np.radians(angle_degrees)
+        return np.array([np.cos(angle), np.sin(angle), 0.0])
+
+    first_step = direction(40.0)
+    straight_continuation = first_step + direction(0.0)
+    turned_continuation = first_step + direction(22.0)
+    points = np.vstack(
+        [first_step, straight_continuation, turned_continuation]
+    )
+    start = LateralStart(
+        start_id=0,
+        point=np.zeros(3),
+        primary_point=np.array([0.0, 0.0, -0.25]),
+        primary_index=0,
+        member_indices=np.arange(len(points)),
+        direction=np.array([1.0, 0.0, 0.0]),
+    )
+
+    selected = _grow_one_candidate(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_mask=np.ones(len(points), dtype=bool),
+        start=start,
+        initial_direction=np.array([1.0, 0.0, 0.0]),
+        primary_tangent=np.array([1.0, 0.0, 0.0]),
+        step_length=1.0,
+        open_angle=90.0,
+        max_steps=2,
+        search_radius=1.05,
+        limit_primary_angle_to_insertion=True,
+        density_support_mask=np.zeros(len(points), dtype=bool),
+    )
+
+    np.testing.assert_allclose(selected.points[-1], straight_continuation)
+
+
 def test_main_tracer_default_accepts_a_95_degree_turn() -> None:
     angle = np.radians(95.0)
     candidate = np.array([np.cos(angle), np.sin(angle), 0.0])

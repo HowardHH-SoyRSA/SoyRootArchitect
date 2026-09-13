@@ -1,0 +1,13 @@
+﻿open3d
+numpy
+scipy
+hdbscan
+scikit-learn
+networkx
+pandas
+matplotlib
+openpyxl
+psutil
+flask>=3.0
+tkinterdnd2
+pytest

@@ -1,0 +1,68 @@
+{
+  "schema": "soyrootbio.edited-remeasurement-audit/v1",
+  "source_output_dir": "E:\\Seafile\\Chenlab组会\\20260724\\10 accessions\\SoyRootBio_outputs\\BaxiNo2_4-2_20260525",
+  "editor_session_dir": "E:\\SoyRSA Build\\editor-sessions\\BaxiNo2_4-2_20260525",
+  "baseline_fingerprint": "sha256:12d7923fdfeb1c04e0cf3c0700c7bbe9d8dd5796d9977e314e37e9b4ecf51f0b",
+  "operation_log": {
+    "record_count": 558,
+    "event_counts": {
+      "apply": 512,
+      "redo": 1,
+      "undo": 45
+    },
+    "active_operation_count": 468,
+    "redo_available": false,
+    "sha256": "d5b3cf0a71f45515a70a3e9489dcf720f38b65fdebcd3135a43c70163478f166",
+    "blob_count": 487,
+    "blob_tree_sha256": "ec50f62409cf3c92b7fcc71c56577bcdddd512277625300d6d0ff28870c757b5"
+  },
+  "measurements": {
+    "baseline_root_count": 77,
+    "edited_root_count": 74,
+    "added_root_ids": [
+      "root-manual-001f6a7dd29a",
+      "root-manual-9a21b0c55855",
+      "root-manual-bfe2584fe0b5"
+    ],
+    "removed_root_ids": [
+      "root-o1-020",
+      "root-o1-021",
+      "root-o2-003",
+      "root-o2-017",
+      "root-o2-020",
+      "root-o3-001"
+    ],
+    "edited_root_count_by_order": {
+      "0": 1,
+      "1": 55,
+      "2": 18
+    },
+    "baseline_total_length_mesh_unit": 869.6016405224785,
+    "edited_total_length_mesh_unit": 847.8034370071067,
+    "unassigned_vertex_count": 109,
+    "uncertain_vertex_count": 139,
+    "unassigned_patch_count": 23,
+    "uncertain_patch_count": 17
+  },
+  "validation": {
+    "automatic_bundle_unchanged": true,
+    "operation_log_unchanged": true,
+    "deterministic_files_match_existing_materialisation": [
+      "edited_root_hierarchy.json",
+      "edited_root_traits.csv",
+      "edited_root_label_map.csv",
+      "edited_segmented_root_structure.ply",
+      "operations.jsonl"
+    ],
+    "rsml_matches_ignoring_last_modified": true,
+    "manifest_matches_ignoring_created_at": true
+  },
+  "artifact_sha256": {
+    "edited_root_hierarchy.json": "21c15905f39c30f41229b3d7139097469629020f8b62fd67e1748cd1c64a08a0",
+    "edited_root_traits.csv": "4c6e95c6ff5ad6937506980e6c51d65a169b99c8b784c52c57496e908cbf0d95",
+    "edited_root_label_map.csv": "22cdc53ea41b86cbdba92dbb17f845230a24396010595746b74ee133bfef4de4",
+    "edited_segmented_root_structure.ply": "25aaf5f943aff197ef028a5dc218be6e35906721ecf315caadce1acecb3ef8b3",
+    "operations.jsonl": "d5b3cf0a71f45515a70a3e9489dcf720f38b65fdebcd3135a43c70163478f166",
+    "edited_root_system.rsml": "014189a3235a81b304b410e01d79415ff051f3dda34cd863e0e4bc231b323506"
+  }
+}

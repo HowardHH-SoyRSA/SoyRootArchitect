@@ -23,7 +23,13 @@ from .primary_guidance import (
 from .geometry import mean_nearest_neighbor_distance, normalize_unit_box
 from .io import load_root_geometry
 from .lateral import (
+    MAIN_TRACER_LOCAL_DENSITY_WEIGHT,
     MAIN_TRACER_MAX_TURN_DEGREES,
+    MAIN_TRACER_NEW_DIRECTION_WEIGHT,
+    MAIN_TRACER_OLD_DIRECTION_WEIGHT,
+    MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT,
+    MAIN_TRACER_STEP_DISTANCE_WEIGHT,
+    MAIN_TRACER_TURN_ALIGNMENT_WEIGHT,
     TIP_EXTENSION_MAX_STEPS,
     backtrace_to_primary,
     estimate_parent_radius_profile,
@@ -522,6 +528,13 @@ def _run_pipeline_impl(
             ],
         )
     )
+    # Run after sampled-mask restoration AND parent patch cleanup. Strong,
+    # connected child support must have the final say over a primary mask.
+    full_root_labels, primary_o1_ownership_report = _resolve_primary_o1_ownership(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=full_above_base_mask,
+    )
     cleaned_analysis_labels: np.ndarray | None = None
     if analysis_to_full is not None:
         cleaned_analysis_labels = full_root_labels[analysis_to_full]
@@ -633,8 +646,28 @@ def _run_pipeline_impl(
             ),
             "covered_forward_recovery": True,
             "main_tracer_max_turn_degrees": MAIN_TRACER_MAX_TURN_DEGREES,
+            "main_tracer_step_score_turn_alignment_weight": (
+                MAIN_TRACER_TURN_ALIGNMENT_WEIGHT
+            ),
+            "main_tracer_step_score_local_density_weight": (
+                MAIN_TRACER_LOCAL_DENSITY_WEIGHT
+            ),
+            "main_tracer_step_score_distance_weight": (
+                MAIN_TRACER_STEP_DISTANCE_WEIGHT
+            ),
+            "main_tracer_step_score_radius_continuity_weight": (
+                MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT
+            ),
+            "main_tracer_old_direction_weight": (
+                MAIN_TRACER_OLD_DIRECTION_WEIGHT
+            ),
+            "main_tracer_new_direction_weight": (
+                MAIN_TRACER_NEW_DIRECTION_WEIGHT
+            ),
             "tip_extension_max_steps": TIP_EXTENSION_MAX_STEPS,
-            "local_radius_continuity_reward": 0.08,
+            "local_radius_continuity_reward": (
+                MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT
+            ),
             "longest_path_reward_per_d_bar": 0.35,
             "rms_curvature_penalty": 0.25,
             "cumulative_turn_penalty": 0.06,
@@ -665,6 +698,7 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "final_centerline_fitting": final_centerline_report,
+        "primary_o1_ownership": primary_o1_ownership_report,
         "primary_detection_method": _primary_method(config),
         "primary_guidance_file": (
             PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None
@@ -1878,6 +1912,198 @@ def _surface_connectivity_edges(
     edges = np.sort(np.asarray(edges, dtype=np.int64), axis=1)
     edges = edges[edges[:, 0] != edges[:, 1]]
     return np.unique(edges, axis=0), mode
+
+
+def _segment_radius_profile(points, path, spacing):
+    """Measure radii against segments, robust to sparse skeleton stations.
+
+    Median radial support suppresses short primary-labelled side protrusions.
+    Bins have a physical arc width; adding collinear path nodes changes neither
+    the distances nor the radius estimate.
+    """
+    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+    stations = np.linspace(0.0, arc[-1], max(2, int(np.ceil(arc[-1] / (4 * spacing))) + 1))
+    distances, projected = _polyline_projection_distance_and_arc(points, path)
+    bins = np.clip(np.searchsorted((stations[:-1] + stations[1:]) / 2, projected), 0, len(stations) - 1)
+    values = np.full(len(stations), np.nan)
+    for index in np.unique(bins):
+        support = distances[bins == index]
+        if len(support) >= 3:
+            values[index] = np.median(support)
+    valid = np.flatnonzero(np.isfinite(values))
+    if not len(valid):
+        values[:] = np.median(distances) if len(distances) else spacing
+    else:
+        values = np.interp(stations, stations[valid], values[valid])
+    padded = np.pad(values, (2, 2), mode="edge")
+    values = np.median(np.lib.stride_tricks.sliding_window_view(padded, 5), axis=1)
+    return stations, np.maximum(values, spacing)
+
+
+def _resolve_primary_o1_ownership(
+    points: np.ndarray,
+    labels: np.ndarray,
+    primary_path: np.ndarray,
+    lateral_paths: list[RootPath],
+    *,
+    d_bar: float,
+    triangles: np.ndarray | None = None,
+    excluded_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Trim short primary protrusions continuous with exposed O1 surfaces.
+
+    All proposals use frozen ownership. Internal connectors are geometric
+    paths, not surface seeds: only existing, exposed child support can anchor
+    a claim. No other lateral's ownership or centerline is modified. Distances
+    and all bounds use the same coordinate system as points and d_bar.
+    """
+    from scipy.sparse.csgraph import dijkstra
+
+    source = np.asarray(points, dtype=float)
+    before = np.asarray(labels, dtype=int)
+    primary = np.asarray(primary_path, dtype=float)
+    spacing = float(d_bar)
+    if source.ndim != 2 or source.shape[1] != 3 or not np.all(np.isfinite(source)):
+        raise ValueError("points must contain finite XYZ coordinates")
+    if before.shape != (len(source),):
+        raise ValueError("labels must contain one value per point")
+    if primary.ndim != 2 or primary.shape[1] != 3 or not np.all(np.isfinite(primary)):
+        raise ValueError("primary_path must contain finite XYZ coordinates")
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise ValueError("d_bar must be positive and finite")
+    excluded = _coerce_exclusion_mask(excluded_mask, len(source))
+    resolved = before.copy()
+    # Existing assigned editor surfaces above the collar are not an invitation
+    # to grow there; uncertain shoot-side points must become unassigned.
+    resolved[excluded & (before == -2)] = -1
+    report = {
+        "policy": "primary-o1-exposed-surface-competition-v1",
+        "radius_estimator": "median exact-segment distance in 4*d_bar arc bins; five-bin median",
+        "region_radius_rule": "4*parent_radius + 4*child_radius + 8*d_bar",
+        "child_arc_bound_rule": "max(6*parent_radius, 4*child_radius, 12*d_bar)",
+        "protrusion_span_rule": "max(2*parent_radius, 4*child_radius, 8*d_bar)",
+        "geodesic_limit_rule": "max(2*parent_radius, 3*child_radius, 6*d_bar)",
+        "primary_mask_lock": False,
+        "transferred_vertex_count": 0,
+        "excluded_uncertain_to_unassigned_count": int(np.sum(excluded & (before == -2))),
+        "multi_claim_vertex_count": 0,
+        "ambiguous_claim_vertex_count": 0,
+        "junctions": [],
+    }
+    if len(primary) < 2 or not len(source) or np.sum((before == 0) & ~excluded) < 3:
+        return resolved, report
+    edges, mode = _surface_connectivity_edges(source, triangles, spacing)
+    report["connectivity"] = mode
+    if not len(edges):
+        return resolved, report
+    tree = cKDTree(source)
+    parent_stations, parent_radii = _segment_radius_profile(source[(before == 0) & ~excluded], primary, spacing)
+    primary_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(primary, axis=0), axis=1))]
+    claims = []
+    for label, child in enumerate(lateral_paths, start=1):
+        if child.order != 1 or child.parent_id != "primary":
+            continue
+        path = np.asarray(child.points, dtype=float)
+        row = {"root_id": str(child.root_id), "label": label, "transferred_vertex_count": 0}
+        report["junctions"].append(row)
+        support = np.flatnonzero((before == label) & ~excluded)
+        if len(path) < 2 or not np.all(np.isfinite(path)) or len(support) < 3:
+            row["status"] = "insufficient_child_support"
+            continue
+        _, insertion_arc = _polyline_projection_distance_and_arc(path[:1], primary)
+        rp = float(np.interp(insertion_arc[0], parent_stations, parent_radii))
+        child_stations, child_radii = _segment_radius_profile(source[support], path, spacing)
+        rc = float(np.median(child_radii[child_stations <= max(6 * rp, 12 * spacing)]))
+        region_radius = 4 * rp + 4 * rc + 8 * spacing
+        max_arc = max(6 * rp, 4 * rc, 12 * spacing)
+        ids = np.asarray(sorted(tree.query_ball_point(path[0], region_radius)), dtype=int)
+        ids = ids[~excluded[ids] & np.isin(before[ids], [0, label])]
+        row.update(parent_radius=rp, child_radius=rc, region_center=path[0].tolist(),
+                   region_radius=region_radius, maximum_child_arc=max_arc,
+                   competition_vertex_count=int(len(ids)))
+        if not len(ids):
+            row["status"] = "empty_region"
+            continue
+        p = source[ids]
+        pd, pa = _polyline_projection_distance_and_arc(p, primary)
+        cd, ca = _polyline_projection_distance_and_arc(p, path)
+        pr = np.interp(pa, parent_stations, parent_radii)
+        cr = np.interp(ca, child_stations, child_radii)
+        child_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+        child_center = np.column_stack([np.interp(ca, child_arc, path[:, axis]) for axis in range(3)])
+        parent_center = np.column_stack([np.interp(pa, primary_arc, primary[:, axis]) for axis in range(3)])
+        ci = np.clip(np.searchsorted(child_arc, ca, side="right") - 1, 0, len(path) - 2)
+        tangent = path[ci + 1] - path[ci]
+        tangent /= np.maximum(np.linalg.norm(tangent, axis=1)[:, None], 1e-12)
+        radial = p - parent_center
+        radial /= np.maximum(np.linalg.norm(radial, axis=1)[:, None], 1e-12)
+        outward = np.einsum("ij,ij->i", tangent, radial)
+        axis_distance, _ = _polyline_projection_distance_and_arc(child_center, primary)
+        # Tangential emergence is accepted once the child axis has separated;
+        # near the parent wall it must point outward from that wall.
+        exposed = (axis_distance >= pr - 0.5 * cr) & ((outward >= 0.20) | (axis_distance >= pr + cr))
+        geometric = ((ca <= max_arc) & (pd >= pr + 0.25 * spacing)
+                     & (cd <= 1.5 * cr + spacing) & exposed)
+        strength = pd / (pr + spacing) - cd / (cr + spacing)
+        eligible = geometric & (strength >= 0.20)
+        seeds = (before[ids] == label) & geometric
+        row["supported_seed_count"] = int(seeds.sum())
+        if seeds.sum() < 3:
+            row["status"] = "no_exposed_child_anchor"
+            continue
+        allowed = seeds | ((before[ids] == 0) & eligible)
+        local = np.full(len(source), -1, dtype=int)
+        local[ids[allowed]] = np.flatnonzero(allowed)
+        e = edges[(local[edges[:, 0]] >= 0) & (local[edges[:, 1]] >= 0)]
+        u, v = local[e[:, 0]], local[e[:, 1]]
+        lengths = np.linalg.norm(source[e[:, 0]] - source[e[:, 1]], axis=1)
+        graph = coo_matrix((np.r_[lengths, lengths], (np.r_[u, v], np.r_[v, u])), shape=(len(ids), len(ids))).tocsr()
+        limit = max(2 * rp, 3 * rc, 6 * spacing)
+        distance = dijkstra(graph, directed=False, indices=np.flatnonzero(seeds), min_only=True, limit=limit)
+        candidates = allowed & (before[ids] == 0) & np.isfinite(distance)
+        # Limit each primary protrusion's axial extent, not the entire child's
+        # supported body. Large ambiguous strips are retained for review.
+        ce = candidates[u] & candidates[v]
+        cg = coo_matrix((np.ones(2 * int(ce.sum())), (np.r_[u[ce], v[ce]], np.r_[v[ce], u[ce]])), shape=graph.shape).tocsr()
+        _, components = connected_components(cg, directed=False)
+        for component in np.unique(components[candidates]):
+            members = candidates & (components == component)
+            if np.ptp(ca[members]) > max(2 * rp, 4 * rc, 8 * spacing):
+                candidates[members] = False
+        row["candidate_vertex_count"] = int(candidates.sum())
+        row["status"] = "evaluated"
+        claims.append((label, ids, candidates, seeds, graph, strength, row))
+
+    best = np.full(len(source), -np.inf)
+    second = best.copy()
+    winners = np.zeros(len(source), dtype=int)
+    counts = np.zeros(len(source), dtype=int)
+    for label, ids, candidates, _, _, strength, _ in claims:
+        ix = ids[candidates]
+        score = strength[candidates]
+        better = score > best[ix]
+        second[ix] = np.where(better, best[ix], np.maximum(second[ix], score))
+        best[ix] = np.maximum(best[ix], score)
+        winners[ix[better]] = label
+        counts[ix] += 1
+    ambiguous = (counts > 1) & ((best - np.where(np.isfinite(second), second, 0)) < 0.15)
+    winners[ambiguous] = 0
+    report["multi_claim_vertex_count"] = int(np.sum(counts > 1))
+    report["ambiguous_claim_vertex_count"] = int(ambiguous.sum())
+    for label, ids, candidates, seeds, graph, _, row in claims:
+        # Arbitration can remove an intermediate bridge. Recheck connectivity
+        # using only this winner's vertices and its original surface anchors.
+        allowed = seeds | (candidates & (winners[ids] == label))
+        g = graph.tocoo()
+        keep = allowed[g.row] & allowed[g.col]
+        restricted = coo_matrix((g.data[keep], (g.row[keep], g.col[keep])), shape=g.shape).tocsr()
+        _, components = connected_components(restricted, directed=False)
+        reachable = np.isin(components, np.unique(components[seeds]))
+        transfer = ids[candidates & (winners[ids] == label) & reachable]
+        resolved[transfer] = label
+        row["transferred_vertex_count"] = int(len(transfer))
+    report["transferred_vertex_count"] = int(np.sum((before == 0) & (resolved > 0)))
+    return resolved, report
 
 
 def _absorb_small_primary_surface_patches(

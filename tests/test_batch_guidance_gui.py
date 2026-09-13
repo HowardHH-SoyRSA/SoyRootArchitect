@@ -144,3 +144,101 @@ def test_runtime_updates_without_progress_events_and_freezes_on_pause_and_finish
     assert {column for item, column in app.tree.cells} == {"runtime"}
     assert app._format_runtime(None) == "--"
     assert app._format_runtime(3661) == "1:01:01"
+
+
+def test_batch_completion_notifies_once_only_after_every_sample_succeeds(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    first = _add_sample(app, tmp_path)
+    second_path = tmp_path / "second.ply"
+    second_path.write_text("ply", encoding="ascii")
+    app.add_files([second_path])
+    second = next(entry for entry in app.entries.values() if entry is not first)
+    jobs = (
+        batch.BatchJob("first-job", first.input_path, first.output_dir, 1, state=batch.BatchJobState.COMPLETED),
+        batch.BatchJob("second-job", second.input_path, second.output_dir, 1, state=batch.BatchJobState.COMPLETED),
+    )
+    app.job_to_item = {
+        jobs[0].job_id: first.item_id,
+        jobs[1].job_id: second.item_id,
+    }
+    app.scheduler = SimpleNamespace(jobs=jobs, all_done=True, drain_events=lambda: [])
+    app.root = SimpleNamespace(after=lambda *args: None)
+    notices = []
+    monkeypatch.setattr(
+        batch_gui.messagebox,
+        "showinfo",
+        lambda title, text, **kwargs: notices.append((title, text, kwargs)),
+    )
+
+    app._poll_scheduler()
+    app._poll_scheduler()
+
+    assert notices == [
+        (
+            "Batch complete",
+            "All 2 sample(s) completed successfully.",
+            {"parent": app.root},
+        )
+    ]
+
+
+def test_batch_completion_notification_excludes_failed_batches(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    entry = _add_sample(app, tmp_path)
+    job = batch.BatchJob("failed-job", entry.input_path, entry.output_dir, 1, state=batch.BatchJobState.FAILED)
+    app.job_to_item = {job.job_id: entry.item_id}
+    app.scheduler = SimpleNamespace(jobs=(job,), all_done=True, drain_events=lambda: [])
+    app.root = SimpleNamespace(after=lambda *args: None)
+    notices = []
+    monkeypatch.setattr(batch_gui.messagebox, "showinfo", lambda *args, **kwargs: notices.append(args))
+
+    app._poll_scheduler()
+
+    assert notices == []
+
+
+def test_first_failed_sample_plays_one_native_alert_while_batch_continues(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    failed = _add_sample(app, tmp_path)
+    running_path = tmp_path / "still-running.ply"
+    running_path.write_text("ply", encoding="ascii")
+    app.add_files([running_path])
+    running = next(entry for entry in app.entries.values() if entry is not failed)
+    failed_job = batch.BatchJob(
+        "failed-job",
+        failed.input_path,
+        failed.output_dir,
+        1,
+        state=batch.BatchJobState.FAILED,
+    )
+    running_job = batch.BatchJob(
+        "running-job",
+        running.input_path,
+        running.output_dir,
+        1,
+        state=batch.BatchJobState.RUNNING,
+    )
+    failed_event = batch.BatchEvent(batch.BatchEventType.FAILED, failed_job.snapshot())
+    app.job_to_item = {
+        failed_job.job_id: failed.item_id,
+        running_job.job_id: running.item_id,
+    }
+    app.scheduler = SimpleNamespace(
+        jobs=(failed_job, running_job),
+        all_done=False,
+        drain_events=lambda: [failed_event],
+    )
+    app.root = SimpleNamespace(after=lambda *args: None)
+    sounds = []
+    monkeypatch.setattr(
+        batch_gui,
+        "winsound",
+        SimpleNamespace(MB_ICONHAND="error", MessageBeep=sounds.append),
+    )
+
+    app._poll_scheduler()
+    app._poll_scheduler()
+
+    assert sounds == ["error"]
+    assert app.tree.cells[failed.item_id, "status"] == "Failed"
+    assert running_job.state == batch.BatchJobState.RUNNING

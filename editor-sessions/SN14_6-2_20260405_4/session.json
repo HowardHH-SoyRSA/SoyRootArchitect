@@ -1,0 +1,15 @@
+{
+  "schema": "soyrootbio.editor-log/v1",
+  "created_at": "2026-09-05T14:56:48.173528+00:00",
+  "source_output_dir": "E:\\Seafile\\Test files for BioInsAlgo\\SoyRootBio_outputs\\SN14_6-2_20260405_4",
+  "baseline_fingerprint": "sha256:da5834dfa23c51bc3b32956db8e4ec1f01f15d87091c9f2d4505e0a523785206",
+  "automatic_files_are_immutable": true,
+  "trait_configuration": {
+    "tip_vector_window_mesh_units": 2.0,
+    "gravity": [
+      0.0,
+      0.0,
+      -1.0
+    ]
+  }
+}

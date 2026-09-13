@@ -84,6 +84,25 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert metadata["lateral_tracing_policy"][
         "child_length_may_not_exceed_parent"
     ] is True
+    tracing_policy = metadata["lateral_tracing_policy"]
+    assert tracing_policy[
+        "main_tracer_step_score_turn_alignment_weight"
+    ] == pytest.approx(0.57)
+    assert tracing_policy[
+        "main_tracer_step_score_local_density_weight"
+    ] == pytest.approx(0.20)
+    assert tracing_policy[
+        "main_tracer_step_score_distance_weight"
+    ] == pytest.approx(0.15)
+    assert tracing_policy[
+        "main_tracer_step_score_radius_continuity_weight"
+    ] == pytest.approx(0.08)
+    assert tracing_policy["main_tracer_old_direction_weight"] == pytest.approx(
+        0.75
+    )
+    assert tracing_policy["main_tracer_new_direction_weight"] == pytest.approx(
+        0.25
+    )
     assert metadata["topology_report"]["overlong_children_removed"] >= 0
     assert metadata["topology_report"]["overlong_descendants_removed"] >= 0
 
@@ -153,6 +172,10 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
     assert cleanup["policy"] == "primary-surface-small-patch-cleanup-v1"
     assert cleanup["absorbed_patch_count"] >= 0
     assert cleanup["absorbed_vertex_count"] >= 0
+    ownership = metadata["primary_o1_ownership"]
+    assert ownership["policy"] == "primary-o1-exposed-surface-competition-v1"
+    assert ownership["primary_mask_lock"] is False
+    assert ownership["transferred_vertex_count"] >= 0
 
 
 def test_pipeline_reassigns_points_after_reported_internal_o1_swap(

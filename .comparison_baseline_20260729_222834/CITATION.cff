@@ -1,0 +1,25 @@
+﻿cff-version: 1.2.0
+message: "If you use BioInsAlgo, please cite both this software repository and the related soybean root skeletonization paper."
+title: "BioInsAlgo: Bio-inspired 3D soybean root skeletonization and phenotyping"
+type: software
+authors:
+  - name: "HowardHH-SoyRSA"
+repository-code: "https://github.com/HowardHH-SoyRSA/BioInsAlgo"
+license: MIT
+keywords:
+  - soybean
+  - root-system-architecture
+  - 3D-point-cloud
+  - skeletonization
+  - phenotyping
+references:
+  - type: article
+    title: "3D skeletonization and phenotyping for soybean root system architecture using a bio-inspired algorithm"
+    authors:
+      - name: "Zhou et al."
+    journal: "Computers and Electronics in Agriculture"
+    volume: "239"
+    issue: "B"
+    year: 2025
+    doi: "10.1016/j.compag.2025.110890"
+    url: "https://www.sciencedirect.com/science/article/pii/S0168169925009962"

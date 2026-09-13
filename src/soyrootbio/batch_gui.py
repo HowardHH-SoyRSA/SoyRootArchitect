@@ -9,6 +9,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable
 
+try:
+    import winsound
+except ImportError:  # pragma: no cover - available on Windows only.
+    winsound = None
+
 import numpy as np
 
 from .batch import (
@@ -64,6 +69,10 @@ class BioInsAlgoBatchApp:
         self.entries: dict[str, SampleEntry] = {}
         self.scheduler: BatchScheduler | None = None
         self.job_to_item: dict[str, str] = {}
+        # Keep completion acknowledgement scoped to one scheduler instance so
+        # the polling loop cannot reopen the dialog every 120 ms.
+        self._completion_notified_scheduler: BatchScheduler | None = None
+        self._failure_alerted_scheduler: BatchScheduler | None = None
 
         self.output_root_var = tk.StringVar(value=str(initial_output or ""))
         self.primary_method_var = tk.StringVar(value="Scored automatic")
@@ -612,6 +621,8 @@ class BioInsAlgoBatchApp:
     def _poll_scheduler(self) -> None:
         if self.scheduler is not None:
             for event in self.scheduler.drain_events():
+                if event.kind == BatchEventType.FAILED:
+                    self._alert_batch_failure()
                 item = self.job_to_item.get(event.job_id)
                 if item is None or not self.tree.exists(item):
                     continue
@@ -641,7 +652,39 @@ class BioInsAlgoBatchApp:
                     )
                 else:
                     self.status_var.set(f"Batch finished: {completed}/{len(jobs)} completed.")
+                if (
+                    completed == len(jobs)
+                    and getattr(self, "_completion_notified_scheduler", None) is not self.scheduler
+                ):
+                    # Mark it before opening the modal dialog: its nested Tk
+                    # event loop may otherwise re-enter this polling callback.
+                    self._completion_notified_scheduler = self.scheduler
+                    messagebox.showinfo(
+                        "Batch complete",
+                        f"All {len(jobs)} sample(s) completed successfully.",
+                        parent=self.root,
+                    )
         self.root.after(120, self._poll_scheduler)
+
+    def _alert_batch_failure(self) -> None:
+        """Play one failure sound for the active batch without affecting it."""
+
+        if getattr(self, "_failure_alerted_scheduler", None) is self.scheduler:
+            return
+        # Set the marker before invoking an OS sound API; this also prevents a
+        # duplicate alert if a nested GUI event loop re-enters polling.
+        self._failure_alerted_scheduler = self.scheduler
+        try:
+            if winsound is not None:
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+                return
+        except (OSError, RuntimeError):
+            # A muted or unavailable system sound must not affect analysis.
+            pass
+        try:
+            self.root.bell()
+        except (AttributeError, tk.TclError):
+            pass
 
     @staticmethod
     def _format_runtime(seconds: float | None) -> str:
