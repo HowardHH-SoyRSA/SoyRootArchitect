@@ -54,6 +54,8 @@ class RootNode:
     insertion_index: int | None = None
     order_overridden: bool = False
     source_root_ids: list[str] = field(default_factory=list)
+    body_start_index: int = 0
+    centerline_assessment: dict[str, Any] = field(default_factory=dict)
 
     def clone(self) -> "RootNode":
         return RootNode(
@@ -73,6 +75,8 @@ class RootNode:
             insertion_index=self.insertion_index,
             order_overridden=bool(self.order_overridden),
             source_root_ids=list(self.source_root_ids),
+            body_start_index=self.body_start_index,
+            centerline_assessment=dict(self.centerline_assessment),
         )
 
 
@@ -414,6 +418,8 @@ class EditorSession:
                             else root.insertion_point.tolist()
                         ),
                         "polyline": root.points.tolist(),
+                        "body_start_index": root.body_start_index,
+                        "centerline_assessment": root.centerline_assessment,
                         "order_overridden": root.order_overridden,
                         "source_root_ids": root.source_root_ids,
                     }
@@ -547,6 +553,21 @@ class EditorSession:
             if action is None:
                 raise EditorValidationError(f"Unsupported editor operation: {operation.type}")
             action(operation)
+            changed_labels: set[int] = set()
+            for chunk, old_labels in zip(self._pending_index_chunks, self._pending_old_label_chunks):
+                changed_labels.update(int(label) for label in old_labels)
+                changed_labels.update(int(label) for label in self.mesh.root_labels[chunk])
+            for root_id, root in self.roots.items():
+                previous = roots_before.get(root_id)
+                if previous is not None and (
+                    root.parent_id != previous.parent_id
+                    or not np.array_equal(root.points, previous.points)
+                ):
+                    root.body_start_index = 0
+                    root.centerline_assessment = {}
+                elif root.numeric_label in changed_labels and root.centerline_assessment:
+                    root.centerline_assessment["assignment_changed_since_fit"] = True
+                    root.qc_flags = list(dict.fromkeys([*root.qc_flags, "centerline_fit_stale_assignment"]))
             self._refresh_attachments()
             self._validate_state()
             self._recompute_traits()
@@ -1118,6 +1139,8 @@ class EditorSession:
                 ),
                 insertion_index=row.get("insertion_index"),
                 source_root_ids=[root_id],
+                body_start_index=int(row.get("body_start_index", 0)),
+                centerline_assessment=dict(row.get("centerline_assessment", {})),
             )
         if PRIMARY_ID not in roots:
             raise ValueError("root_hierarchy.json does not contain the primary root.")
@@ -1158,6 +1181,8 @@ class EditorSession:
                     parent_points=parent.points,
                     insertion_point=root.insertion_point,
                     insertion_index=root.insertion_index,
+                    body_start_index=root.body_start_index,
+                    centerline_assessment=root.centerline_assessment,
                 )
             )
         identity = Normalization(minimum=np.zeros(3), scale=1.0)
@@ -1173,6 +1198,7 @@ class EditorSession:
             full_root_labels=mapped,
             primary_confidence=primary.confidence,
             primary_qc_flags=primary.qc_flags,
+            primary_centerline_assessment=primary.centerline_assessment,
             tip_vector_window=self.tip_vector_window_mesh_units,
             gravity=self.gravity,
         )
@@ -1212,15 +1238,28 @@ class EditorSession:
             if (
                 root.points.ndim != 2
                 or root.points.shape[1] != 3
-                or len(root.points) < 2
+                or len(root.points) < (1 if root.centerline_assessment.get("status") in {"no_support", "insufficient_support"} or root.root_id == PRIMARY_ID and any(flag in root.qc_flags for flag in ("centerline_no_support", "centerline_insufficient_support")) else 2)
                 or not np.all(np.isfinite(root.points))
             ):
                 raise EditorValidationError(f"{root.root_id} has an invalid polyline.")
+            if not 0 <= root.body_start_index < len(root.points):
+                raise EditorValidationError(f"{root.root_id} has an invalid exposed-body index.")
             if root.root_id != PRIMARY_ID:
                 parent = self.roots[root.parent_id]
                 child_length = path_length(root.points)
                 parent_length = path_length(parent.points)
-                if child_length_exceeds_parent(child_length, parent_length):
+                baseline_root = self._baseline_roots.get(root.root_id)
+                baseline_parent = self._baseline_roots.get(root.parent_id)
+                unchanged_fit = (
+                    bool(root.centerline_assessment)
+                    and baseline_root is not None and baseline_parent is not None
+                    and root.parent_id == baseline_root.parent_id
+                    and np.array_equal(root.points, baseline_root.points)
+                    and np.array_equal(parent.points, baseline_parent.points)
+                )
+                if child_length_exceeds_parent(child_length, parent_length) and not (
+                    unchanged_fit and "centerline_refit_child_longer_than_parent" in root.qc_flags
+                ):
                     raise EditorValidationError(
                         f"{root.root_id} has centreline length {child_length:.9g}, "
                         f"which exceeds parent {parent.root_id} length "
@@ -1243,7 +1282,11 @@ class EditorSession:
                     raise EditorValidationError(
                         f"{root.root_id} has a stale parent insertion point."
                     )
-                if not np.allclose(
+                supported_gap_exception = (
+                    root.centerline_assessment.get("parent_connector_supported") is False
+                    or root.centerline_assessment.get("status") in {"no_support", "insufficient_support"}
+                )
+                if not supported_gap_exception and not np.allclose(
                     root.points[0],
                     expected_insertion,
                     rtol=1e-7,
@@ -1303,6 +1346,8 @@ class EditorSession:
                     parent_points=parent.points,
                     insertion_point=root.insertion_point,
                     insertion_index=root.insertion_index,
+                    body_start_index=root.body_start_index,
+                    centerline_assessment=root.centerline_assessment,
                 )
             )
         return output
@@ -1682,13 +1727,16 @@ class EditorSession:
                 root.insertion_index = None
                 continue
             parent = self.roots[root.parent_id]
-            insertion_index = int(cKDTree(parent.points).query(root.points[0], k=1)[1])
+            preserve_gap = root.centerline_assessment.get("parent_connector_supported") is False or root.centerline_assessment.get("status") in {"no_support", "insufficient_support"}
+            hint = root.insertion_point if preserve_gap and root.insertion_point is not None else root.points[0]
+            insertion_index = int(cKDTree(parent.points).query(hint, k=1)[1])
             insertion_point = np.asarray(
                 parent.points[insertion_index],
                 dtype=float,
             ).copy()
             root.points = root.points.copy()
-            root.points[0] = insertion_point
+            if not preserve_gap:
+                root.points[0] = insertion_point
             root.insertion_point = insertion_point
             root.insertion_index = insertion_index
 
@@ -1763,6 +1811,8 @@ class EditorSession:
                 "root_order": root.order,
                 "order_overridden": root.order_overridden,
                 "polyline": root.points.tolist(),
+                "body_start_index": root.body_start_index,
+                "centerline_assessment": root.centerline_assessment,
                 "insertion_point": (
                     root.points[0].tolist()
                     if root.insertion_point is None

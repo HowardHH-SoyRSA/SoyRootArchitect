@@ -24,6 +24,45 @@ SOURCE_FILES = (
 )
 
 
+def test_final_fit_gap_and_sparse_body_survive_editor_reload_and_edits(editor_bundle, tmp_path):
+    hierarchy_path = editor_bundle / "root_hierarchy.json"
+    hierarchy = json.loads(hierarchy_path.read_text())
+    for row in hierarchy["roots"]:
+        if row["root_id"] == "root-b":
+            row["polyline"] = row["polyline"][1:]
+            row["centerline_assessment"] = {"status": "partial_support", "parent_connector_supported": False}
+        if row["root_id"] == "root-c":
+            row["polyline"] = [row["polyline"][-1]]
+            row["centerline_assessment"] = {"status": "insufficient_support", "parent_connector_supported": False}
+    hierarchy_path.write_text(json.dumps(hierarchy))
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "fit-session")
+    before = {rid: session.roots[rid].points.copy() for rid in ("root-b", "root-c")}
+    session.apply_operation("assign_points", {"root_id": "root-b", "indices": [17]})
+    for rid, line in before.items():
+        np.testing.assert_array_equal(session.roots[rid].points, line)
+    assert session.roots["root-b"].centerline_assessment["assignment_changed_since_fit"]
+    assert session.roots["root-c"].traits["length"] is None
+    reloaded = EditorSession(editor_bundle, session_dir=tmp_path / "fit-session")
+    for rid, line in before.items():
+        np.testing.assert_array_equal(reloaded.roots[rid].points, line)
+
+
+def test_editor_preserves_exposed_body_trait_window(editor_bundle, tmp_path):
+    hierarchy_path = editor_bundle / "root_hierarchy.json"
+    hierarchy = json.loads(hierarchy_path.read_text())
+    row = next(r for r in hierarchy["roots"] if r["root_id"] == "root-b")
+    row["body_start_index"] = 1
+    row["centerline_assessment"] = {"status": "fitted", "parent_connector_supported": True}
+    hierarchy_path.write_text(json.dumps(hierarchy))
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "body-session")
+    session._recompute_traits()
+    root = session.roots["root-b"]
+    assert root.traits["base_vector_start_x"] == pytest.approx(root.points[1, 0])
+    assert root.traits["parent_connector_length"] == pytest.approx(.5)
+    assert root.clone().body_start_index == 1
+
+
+
 @pytest.fixture(autouse=True)
 def fixed_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep editor tests deterministic and independent of workstation hardware."""

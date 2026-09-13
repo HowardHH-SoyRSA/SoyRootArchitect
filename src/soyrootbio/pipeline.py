@@ -14,6 +14,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from .export import export_results
+from .centerline import refit_final_centerlines
 from .primary_guidance import (
     PRIMARY_GUIDANCE_FILENAME,
     PrimaryGuidance,
@@ -42,6 +43,7 @@ from .primary import (
     tangent_plane_primary_segmentation,
 )
 from .topology import (
+    _polyline_fingerprint,
     apply_hierarchy_corrections,
     repair_root_hierarchy,
     uncross_internal_primary_sibling_contacts,
@@ -351,6 +353,10 @@ def _run_pipeline_impl(
             np.asarray(primary_mask, dtype=bool) & ~above_base_mask
         ],
     )
+    correction_input_fingerprints = {
+        "primary": _polyline_fingerprint(primary.points),
+        **{path.root_id: _polyline_fingerprint(path.points) for path in selected},
+    }
     if config.correction_file is not None:
         selected = apply_hierarchy_corrections(
             primary.points,
@@ -539,7 +545,22 @@ def _run_pipeline_impl(
         int(primary_surface_patch_report["absorbed_patch_count"]),
         int(primary_surface_patch_report["absorbed_vertex_count"]),
     )
-    checkpoint("point_assignment", "Computing root traits", 0.82)
+    checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
+    primary.points, final_centerline_report = refit_final_centerlines(
+        full_normalized,
+        full_root_labels,
+        primary.points,
+        selected,
+        d_bar=d_bar,
+        triangles=cloud.triangles,
+        cooperate=cooperate,
+    )
+    primary.qc_flags = list(dict.fromkeys([
+        *primary.qc_flags, *final_centerline_report["primary_qc_flags"],
+    ]))
+    for assessment in final_centerline_report["roots"]:
+        assessment["correction_input_geometry_fingerprint"] = correction_input_fingerprints[assessment["root_id"]]
+    checkpoint("final_centerline_fitting", "Computing root traits", 0.84)
     traits = compute_traits(
         primary.points,
         selected,
@@ -555,6 +576,7 @@ def _run_pipeline_impl(
         mesh_metadata=cloud.source_metadata,
         primary_confidence=primary.confidence,
         primary_qc_flags=primary.qc_flags,
+        primary_centerline_assessment=final_centerline_report["roots"][0],
         tip_vector_window=config.tip_vector_window_mesh_units,
     )
     checkpoint("trait_measurement", "Rendering validation figures", 0.87)
@@ -626,6 +648,8 @@ def _run_pipeline_impl(
             ),
             "ancestor_inward_terminal_rejection": True,
             "child_length_may_not_exceed_parent": True,
+            "child_length_control_stage": "topology_repair_before_final_support_fitting",
+            "post_fit_length_violation_action": "QC_flag_preserve_final_ownership_and_hierarchy",
             "overlong_child_alternative_parent_resurvey": True,
             "overlong_child_action": (
                 "at a supported internal fork, resurvey the overlong "
@@ -640,6 +664,7 @@ def _run_pipeline_impl(
             internal_o1_contact_changed_ids
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
+        "final_centerline_fitting": final_centerline_report,
         "primary_detection_method": _primary_method(config),
         "primary_guidance_file": (
             PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None

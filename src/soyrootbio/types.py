@@ -80,6 +80,10 @@ class RootPath:
     # points inside the parent tube can be traversed at a junction, but must not
     # improve candidate ranking or overlap selection.
     novel_support_indices: set[int] | None = None
+    # Final-support fitting keeps the internal attachment separate from the
+    # exposed body. Zero means there is no supported internal connector.
+    body_start_index: int = 0
+    centerline_assessment: dict[str, Any] = field(default_factory=dict)
 
     @property
     def length(self) -> float:

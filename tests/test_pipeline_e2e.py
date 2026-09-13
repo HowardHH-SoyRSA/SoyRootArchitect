@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import soyrootbio.pipeline as pipeline_module
 from soyrootbio.pipeline import PipelineConfig, run_pipeline
@@ -74,6 +75,12 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
         assert float(row.length) <= float(length_by_id[str(row.parent_id)]) + 1e-9
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["primary_guidance_file"] == "primary_guidance.json"
+    assert "final_centerline_fitting" in metadata["stage_timings_seconds"]
+    fitting = metadata["final_centerline_fitting"]
+    assert len(fitting["roots"]) == len(traits)
+    assert fitting["roots"][0]["assigned_point_count"] == int(np.sum(result.full_root_labels == 0))
+    assert fitting["roots"][0]["length_after"] * result.normalization.scale == pytest.approx(float(traits.iloc[0]["length"]))
+    assert "centerline_region" in lateral_skeletons.columns
     assert metadata["lateral_tracing_policy"][
         "child_length_may_not_exceed_parent"
     ] is True

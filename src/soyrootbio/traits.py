@@ -30,6 +30,7 @@ def compute_traits(
     mesh_metadata: dict | None = None,
     primary_confidence: float = 1.0,
     primary_qc_flags: list[str] | None = None,
+    primary_centerline_assessment: dict | None = None,
     tip_vector_window: float = 2.0,
 ) -> pd.DataFrame:
     """Measure per-root geometry in source mesh units and requested angles.
@@ -53,7 +54,15 @@ def compute_traits(
         full_root_labels,
     )
     primary_original = normalization.inverse_points(primary_path)
-    primary_radii = _radius_profile(points[primary_mask], primary_path, normalization)
+    # Use the same final full-resolution ownership as the fitting pass, even
+    # when analysis was reduced and a small root has no sampled vertices.
+    support_points = points
+    support_labels = None
+    if full_points is not None and full_root_labels is not None:
+        support_points = normalization.transform_points(np.asarray(full_points))
+        support_labels = np.asarray(full_root_labels)
+    primary_support = support_points[support_labels == 0] if support_labels is not None else points[primary_mask]
+    primary_radii = _radius_profile(primary_support, primary_path, normalization)
     primary_length = path_length(primary_original)
     primary_frustum_area, primary_frustum_volume = _frustum_measurements(
         primary_original,
@@ -68,7 +77,7 @@ def compute_traits(
             length=primary_length,
             chord=primary_chord,
             radii=primary_radii,
-            point_count=int(primary_mask.sum()),
+            point_count=int(len(primary_support)),
             confidence=float(primary_confidence),
             qc_flags=list(primary_qc_flags or []),
             surface_area=mesh_areas.get(0, primary_frustum_area),
@@ -102,18 +111,26 @@ def compute_traits(
             "gravity_dz": float(gravity[2]),
         }
     )
+    primary_unmeasurable = any(flag in (primary_qc_flags or []) for flag in ("centerline_no_support", "centerline_insufficient_support"))
+    records[0]["centerline_fit_status"] = (primary_centerline_assessment or {}).get("status", "insufficient_support" if primary_unmeasurable else "not_assessed")
+    if primary_unmeasurable:
+        _mark_unmeasurable(records[0])
 
     primary_tree = cKDTree(primary_path)
     for lateral_index, lateral in enumerate(lateral_paths, start=1):
         parent_path = lateral.parent_points if lateral.parent_points is not None and len(lateral.parent_points) else primary_path
         parent_tree = cKDTree(parent_path)
         original = normalization.inverse_points(lateral.points)
+        body_index = int(lateral.body_start_index)
+        body = lateral.points[body_index:]
+        body_original = original[body_index:]
         parent_original = normalization.inverse_points(parent_path)
         label_mask = lateral_labels == lateral_index
-        radii = _radius_profile(points[label_mask], lateral.points, normalization)
+        support = support_points[support_labels == lateral_index] if support_labels is not None else points[label_mask]
+        radii = _radius_profile(support, body, normalization)
         length = path_length(original)
         chord = _chord_length(original)
-        frustum_area, frustum_volume = _frustum_measurements(original, radii)
+        frustum_area, frustum_volume = _frustum_measurements(body_original, radii)
 
         _, parent_index = parent_tree.query(lateral.points[0], k=1)
         _, primary_index = primary_tree.query(lateral.points[0], k=1)
@@ -123,14 +140,14 @@ def compute_traits(
             base_vector,
             actual_base_window,
         ) = _arc_window_vector(
-            original,
+            body_original,
             anchor_index=0,
             requested_window=tip_vector_window,
             from_start=True,
         )
         tip_start_point, tip_point, tip_vector, actual_tip_window = _arc_window_vector(
-            original,
-            anchor_index=len(original) - 1,
+            body_original,
+            anchor_index=len(body_original) - 1,
             requested_window=tip_vector_window,
             from_start=False,
         )
@@ -170,7 +187,7 @@ def compute_traits(
             length=length,
             chord=chord,
             radii=radii,
-            point_count=int(label_mask.sum()),
+            point_count=int(len(support)),
             confidence=float(lateral.confidence),
             qc_flags=qc_flags,
             surface_area=mesh_areas.get(lateral_index, frustum_area),
@@ -181,6 +198,9 @@ def compute_traits(
         record.update(
             {
                 "angle_deg": base_parent_angle,
+                "exposed_body_length": path_length(body_original),
+                "parent_connector_length": path_length(original[:body_index + 1]) if body_index else 0.0,
+                "centerline_fit_status": lateral.centerline_assessment.get("status", "not_assessed"),
                 "base_parent_angle_deg": base_parent_angle,
                 "tip_angle_parent_deg": tip_parent_angle,
                 "tip_angle_primary_deg": tip_primary_angle,
@@ -231,6 +251,8 @@ def compute_traits(
                 "gravity_dz": float(gravity[2]),
             }
         )
+        if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support"}:
+            _mark_unmeasurable(record)
         records.append(record)
 
     frame = pd.DataFrame.from_records(records)
@@ -241,6 +263,17 @@ def compute_traits(
         full_root_labels=full_root_labels,
     )
     return frame
+
+
+def _mark_unmeasurable(record: dict) -> None:
+    """A stored support location is not a measured zero-length biological root."""
+    for key in ("length", "chord_length", "tortuosity", "mean_radius", "mean_diameter", "median_diameter",
+                "minimum_diameter", "maximum_diameter", "volume", "exposed_body_length"):
+        record[key] = np.nan
+    for key in ("root_tip_x", "root_tip_y", "root_tip_z"):
+        record[key] = np.nan
+    if record["surface_area_method"] == "centerline_frustum_estimate":
+        record["surface_area"] = np.nan
 
 
 def trait_summary_frame(traits: pd.DataFrame) -> pd.DataFrame:

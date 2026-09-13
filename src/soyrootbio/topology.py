@@ -1482,6 +1482,7 @@ def write_editable_hierarchy(
     *,
     primary_confidence: float = 1.0,
     primary_qc_flags: Iterable[str] = (),
+    primary_centerline_assessment: dict | None = None,
 ) -> Path:
     """Write the complete topology contract as editable JSON."""
 
@@ -1498,6 +1499,7 @@ def write_editable_hierarchy(
             "qc_flags": list(primary_qc_flags),
             "polyline": np.asarray(primary_path, dtype=float).tolist(),
             "geometry_fingerprint": _polyline_fingerprint(primary_path),
+            "centerline_assessment": primary_centerline_assessment or {},
         }
     ]
     for root in lateral_paths:
@@ -1513,6 +1515,8 @@ def write_editable_hierarchy(
                 "insertion_index": root.insertion_index,
                 "insertion_point": None if root.insertion_point is None else np.asarray(root.insertion_point).tolist(),
                 "polyline": np.asarray(root.points, dtype=float).tolist(),
+                "body_start_index": int(root.body_start_index),
+                "centerline_assessment": root.centerline_assessment,
                 "geometry_fingerprint": _polyline_fingerprint(root.points),
             }
         )
@@ -1560,6 +1564,14 @@ def apply_hierarchy_corrections(
             raise ValueError("The primary root cannot be removed in a hierarchy correction; use a primary override.")
         if "polyline" in primary_row:
             edited_primary = np.asarray(primary_row["polyline"], dtype=float)
+            assessment = primary_row.get("centerline_assessment", {})
+            if (
+                assessment.get("correction_input_geometry_fingerprint", assessment.get("input_geometry_fingerprint")) == _polyline_fingerprint(primary_path)
+                and primary_row.get("geometry_fingerprint") == _polyline_fingerprint(edited_primary)
+            ):
+                # An unchanged final fitted export is not an edit of the
+                # earlier primary used at the hierarchy-correction stage.
+                continue
             if coordinate_space == "source_coordinates":
                 if normalization is None:
                     # A full exported correction may include an unchanged
@@ -1584,11 +1596,20 @@ def apply_hierarchy_corrections(
             kept.append(path)
             continue
         expected_fingerprint = correction.get("geometry_fingerprint")
+        assessment = correction.get("centerline_assessment", {})
+        fitted_export = bool(assessment.get("input_geometry_fingerprint"))
         if expected_fingerprint:
             current_polyline = np.asarray(path.points, dtype=float)
-            if coordinate_space == "source_coordinates" and normalization is not None:
+            if fitted_export:
+                current_fingerprint = _polyline_fingerprint(current_polyline)
+                expected_input = assessment.get("correction_input_geometry_fingerprint", assessment["input_geometry_fingerprint"])
+            else:
+                expected_input = str(expected_fingerprint)
+            if not fitted_export and coordinate_space == "source_coordinates" and normalization is not None:
                 current_polyline = normalization.inverse_points(current_polyline)
-            if _polyline_fingerprint(current_polyline) != str(expected_fingerprint):
+            if not fitted_export:
+                current_fingerprint = _polyline_fingerprint(current_polyline)
+            if current_fingerprint != expected_input:
                 raise ValueError(f"Hierarchy correction is stale for {path.root_id}: geometry fingerprint changed")
         if correction.get("valid", True) is False:
             continue
@@ -1597,7 +1618,8 @@ def apply_hierarchy_corrections(
             corrected_parent = str(correction["parent_id"])
             geometry_changed = corrected_parent != path.parent_id
             path.parent_id = corrected_parent
-        if "polyline" in correction:
+        unchanged_fitted_polyline = fitted_export and "polyline" in correction and _polyline_fingerprint(np.asarray(correction["polyline"], dtype=float)) == expected_fingerprint
+        if "polyline" in correction and not unchanged_fitted_polyline:
             edited = np.asarray(correction["polyline"], dtype=float)
             if edited.ndim != 2 or edited.shape[1] != 3 or len(edited) < 2 or not np.all(np.isfinite(edited)):
                 raise ValueError(f"Invalid corrected polyline for {path.root_id}")
