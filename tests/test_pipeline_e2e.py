@@ -169,7 +169,15 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
         == assignment["total_vertex_count"]
     )
     cleanup = assignment["primary_surface_patch_cleanup"]
-    assert cleanup["policy"] == "primary-surface-small-patch-cleanup-v1"
+    assert cleanup["policy"] == "primary-surface-small-patch-cleanup-v2"
+    competition = metadata["distinct_root_competition"]
+    assert competition["policy"] == "distinct-root-segments-v1"
+    evidence = np.load(output_dir / "root_competition.npz")
+    pairs = evidence["root_labels"]
+    indices = evidence["vertex_indices"]
+    assert len(indices) == competition["competing_vertex_count"]
+    assert np.all(pairs[:, 0] != pairs[:, 1])
+    assert not np.any(result.full_above_base_mask[indices])
     assert cleanup["absorbed_patch_count"] >= 0
     assert cleanup["absorbed_vertex_count"] >= 0
     ownership = metadata["primary_o1_ownership"]

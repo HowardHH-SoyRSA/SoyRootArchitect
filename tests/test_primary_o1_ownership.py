@@ -57,6 +57,16 @@ def test_excluded_uncertain_stays_unassigned_and_cannot_bridge():
     assert report["excluded_uncertain_to_unassigned_count"] == excluded.sum()
 
 
+def test_unrelated_competition_blocks_primary_protrusion_transfer():
+    case = junction()
+    p, labels, _, _, _, count = case
+    target = (np.arange(len(p)) >= count) & (p[:, 0] >= 0.055) & (p[:, 0] < 0.10)
+    pairs = {int(i): (1, 2) for i in np.flatnonzero(target)}
+    result, report = run(case, competing_labels=pairs)
+    np.testing.assert_array_equal(result[target], labels[target])
+    assert report["junctions"][0]["competition_protected_vertex_count"] >= target.sum()
+
+
 def test_mesh_disconnection_blocks_spatially_near_child_support():
     case = list(junction())
     p, _, _, _, faces, _ = case

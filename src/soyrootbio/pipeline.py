@@ -13,6 +13,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
+from .competition import RootSegmentIndex, TIE_TOLERANCE
 from .export import export_results
 from .centerline import refit_final_centerlines
 from .primary_guidance import (
@@ -378,18 +379,21 @@ def _run_pipeline_impl(
         raise RuntimeError("Root topology validation failed: " + "; ".join(topology_errors))
     checkpoint("topology_repair", "Assigning root vertices", 0.76)
     segmented_primary_mask = np.asarray(primary_mask, dtype=bool).copy()
+    assignment_radii = _assignment_radius_profiles(
+        normalized, primary.points, selected, segmented_primary_mask & ~above_base_mask, d_bar,
+    )
     lateral_labels, analysis_competing_labels = _assign_lateral_points(
         normalized,
         selected,
         segmented_primary_mask,
         d_bar,
+        primary_path=primary.points,
+        return_root_labels=True,
         excluded_mask=above_base_mask,
         return_competing_labels=True,
+        root_radii=assignment_radii,
     )
-    analysis_root_labels = _analysis_root_labels(
-        segmented_primary_mask,
-        lateral_labels,
-    )
+    analysis_root_labels = lateral_labels.copy()
     analysis_root_labels, analysis_junction_report = _resolve_parent_owned_junctions(
         normalized,
         analysis_root_labels,
@@ -399,6 +403,7 @@ def _run_pipeline_impl(
         assignment_radius=max(4.0 * d_bar, 0.006),
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=analysis_competing_labels,
+        root_radii=assignment_radii,
     )
     # The lateral-label representation reserves zero for "not lateral", so
     # reconstruct both masks from unified labels after resolving primary-owned
@@ -426,6 +431,7 @@ def _run_pipeline_impl(
         d_bar=d_bar,
         excluded_mask=full_above_base_mask,
         return_competing_labels=True,
+        root_radii=assignment_radii,
     )
     (
         internal_o1_contact_changed_ids,
@@ -455,18 +461,21 @@ def _run_pipeline_impl(
             "reassigning analysis and full-resolution vertices",
             len(internal_o1_contact_changed_ids),
         )
+        assignment_radii = _assignment_radius_profiles(
+            normalized, primary.points, selected, segmented_primary_mask & ~above_base_mask, d_bar,
+        )
         lateral_labels, analysis_competing_labels = _assign_lateral_points(
             normalized,
             selected,
             segmented_primary_mask,
             d_bar,
+            primary_path=primary.points,
+            return_root_labels=True,
             excluded_mask=above_base_mask,
             return_competing_labels=True,
+            root_radii=assignment_radii,
         )
-        analysis_root_labels = _analysis_root_labels(
-            segmented_primary_mask,
-            lateral_labels,
-        )
+        analysis_root_labels = lateral_labels.copy()
         (
             analysis_root_labels,
             analysis_junction_report,
@@ -479,6 +488,7 @@ def _run_pipeline_impl(
             assignment_radius=max(4.0 * d_bar, 0.006),
             ambiguity_margin=max(0.75 * d_bar, 0.001),
             competing_labels=analysis_competing_labels,
+            root_radii=assignment_radii,
         )
         primary_mask = analysis_root_labels == 0
         lateral_labels = np.zeros(len(analysis_root_labels), dtype=int)
@@ -493,14 +503,15 @@ def _run_pipeline_impl(
             d_bar=d_bar,
             excluded_mask=full_above_base_mask,
             return_competing_labels=True,
+            root_radii=assignment_radii,
         )
     analysis_to_full: np.ndarray | None = None
     if cloud.analysis_indices is not None and len(cloud.analysis_indices) == len(normalized):
         analysis_to_full = np.asarray(cloud.analysis_indices, dtype=int)
         full_root_labels[analysis_to_full] = analysis_root_labels
-        # Replace the competitor evidence at sampled vertices with the
-        # evidence that produced the sampled labels. Stale full-resolution
-        # entries are harmless for non-uncertain labels and are ignored below.
+        # Keep evidence synchronized with the labels being restored.
+        for vertex_index in analysis_to_full:
+            full_competing_labels.pop(int(vertex_index), None)
         for analysis_index, pair in analysis_competing_labels.items():
             full_competing_labels[int(analysis_to_full[int(analysis_index)])] = pair
     full_root_labels[full_above_base_mask] = -1
@@ -513,6 +524,7 @@ def _run_pipeline_impl(
         assignment_radius=max(5.0 * d_bar, 0.008),
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=full_competing_labels,
+        root_radii=assignment_radii,
     )
     full_root_labels, primary_surface_patch_report = (
         _absorb_small_primary_surface_patches(
@@ -523,6 +535,8 @@ def _run_pipeline_impl(
             d_bar=d_bar,
             triangles=cloud.triangles,
             excluded_mask=full_above_base_mask,
+            competing_labels=full_competing_labels,
+            root_radii=assignment_radii,
             primary_support_points=normalized[
                 segmented_primary_mask & ~above_base_mask
             ],
@@ -534,6 +548,7 @@ def _run_pipeline_impl(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=full_above_base_mask,
+        competing_labels=full_competing_labels,
     )
     cleaned_analysis_labels: np.ndarray | None = None
     if analysis_to_full is not None:
@@ -558,6 +573,26 @@ def _run_pipeline_impl(
         int(primary_surface_patch_report["absorbed_patch_count"]),
         int(primary_surface_patch_report["absorbed_vertex_count"]),
     )
+    competition_indices = np.asarray(sorted(full_competing_labels), dtype=int)
+    collar_indices = competition_indices[
+        np.linalg.norm(full_normalized[competition_indices] - selected_base, axis=1)
+        <= base_collar_neighborhood_radius
+    ]
+    competition_report = {
+        "policy": "distinct-root-segments-v1",
+        "metric": "absolute(centerline segment distance - interpolated local radius)",
+        "evidence_file": "root_competition.npz",
+        "radius_source": "frozen unshared traced support; primary segmented support; missing radius zero",
+        "radius_profiles_normalized": {str(k): v for k, v in assignment_radii.items()},
+        "tie_tolerance_normalized": TIE_TOLERANCE,
+        "index": "length-bucketed segment midpoint KD trees; conservative radius balls; chunked exact projection",
+        "competing_vertex_count": len(full_competing_labels),
+        "remaining_uncertain_competing_vertex_count": int(np.sum(full_root_labels[competition_indices] == -2)),
+        "collar_competing_vertex_count": int(len(collar_indices)),
+        "collar_uncertain_vertex_count": int(np.sum(full_root_labels[collar_indices] == -2)),
+        "collar_excluded_vertex_count": int(np.sum(full_above_base_mask)),
+        "evidence_geometry": "before final assignment-supported centerline fitting",
+    }
     checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
     primary.points, final_centerline_report = refit_final_centerlines(
         full_normalized,
@@ -594,6 +629,13 @@ def _run_pipeline_impl(
     )
     checkpoint("trait_measurement", "Rendering validation figures", 0.87)
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        config.output_dir / "root_competition.npz",
+        vertex_indices=competition_indices,
+        root_labels=np.asarray(
+            [full_competing_labels[int(i)] for i in competition_indices], dtype=np.int64,
+        ).reshape(-1, 2),
+    )
     save_overview_plot(config.output_dir / "overview.png", normalized, primary_mask, lateral_labels, primary.points, selected)
     save_angle_front_views(
         config.output_dir,
@@ -617,6 +659,7 @@ def _run_pipeline_impl(
         "point_count": len(normalized),
         "full_resolution_point_count": len(cloud.export_points),
         "d_bar_normalized": d_bar,
+        "distinct_root_competition": competition_report,
         "normalization_minimum": normalization.minimum,
         "normalization_scale": normalization.scale,
         "coordinate_unit": "mesh_unit",
@@ -1172,7 +1215,9 @@ def _trace_lateral_orders(
             d_bar,
             excluded_mask=excluded,
         )
-        occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded | (labels > 0)
+        # Competing selected roots already claim these surfaces. Uncertain
+        # ownership must not turn them into novel support for a later order.
+        occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded | (labels != 0)
         parent_paths = [
             (path.root_id, path.points)
             for path in selected_all
@@ -1768,6 +1813,55 @@ def _selected_base_exclusion_mask(
     return np.where(near_collar, local_above, gravity_above)
 
 
+def _assignment_radius_profiles(points, primary, paths, primary_mask, d_bar):
+    """Freeze segment-derived radii from unshared traced surface support.
+
+    Shared coverage and primary-owned vertices cannot inflate lateral radii.
+    Radius measurement is separate from the assignment it will influence.
+    """
+    coverage = np.zeros(len(points), dtype=int)
+    supports = []
+    for path in paths:
+        ids = np.asarray(sorted(path.covered_indices), dtype=int)
+        ids = ids[(ids >= 0) & (ids < len(points))]
+        supports.append(ids)
+        coverage[ids] += 1
+    profiles = {}
+    for label, path in enumerate([primary] + [p.points for p in paths]):
+        if not len(path):
+            profiles[label] = np.empty(0)
+            continue
+        if label == 0:
+            support = points[primary_mask]
+        else:
+            ids = supports[label - 1]
+            ids = ids[(coverage[ids] == 1) & ~primary_mask[ids]]
+            support = points[ids]
+        if len(support) >= 3:
+            stations, values = _segment_radius_profile(support, path, d_bar)
+            arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+            profiles[label] = np.interp(arc, stations, values)
+        else:
+            value = paths[label - 1].mean_radius if label else None
+            profiles[label] = np.full(len(path), _valid_root_radius(value))
+    return profiles
+
+
+def _valid_root_radius(value):
+    return float(value) if value is not None and np.isfinite(value) and value >= 0 else 0.0
+
+
+def _root_segment_index(primary_path, paths, root_radii=None):
+    root_ids = (["primary"] if primary_path is not None else []) + [str(p.root_id) for p in paths]
+    if len(root_ids) != len(set(root_ids)):
+        raise ValueError("root identities must be unique")
+    polylines = ([] if primary_path is None else [primary_path]) + [p.points for p in paths]
+    labels = list(range(0 if primary_path is not None else 1, len(paths) + 1))
+    defaults = ([] if primary_path is None else [0.0]) + [_valid_root_radius(p.mean_radius) for p in paths]
+    profiles = [(root_radii or {}).get(label, fallback) for label, fallback in zip(labels, defaults, strict=True)]
+    return RootSegmentIndex(polylines, labels=labels, radii=profiles)
+
+
 def _assign_lateral_points(
     points: np.ndarray,
     paths: list[RootPath],
@@ -1776,49 +1870,28 @@ def _assign_lateral_points(
     *,
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
+    primary_path: np.ndarray | None = None,
+    root_radii: dict | None = None,
+    return_root_labels: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     labels = np.zeros(len(points), dtype=int)
-    if not paths:
-        return (labels, {}) if return_competing_labels else labels
+    if return_root_labels:
+        labels[:] = -1
+        labels[np.asarray(primary_mask, dtype=bool)] = 0
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
-    non_primary = np.flatnonzero(~np.asarray(primary_mask, dtype=bool) & ~excluded)
-    if len(non_primary) == 0:
-        return (labels, {}) if return_competing_labels else labels
-    path_nodes = np.vstack([path.points for path in paths])
-    node_to_label = np.concatenate([np.full(len(path.points), idx, dtype=int) for idx, path in enumerate(paths, start=1)])
-    tree = cKDTree(path_nodes)
-    query_k = 2 if len(path_nodes) > 1 else 1
-    distances, node_idx = tree.query(points[non_primary], k=query_k, workers=worker_threads())
-    if query_k == 1:
-        distances = distances[:, None]
-        node_idx = node_idx[:, None]
-    radius = max(4.0 * d_bar, 0.006)
-    assigned = distances[:, 0] <= radius
-    nearest_labels = node_to_label[node_idx[:, 0]]
-    labels[non_primary[assigned]] = nearest_labels[assigned]
-    competing_labels: dict[int, tuple[int, int]] = {}
-    if query_k > 1:
-        second_labels = node_to_label[node_idx[:, 1]]
-        ambiguous = (
-            assigned
-            & (nearest_labels != second_labels)
-            & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
-        )
-        ambiguous_indices = non_primary[ambiguous]
-        labels[ambiguous_indices] = -1
-        if return_competing_labels:
-            competing_labels = {
-                int(vertex_index): (int(first_label), int(second_label))
-                for vertex_index, first_label, second_label in zip(
-                    ambiguous_indices,
-                    nearest_labels[ambiguous],
-                    second_labels[ambiguous],
-                    strict=True,
-                )
-            }
-    if return_competing_labels:
-        return labels, competing_labels
-    return labels
+    # With primary geometry available, measure competition even on the
+    # segmented primary mask; mask restoration must not erase this evidence.
+    ids = np.flatnonzero(~excluded & (True if primary_path is not None else ~np.asarray(primary_mask, dtype=bool)))
+    radius, margin = max(4.0 * d_bar, 0.006), max(0.75 * d_bar, 0.001)
+    result = _root_segment_index(primary_path, paths, root_radii).query(points[ids], max_distance=radius + margin)
+    assigned = result.distances[:, 0] <= radius + TIE_TOLERANCE
+    labels[ids[assigned]] = result.labels[assigned, 0]
+    ambiguous = assigned & result.ambiguous(margin)
+    labels[ids[ambiguous]] = -2 if return_root_labels else -1
+    if return_root_labels:
+        labels[excluded] = -1
+    pairs = {int(i): tuple(map(int, pair)) for i, pair in zip(ids[ambiguous], result.labels[ambiguous], strict=True)}
+    return (labels, pairs) if return_competing_labels else labels
 
 
 def _analysis_root_labels(primary_mask: np.ndarray, lateral_labels: np.ndarray) -> np.ndarray:
@@ -1949,6 +2022,7 @@ def _resolve_primary_o1_ownership(
     d_bar: float,
     triangles: np.ndarray | None = None,
     excluded_mask: np.ndarray | None = None,
+    competing_labels: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Trim short primary protrusions continuous with exposed O1 surfaces.
 
@@ -2045,7 +2119,12 @@ def _resolve_primary_o1_ownership(
         geometric = ((ca <= max_arc) & (pd >= pr + 0.25 * spacing)
                      & (cd <= 1.5 * cr + spacing) & exposed)
         strength = pd / (pr + spacing) - cd / (cr + spacing)
-        eligible = geometric & (strength >= 0.20)
+        unrelated = np.asarray([
+            any(other not in (0, label) for other in (competing_labels or {}).get(int(i), ()))
+            for i in ids
+        ], dtype=bool)
+        row["competition_protected_vertex_count"] = int(np.sum(unrelated & (before[ids] == 0)))
+        eligible = geometric & (strength >= 0.20) & ~unrelated
         seeds = (before[ids] == label) & geometric
         row["supported_seed_count"] = int(seeds.sum())
         if seeds.sum() < 3:
@@ -2116,6 +2195,8 @@ def _absorb_small_primary_surface_patches(
     triangles: np.ndarray | None = None,
     excluded_mask: np.ndarray | None = None,
     primary_support_points: np.ndarray | None = None,
+    competing_labels: dict[int, tuple[int, int]] | None = None,
+    root_radii: dict | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Absorb discrete non-primary islands embedded in the primary surface.
 
@@ -2138,6 +2219,10 @@ def _absorb_small_primary_surface_patches(
     if not np.isfinite(spacing) or spacing <= 0.0:
         raise ValueError("d_bar must be positive and finite")
     excluded = _coerce_exclusion_mask(excluded_mask, len(source))
+    protected = np.zeros(len(source), dtype=bool)
+    for vertex, pair in (competing_labels or {}).items():
+        if resolved[vertex] == -2 and pair[0] != pair[1]:
+            protected[vertex] = True
     order_one_labels = {
         index
         for index, path in enumerate(lateral_paths, start=1)
@@ -2146,7 +2231,7 @@ def _absorb_small_primary_surface_patches(
     target_labels = {-2, -1, *order_one_labels}
     edges, connectivity = _surface_connectivity_edges(source, triangles, spacing)
     report = {
-        "policy": "primary-surface-small-patch-cleanup-v1",
+        "policy": "primary-surface-small-patch-cleanup-v2",
         "rule": (
             "A non-main order-1, uncertain, or unassigned same-label surface "
             "component is assigned to primary only when at least 75% of its "
@@ -2154,12 +2239,13 @@ def _absorb_small_primary_surface_patches(
             "inside the local primary-radius envelope, and its spatial span is "
             "no larger than max(8*d_bar, 0.75*local_primary_radius, 0.006). "
             "The largest component of each order-1 root and every explicitly "
-            "excluded above-base vertex are retained."
+            "excluded above-base vertex are retained. Unresolved distinct-root competition is protected."
         ),
         "connectivity": connectivity,
         "absorbed_patch_count": 0,
         "absorbed_vertex_count": 0,
         "passes": 0,
+        "competition_protected_vertex_count": int(protected.sum()),
         "per_source_label": {},
     }
     if not len(source) or not len(primary) or not len(edges):
@@ -2172,12 +2258,15 @@ def _absorb_small_primary_surface_patches(
     )
     if support.ndim != 2 or support.shape[1] != 3:
         raise ValueError("primary_support_points must contain XYZ points")
-    primary_radii = estimate_parent_radius_profile(primary, support, spacing)
-    primary_tree = cKDTree(primary)
+    if root_radii is not None and 0 in root_radii:
+        primary_radii = root_radii[0]
+        stations = np.r_[0., np.cumsum(np.linalg.norm(np.diff(primary, axis=0), axis=1))]
+    else:
+        stations, primary_radii = _segment_radius_profile(support, primary, spacing)
     root_ids = ["primary"] + [str(path.root_id) for path in lateral_paths]
 
     for pass_index in range(3):
-        eligible = ~excluded & np.isin(
+        eligible = ~excluded & ~protected & np.isin(
             resolved,
             np.asarray(sorted(target_labels), dtype=int),
         )
@@ -2276,13 +2365,8 @@ def _absorb_small_primary_surface_patches(
             ]
             positions = source[members]
             patch_span = float(np.linalg.norm(np.ptp(positions, axis=0)))
-            distances, nearest = primary_tree.query(
-                positions,
-                k=1,
-                workers=worker_threads(),
-            )
-            nearest = np.asarray(nearest, dtype=int)
-            local_radii = primary_radii[nearest]
+            distances, arcs = _polyline_projection_distance_and_arc(positions, primary)
+            local_radii = np.interp(arcs, stations, primary_radii)
             local_radius = float(np.median(local_radii))
             maximum_span = max(8.0 * spacing, 0.75 * local_radius, 0.006)
             if patch_span > maximum_span:
@@ -2332,6 +2416,8 @@ def _competing_pair_supports_parent_claim(
     """Return whether the observed competitors belong to this junction."""
 
     first, second = (int(pair[0]), int(pair[1]))
+    if first == second:
+        return False
     if first == child_label:
         other = second
     elif second == child_label:
@@ -2384,11 +2470,12 @@ def _resolve_parent_owned_junctions(
     assignment_radius: float,
     ambiguity_margin: float,
     competing_labels: dict[int, tuple[int, int]] | None = None,
+    root_radii: dict | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Assign only branch-site uncertainty to the biological parent root.
 
     Parent and child skeletons intentionally share their insertion coordinate.
-    A nearest-node ambiguity rule therefore creates a short orange band even
+    A distinct-root ambiguity rule therefore creates a short orange band even
     when the topology is known.  This postprocessor uses the observed competing
     root labels, repaired topology, and exact point-to-segment projections to
     resolve only uncertain vertices within a sampling-scaled basal child
@@ -2429,11 +2516,11 @@ def _resolve_parent_owned_junctions(
 
     uncertain_indices = np.flatnonzero(resolved == -2)
     report = {
-        "policy": "topology-aware-parent-owned-junction-v2",
+        "policy": "topology-aware-parent-owned-junction-v3",
         "rule": (
             "Only uncertain vertices whose observed competing roots belong to "
             "the repaired parent-child junction, and whose segment distances "
-            "remain ambiguous, are assigned to the parent. The prefix length is "
+            "remain ambiguous relative to local radii, are assigned to the parent. The prefix length is "
             "the larger of four mean point spacings and the local parent radius, "
             "capped by child length; no physical-distance threshold is used."
         ),
@@ -2475,30 +2562,20 @@ def _resolve_parent_owned_junctions(
         )
         if insertion.shape != (3,) or not np.all(np.isfinite(insertion)):
             continue
-        parent_index = (
-            int(child.insertion_index)
-            if child.insertion_index is not None
-            else int(cKDTree(parent).query(insertion, k=1)[1])
-        )
-        if parent_index < 0 or parent_index >= len(parent):
-            parent_index = int(cKDTree(parent).query(insertion, k=1)[1])
-
         if parent_label not in parent_radius_cache:
-            parent_support = source[
-                parent_support_indices.get(parent_label, empty_indices)
-            ]
-            parent_radius_cache[parent_label] = estimate_parent_radius_profile(
-                parent,
-                parent_support,
-                spacing,
-            )
-        parent_radii = parent_radius_cache[parent_label]
-        local_parent_radius = (
-            float(parent_radii[parent_index])
-            if parent_radii.shape == (len(parent),)
-            and np.isfinite(parent_radii[parent_index])
-            else 2.5 * spacing
+            parent_support = source[parent_support_indices.get(parent_label, empty_indices)]
+            stations, values = _segment_radius_profile(parent_support, parent, spacing)
+            parent_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(parent, axis=0), axis=1))]
+            parent_radius_cache[parent_label] = np.interp(parent_arc, stations, values)
+        parent_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(parent, axis=0), axis=1))]
+        parent_radii = (root_radii or {}).get(parent_label, parent_radius_cache[parent_label])
+        _, insertion_arc = _polyline_projection_distance_and_arc(insertion[None], parent)
+        local_parent_radius = float(np.interp(insertion_arc[0], parent_arc, parent_radii))
+        # Missing profiles follow assignment's zero/mean-radius fallback.
+        parent_metric_radii = (root_radii or {}).get(
+            parent_label, 0.0 if parent_label == 0 else _valid_root_radius(lateral_paths[parent_label - 1].mean_radius),
         )
+        child_metric_radii = (root_radii or {}).get(child_label, _valid_root_radius(child.mean_radius))
         child_length = float(
             np.linalg.norm(np.diff(child_points, axis=0), axis=1).sum()
         )
@@ -2508,13 +2585,13 @@ def _resolve_parent_owned_junctions(
         )
         if not np.isfinite(junction_arc) or junction_arc <= 1e-12:
             continue
-        child_prefix = _polyline_prefix(child_points, junction_arc)
-        if len(child_prefix) < 2:
-            continue
         junction_arcs.append(float(junction_arc))
 
         prefilter_radius = float(
-            np.sqrt(junction_arc**2 + (radius + margin) ** 2) + margin
+            junction_arc + radius + margin + max(
+                float(np.max(parent_metric_radii)),
+                float(np.max(child_metric_radii)),
+            )
         )
         nearby_positions = uncertain_tree.query_ball_point(
             insertion,
@@ -2525,19 +2602,19 @@ def _resolve_parent_owned_junctions(
             continue
         candidate_indices = uncertain_indices[np.asarray(nearby_positions, dtype=int)]
         candidate_points = source[candidate_indices]
-        child_distance, child_arc = _polyline_projection_distance_and_arc(
-            candidate_points,
-            child_prefix,
-        )
-        parent_distance, _ = _polyline_projection_distance_and_arc(
-            candidate_points,
-            parent,
-        )
+        child_distance, child_arc = _polyline_projection_distance_and_arc(candidate_points, child_points)
+        parent_distance, _ = _polyline_projection_distance_and_arc(candidate_points, parent)
+        # Use the same frozen surface metric that produced the evidence.
+        metric = RootSegmentIndex(
+            [parent, child_points], labels=[parent_label, child_label],
+            radii=[parent_metric_radii, child_metric_radii],
+        ).query(candidate_points, max_distance=radius + margin)
+        surface_ambiguous = metric.ambiguous(margin)
         eligible = (
-            (child_distance <= radius)
+            (child_distance <= radius + float(np.max(child_metric_radii)))
             & (child_arc <= junction_arc + 1e-12)
-            & (parent_distance <= radius + margin)
-            & (np.abs(parent_distance - child_distance) <= margin)
+            & (parent_distance <= radius + margin + float(np.max(parent_metric_radii)))
+            & surface_ambiguous
         )
         for candidate_position in np.flatnonzero(eligible):
             vertex_index = int(candidate_indices[candidate_position])
@@ -2768,47 +2845,19 @@ def _assign_full_root_labels(
     d_bar: float,
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
+    root_radii: dict | None = None,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
-    all_paths = [np.asarray(primary_path, dtype=float)] + [np.asarray(path.points, dtype=float) for path in lateral_paths]
-    path_nodes = np.vstack(all_paths)
-    node_labels = np.concatenate(
-        [np.full(len(path), label, dtype=int) for label, path in enumerate(all_paths)]
-    )
-    tree = cKDTree(path_nodes)
-    query_k = 2 if len(path_nodes) > 1 else 1
-    distances, node_indices = tree.query(points, k=query_k, workers=worker_threads())
-    if query_k == 1:
-        distances = distances[:, None]
-        node_indices = node_indices[:, None]
-    labels = np.full(len(points), -1, dtype=int)
-    radius = max(5.0 * d_bar, 0.008)
+    radius, margin = max(5.0 * d_bar, 0.008), max(0.75 * d_bar, 0.001)
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
-    assigned = (distances[:, 0] <= radius) & ~excluded
-    nearest = node_labels[node_indices[:, 0]]
-    labels[assigned] = nearest[assigned]
-    competing_labels: dict[int, tuple[int, int]] = {}
-    if query_k > 1:
-        second = node_labels[node_indices[:, 1]]
-        ambiguous = (
-            assigned
-            & (nearest != second)
-            & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
-        )
-        labels[ambiguous] = -2
-        if return_competing_labels:
-            ambiguous_indices = np.flatnonzero(ambiguous)
-            competing_labels = {
-                int(vertex_index): (int(first_label), int(second_label))
-                for vertex_index, first_label, second_label in zip(
-                    ambiguous_indices,
-                    nearest[ambiguous],
-                    second[ambiguous],
-                    strict=True,
-                )
-            }
-    if return_competing_labels:
-        return labels, competing_labels
-    return labels
+    ids = np.flatnonzero(~excluded)
+    result = _root_segment_index(primary_path, lateral_paths, root_radii).query(points[ids], max_distance=radius + margin)
+    labels = np.full(len(points), -1, dtype=int)
+    assigned = result.distances[:, 0] <= radius + TIE_TOLERANCE
+    labels[ids[assigned]] = result.labels[assigned, 0]
+    ambiguous = assigned & result.ambiguous(margin)
+    labels[ids[ambiguous]] = -2
+    pairs = {int(i): tuple(map(int, pair)) for i, pair in zip(ids[ambiguous], result.labels[ambiguous], strict=True)}
+    return (labels, pairs) if return_competing_labels else labels
 
 
 def _update_metadata_timings(path: Path, timings: dict[str, float]) -> None:
