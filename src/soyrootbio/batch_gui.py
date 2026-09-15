@@ -30,7 +30,8 @@ from .endpoint_picker import (
     select_soil_guidance_from_file_gui,
 )
 from .hardware import allocate_resources, detect_hardware, format_bytes
-from .pipeline import PipelineConfig, run_pipeline
+from .pipeline import PipelineConfig
+from .batch_process import run_pipeline_process
 from .primary_guidance import read_primary_guidance
 
 
@@ -490,7 +491,7 @@ class BioInsAlgoBatchApp:
                 if item in selected_items
             ]
             new_scheduler = BatchScheduler(
-                self._run_job,
+                run_pipeline_process,
                 max_concurrent_samples=allocation.max_concurrent_samples,
                 threads_per_sample=allocation.threads_per_sample,
                 timing_history=history,
@@ -510,8 +511,8 @@ class BioInsAlgoBatchApp:
             self.job_to_item.clear()
             self.job_to_item.update(new_job_to_item)
             self.status_var.set(
-                f"Running up to {allocation.max_concurrent_samples} sample(s) concurrently, "
-                f"{allocation.threads_per_sample} thread(s) each."
+                f"Running up to {allocation.max_concurrent_samples} sample process(es), "
+                f"{allocation.threads_per_sample} worker thread(s) each."
             )
         except Exception as exc:
             if new_scheduler is not None:
@@ -539,21 +540,6 @@ class BioInsAlgoBatchApp:
                     f"and {entry.input_path.name}: {output}"
                 )
             owners[output] = item
-
-    def _run_job(self, job, control, progress):
-        config: PipelineConfig = job.payload
-        config.output_dir = job.output_dir
-        config.worker_threads = job.threads_per_sample
-        # ``threadpool_limits`` changes process-global native-library state.
-        # Per-job contexts overlap in a ThreadPoolExecutor and can restore one
-        # another's limits out of order.  The pipeline's ContextVar-based
-        # worker setting safely isolates cKDTree parallelism per analysis.
-        return run_pipeline(
-            config,
-            progress_callback=progress,
-            cancel_check=control.cancel_check,
-            pause_check=lambda: control.paused,
-        )
 
     def _pipeline_config(self, entry: SampleEntry, threads: int) -> PipelineConfig:
         if entry.output_dir.exists() and any(entry.output_dir.iterdir()):

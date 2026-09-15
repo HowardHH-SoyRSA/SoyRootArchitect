@@ -644,6 +644,8 @@ def launch_gui(
 
 
 def main(argv: list[str] | None = None) -> int:
+    from multiprocessing import freeze_support
+    freeze_support()
     parser = argparse.ArgumentParser(description="Launch the BioInsAlgo desktop application.")
     parser.add_argument("--input", type=Path, help="Optional root file to prefill.")
     parser.add_argument("--output", type=Path, help="Optional output directory to prefill.")

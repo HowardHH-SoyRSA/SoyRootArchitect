@@ -1,4 +1,4 @@
-"""Thread-based batch scheduling primitives for the desktop application.
+"""Batch scheduling and job-state supervision for the desktop application.
 
 Workers never call Tkinter.  Instead, state changes are copied into immutable
 ``BatchEvent`` objects and placed in a thread-safe queue.  A GUI can poll
@@ -8,7 +8,8 @@ thread.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -128,6 +129,9 @@ def write_processing_error_log(
                 exception.__traceback__,
             )
         ).rstrip()
+        remote_trace = getattr(exception, "remote_traceback", None)
+        if isinstance(remote_trace, str) and remote_trace:
+            trace += "\n\nSample process traceback:\n" + remote_trace.rstrip()
         configuration = json.dumps(
             _safe_error_configuration(config),
             ensure_ascii=False,
@@ -209,6 +213,36 @@ class CooperativeToken:
         self._cancel_requested = False
         self._pause_started: float | None = None
         self._paused_seconds = 0.0
+        self._event_mirrors: list[tuple[Any, Any]] = []
+
+    @contextmanager
+    def mirror_to(self, pause_event: Any, cancel_event: Any):
+        """Mirror controls to process-safe Events, including their initial state.
+
+        Updates happen under the same lock as pause/resume/cancel.  They do not
+        depend on the runner receiving progress, which can itself block during
+        a pause.  Detach before closing the child process's resources.
+        """
+        pair = (pause_event, cancel_event)
+        with self._condition:
+            self._event_mirrors.append(pair)
+            self._publish_controls_locked()
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._event_mirrors.remove(pair)
+
+    def _publish_controls_locked(self) -> None:
+        for pause_event, cancel_event in self._event_mirrors:
+            if self._cancel_requested:
+                cancel_event.set()
+            else:
+                cancel_event.clear()
+            if self._pause_requested:
+                pause_event.set()
+            else:
+                pause_event.clear()
 
     @property
     def paused(self) -> bool:
@@ -236,6 +270,7 @@ class CooperativeToken:
                 return False
             self._pause_requested = True
             self._pause_started = time.monotonic()
+            self._publish_controls_locked()
             return True
 
     def resume(self) -> bool:
@@ -246,6 +281,7 @@ class CooperativeToken:
                 return False
             self._finish_pause_locked()
             self._pause_requested = False
+            self._publish_controls_locked()
             self._condition.notify_all()
             return True
 
@@ -258,6 +294,7 @@ class CooperativeToken:
             self._cancel_requested = True
             self._finish_pause_locked()
             self._pause_requested = False
+            self._publish_controls_locked()
             self._condition.notify_all()
             return True
 
@@ -842,8 +879,24 @@ class BatchScheduler:
             futures = tuple(self._futures.values())
         if not futures:
             return True
-        _, pending = wait_futures(futures, timeout=timeout)
-        return not pending
+        # Executor.shutdown(cancel_futures=True) removes cancelled futures
+        # from its queue without the worker notification expected by wait().
+        # Public done callbacks cover both cancellation and normal completion,
+        # including shutdown racing with this wait.
+        finished = threading.Event()
+        remaining = len(futures)
+        completion_lock = threading.Lock()
+
+        def completed(_future: Future[Any]) -> None:
+            nonlocal remaining
+            with completion_lock:
+                remaining -= 1
+                if remaining == 0:
+                    finished.set()
+
+        for future in futures:
+            future.add_done_callback(completed)
+        return finished.wait(timeout)
 
     def shutdown(self, *, wait: bool = True, cancel_pending: bool = False) -> None:
         """Stop accepting work and release the executor."""

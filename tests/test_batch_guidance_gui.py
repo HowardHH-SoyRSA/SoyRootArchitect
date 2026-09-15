@@ -71,6 +71,25 @@ def _add_sample(app, tmp_path):
     return next(iter(app.entries.values()))
 
 
+def test_start_batch_dispatches_module_level_process_runner(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    _add_sample(app, tmp_path)
+    app.concurrency_var = Variable('2')
+    app.threads_var = Variable('1')
+    app.hardware_var = Variable()
+    app.job_to_item = {}
+    # Keep Tk out of spawn payloads and avoid launching a full analysis here.
+    monkeypatch.setattr(batch_gui.BatchScheduler, 'start', lambda self: None)
+    errors = []
+    monkeypatch.setattr(batch_gui.messagebox, 'showerror', lambda *args: errors.append(args))
+    app.start_batch()
+    assert not errors
+    assert app.scheduler.runner is batch_gui.run_pipeline_process
+    assert app.scheduler.threads_per_sample == 1
+    assert 'sample process' in app.status_var.get()
+    app.scheduler.shutdown(cancel_pending=True)
+
+
 def test_added_sample_can_load_guidance_as_a_per_sample_override(tmp_path, monkeypatch):
     app = _app(tmp_path)
     entry = _add_sample(app, tmp_path)

@@ -141,6 +141,10 @@ def export_results(
         metadata,
     )
     metadata = dict(metadata)
+    if "joint_root_collar" in metadata:
+        with (output_dir / "collar_qc.json").open("w", encoding="utf-8") as handle:
+            json.dump(_json_safe(metadata["joint_root_collar"]), handle,
+                      indent=2, ensure_ascii=False, allow_nan=False)
     metadata["system_summary"] = traits.attrs.get("system_summary", {})
     metadata["root_label_map"] = tables["root_label_map.csv"].to_dict(orient="records")
     metadata["skeleton_original_overlay_layout"] = skeleton_overlay_layout

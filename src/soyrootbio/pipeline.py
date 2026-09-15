@@ -13,6 +13,13 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
+from .collar import analyze_joint_collar
+from .junction_transections import trim_primary_junctions
+from .surface_patches import (
+    correct_surface_patches as _correct_surface_patches,
+    _polyline_projection_distance_and_arc,
+    _segment_radius_profile,
+)
 from .export import export_results
 from .centerline import refit_final_centerlines
 from .primary_guidance import (
@@ -514,23 +521,23 @@ def _run_pipeline_impl(
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=full_competing_labels,
     )
-    full_root_labels, primary_surface_patch_report = (
-        _absorb_small_primary_surface_patches(
-            full_normalized,
-            full_root_labels,
-            primary.points,
-            selected,
-            d_bar=d_bar,
-            triangles=cloud.triangles,
-            excluded_mask=full_above_base_mask,
-            primary_support_points=normalized[
-                segmented_primary_mask & ~above_base_mask
-            ],
-        )
+    full_root_labels, collar_report = analyze_joint_collar(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=full_above_base_mask,
     )
-    # Run after sampled-mask restoration AND parent patch cleanup. Strong,
-    # connected child support must have the final say over a primary mask.
-    full_root_labels, primary_o1_ownership_report = _resolve_primary_o1_ownership(
+    # The joint crown decision owns this domain. Later component correction
+    # must not erase supported emergence surfaces or re-open sibling ties.
+    patch_excluded = full_above_base_mask.copy()
+    patch_excluded[np.asarray(collar_report["neighborhood_vertex_indices"], dtype=int)] = True
+    full_root_labels, surface_patch_report = _correct_surface_patches(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=patch_excluded,
+    )
+    # A branch-facing protrusion can be part of the main primary component.
+    # Split that local exterior after atomic patch correction, before fitting.
+    full_root_labels, transection_report = trim_primary_junctions(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=full_above_base_mask,
@@ -554,9 +561,9 @@ def _run_pipeline_impl(
         int(full_junction_report["resolved_vertex_count"]),
     )
     LOGGER.info(
-        "Absorbed %d discrete primary-surface patches containing %d vertices",
-        int(primary_surface_patch_report["absorbed_patch_count"]),
-        int(primary_surface_patch_report["absorbed_vertex_count"]),
+        "Corrected %d surface patches containing %d vertices",
+        int(surface_patch_report["reassigned_patch_count"]),
+        int(surface_patch_report["reassigned_vertex_count"]),
     )
     checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
     primary.points, final_centerline_report = refit_final_centerlines(
@@ -698,7 +705,8 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "final_centerline_fitting": final_centerline_report,
-        "primary_o1_ownership": primary_o1_ownership_report,
+        "branch_facing_transection_trimming": transection_report,
+        "joint_root_collar": collar_report,
         "primary_detection_method": _primary_method(config),
         "primary_guidance_file": (
             PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None
@@ -715,7 +723,7 @@ def _run_pipeline_impl(
             analysis_above_base_count=int(np.count_nonzero(above_base_mask)),
             analysis_junction_report=analysis_junction_report,
             full_junction_report=full_junction_report,
-            primary_surface_patch_report=primary_surface_patch_report,
+            surface_patch_report=surface_patch_report,
         ),
         "primary_candidates": [_candidate_metadata(candidate, normalization) for candidate in primary_candidates],
         "topology_report": topology_report.__dict__,
@@ -1914,32 +1922,6 @@ def _surface_connectivity_edges(
     return np.unique(edges, axis=0), mode
 
 
-def _segment_radius_profile(points, path, spacing):
-    """Measure radii against segments, robust to sparse skeleton stations.
-
-    Median radial support suppresses short primary-labelled side protrusions.
-    Bins have a physical arc width; adding collinear path nodes changes neither
-    the distances nor the radius estimate.
-    """
-    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
-    stations = np.linspace(0.0, arc[-1], max(2, int(np.ceil(arc[-1] / (4 * spacing))) + 1))
-    distances, projected = _polyline_projection_distance_and_arc(points, path)
-    bins = np.clip(np.searchsorted((stations[:-1] + stations[1:]) / 2, projected), 0, len(stations) - 1)
-    values = np.full(len(stations), np.nan)
-    for index in np.unique(bins):
-        support = distances[bins == index]
-        if len(support) >= 3:
-            values[index] = np.median(support)
-    valid = np.flatnonzero(np.isfinite(values))
-    if not len(valid):
-        values[:] = np.median(distances) if len(distances) else spacing
-    else:
-        values = np.interp(stations, stations[valid], values[valid])
-    padded = np.pad(values, (2, 2), mode="edge")
-    values = np.median(np.lib.stride_tricks.sliding_window_view(padded, 5), axis=1)
-    return stations, np.maximum(values, spacing)
-
-
 def _resolve_primary_o1_ownership(
     points: np.ndarray,
     labels: np.ndarray,
@@ -2103,222 +2085,6 @@ def _resolve_primary_o1_ownership(
         resolved[transfer] = label
         row["transferred_vertex_count"] = int(len(transfer))
     report["transferred_vertex_count"] = int(np.sum((before == 0) & (resolved > 0)))
-    return resolved, report
-
-
-def _absorb_small_primary_surface_patches(
-    points: np.ndarray,
-    labels: np.ndarray,
-    primary_path: np.ndarray,
-    lateral_paths: list[RootPath],
-    *,
-    d_bar: float,
-    triangles: np.ndarray | None = None,
-    excluded_mask: np.ndarray | None = None,
-    primary_support_points: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict]:
-    """Absorb discrete non-primary islands embedded in the primary surface.
-
-    A patch must be a small same-label surface component, be surrounded mostly
-    by primary-labelled neighbours, and lie inside the measured primary tube.
-    The largest surface component of every order-1 root is always retained, as
-    are all explicitly excluded points above the selected base.
-    """
-
-    source = np.asarray(points, dtype=float)
-    resolved = np.asarray(labels, dtype=int).copy()
-    primary = np.asarray(primary_path, dtype=float)
-    if source.ndim != 2 or source.shape[1] != 3:
-        raise ValueError("points must have shape (n, 3)")
-    if resolved.shape != (len(source),):
-        raise ValueError("labels must contain one value per point")
-    if primary.ndim != 2 or primary.shape[1] != 3:
-        raise ValueError("primary_path must contain XYZ points")
-    spacing = float(d_bar)
-    if not np.isfinite(spacing) or spacing <= 0.0:
-        raise ValueError("d_bar must be positive and finite")
-    excluded = _coerce_exclusion_mask(excluded_mask, len(source))
-    order_one_labels = {
-        index
-        for index, path in enumerate(lateral_paths, start=1)
-        if int(path.order) == 1
-    }
-    target_labels = {-2, -1, *order_one_labels}
-    edges, connectivity = _surface_connectivity_edges(source, triangles, spacing)
-    report = {
-        "policy": "primary-surface-small-patch-cleanup-v1",
-        "rule": (
-            "A non-main order-1, uncertain, or unassigned same-label surface "
-            "component is assigned to primary only when at least 75% of its "
-            "boundary edges meet primary, at least 90% of its vertices lie "
-            "inside the local primary-radius envelope, and its spatial span is "
-            "no larger than max(8*d_bar, 0.75*local_primary_radius, 0.006). "
-            "The largest component of each order-1 root and every explicitly "
-            "excluded above-base vertex are retained."
-        ),
-        "connectivity": connectivity,
-        "absorbed_patch_count": 0,
-        "absorbed_vertex_count": 0,
-        "passes": 0,
-        "per_source_label": {},
-    }
-    if not len(source) or not len(primary) or not len(edges):
-        return resolved, report
-
-    support = (
-        np.asarray(primary_support_points, dtype=float)
-        if primary_support_points is not None
-        else source[(resolved == 0) & ~excluded]
-    )
-    if support.ndim != 2 or support.shape[1] != 3:
-        raise ValueError("primary_support_points must contain XYZ points")
-    primary_radii = estimate_parent_radius_profile(primary, support, spacing)
-    primary_tree = cKDTree(primary)
-    root_ids = ["primary"] + [str(path.root_id) for path in lateral_paths]
-
-    for pass_index in range(3):
-        eligible = ~excluded & np.isin(
-            resolved,
-            np.asarray(sorted(target_labels), dtype=int),
-        )
-        eligible_indices = np.flatnonzero(eligible)
-        if not len(eligible_indices):
-            break
-        local_index = np.full(len(source), -1, dtype=np.int64)
-        local_index[eligible_indices] = np.arange(len(eligible_indices), dtype=np.int64)
-        edge_starts = edges[:, 0]
-        edge_ends = edges[:, 1]
-        same_label_edges = (
-            eligible[edge_starts]
-            & eligible[edge_ends]
-            & (resolved[edge_starts] == resolved[edge_ends])
-        )
-        rows = local_index[edge_starts[same_label_edges]]
-        columns = local_index[edge_ends[same_label_edges]]
-        if len(rows):
-            graph_rows = np.concatenate([rows, columns])
-            graph_columns = np.concatenate([columns, rows])
-            graph = coo_matrix(
-                (
-                    np.ones(len(graph_rows), dtype=np.uint8),
-                    (graph_rows, graph_columns),
-                ),
-                shape=(len(eligible_indices), len(eligible_indices)),
-            ).tocsr()
-            component_count, component_labels = connected_components(
-                graph,
-                directed=False,
-                return_labels=True,
-            )
-        else:
-            component_count = len(eligible_indices)
-            component_labels = np.arange(len(eligible_indices), dtype=np.int32)
-        counts = np.bincount(
-            component_labels,
-            minlength=component_count,
-        ).astype(np.int64, copy=False)
-        component_source_labels = np.zeros(component_count, dtype=int)
-        component_source_labels[component_labels] = resolved[eligible_indices]
-        component_by_vertex = np.full(len(source), -1, dtype=np.int64)
-        component_by_vertex[eligible_indices] = component_labels
-
-        component_start = component_by_vertex[edge_starts]
-        component_end = component_by_vertex[edge_ends]
-        start_boundary = (component_start >= 0) & (component_start != component_end)
-        end_boundary = (component_end >= 0) & (component_start != component_end)
-        boundary_components = np.concatenate(
-            [component_start[start_boundary], component_end[end_boundary]]
-        )
-        boundary_neighbour_labels = np.concatenate(
-            [resolved[edge_ends[start_boundary]], resolved[edge_starts[end_boundary]]]
-        )
-        boundary_counts = np.bincount(
-            boundary_components,
-            minlength=component_count,
-        )
-        primary_boundary_counts = np.bincount(
-            boundary_components,
-            weights=(boundary_neighbour_labels == 0).astype(float),
-            minlength=component_count,
-        )
-
-        largest_order_one_component: dict[int, int] = {}
-        for component in range(component_count):
-            source_label = int(component_source_labels[component])
-            if source_label not in order_one_labels:
-                continue
-            previous = largest_order_one_component.get(source_label)
-            if previous is None or counts[component] > counts[previous]:
-                largest_order_one_component[source_label] = component
-
-        membership_order = np.argsort(component_labels, kind="stable")
-        offsets = np.concatenate(
-            [np.array([0], dtype=np.int64), np.cumsum(counts)]
-        )
-        absorb: list[tuple[int, np.ndarray]] = []
-        for component in range(component_count):
-            source_label = int(component_source_labels[component])
-            if (
-                source_label in order_one_labels
-                and largest_order_one_component.get(source_label) == component
-            ):
-                continue
-            boundary_count = int(boundary_counts[component])
-            if boundary_count < 2:
-                continue
-            primary_boundary_fraction = float(
-                primary_boundary_counts[component] / boundary_count
-            )
-            if primary_boundary_fraction < 0.75:
-                continue
-            members = eligible_indices[
-                membership_order[offsets[component] : offsets[component + 1]]
-            ]
-            positions = source[members]
-            patch_span = float(np.linalg.norm(np.ptp(positions, axis=0)))
-            distances, nearest = primary_tree.query(
-                positions,
-                k=1,
-                workers=worker_threads(),
-            )
-            nearest = np.asarray(nearest, dtype=int)
-            local_radii = primary_radii[nearest]
-            local_radius = float(np.median(local_radii))
-            maximum_span = max(8.0 * spacing, 0.75 * local_radius, 0.006)
-            if patch_span > maximum_span:
-                continue
-            inside_fraction = float(
-                np.mean(
-                    np.asarray(distances, dtype=float)
-                    <= local_radii + max(2.0 * spacing, 0.002)
-                )
-            )
-            if inside_fraction < 0.90:
-                continue
-            absorb.append((source_label, members))
-
-        if not absorb:
-            break
-        report["passes"] = pass_index + 1
-        for source_label, members in absorb:
-            resolved[members] = 0
-            if source_label == -2:
-                source_name = "uncertain"
-            elif source_label == -1:
-                source_name = "unassigned"
-            elif 0 < source_label < len(root_ids):
-                source_name = root_ids[source_label]
-            else:
-                source_name = str(source_label)
-            entry = report["per_source_label"].setdefault(
-                source_name,
-                {"patch_count": 0, "vertex_count": 0},
-            )
-            entry["patch_count"] += 1
-            entry["vertex_count"] += int(len(members))
-            report["absorbed_patch_count"] += 1
-            report["absorbed_vertex_count"] += int(len(members))
-    report["per_source_label"] = dict(sorted(report["per_source_label"].items()))
     return resolved, report
 
 
@@ -2640,67 +2406,6 @@ def _polyline_prefix(path: np.ndarray, maximum_arc: float) -> np.ndarray:
     return np.vstack([polyline[: segment_index + 1], endpoint])
 
 
-def _polyline_projection_distance_and_arc(
-    query_points: np.ndarray,
-    path: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return exact nearest-segment distance and projected path arc."""
-
-    query = np.asarray(query_points, dtype=float)
-    polyline = np.asarray(path, dtype=float)
-    if query.ndim != 2 or query.shape[1] != 3:
-        raise ValueError("query_points must have shape (n, 3)")
-    if len(polyline) == 0:
-        return (
-            np.full(len(query), np.inf, dtype=float),
-            np.zeros(len(query), dtype=float),
-        )
-    if len(polyline) == 1:
-        return (
-            np.linalg.norm(query - polyline[0], axis=1),
-            np.zeros(len(query), dtype=float),
-        )
-    starts = polyline[:-1]
-    vectors = np.diff(polyline, axis=0)
-    squared_lengths = np.sum(vectors * vectors, axis=1)
-    segment_lengths = np.sqrt(squared_lengths)
-    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    distances = np.full(len(query), np.inf, dtype=float)
-    arcs = np.zeros(len(query), dtype=float)
-    chunk_size = max(128, min(8192, 1_000_000 // max(1, len(starts))))
-    for chunk_start in range(0, len(query), chunk_size):
-        chunk = query[chunk_start : chunk_start + chunk_size]
-        offsets = chunk[:, None, :] - starts[None, :, :]
-        parameters = np.zeros((len(chunk), len(starts)), dtype=float)
-        valid = squared_lengths > 1e-20
-        if np.any(valid):
-            parameters[:, valid] = np.clip(
-                np.einsum(
-                    "nkj,kj->nk",
-                    offsets[:, valid, :],
-                    vectors[valid],
-                )
-                / squared_lengths[valid][None, :],
-                0.0,
-                1.0,
-            )
-        projections = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
-        candidate_distances = np.linalg.norm(
-            chunk[:, None, :] - projections,
-            axis=2,
-        )
-        best_segment = np.argmin(candidate_distances, axis=1)
-        rows = np.arange(len(chunk))
-        best_distance = candidate_distances[rows, best_segment]
-        best_arc = (
-            cumulative[best_segment]
-            + parameters[rows, best_segment] * segment_lengths[best_segment]
-        )
-        distances[chunk_start : chunk_start + len(chunk)] = best_distance
-        arcs[chunk_start : chunk_start + len(chunk)] = best_arc
-    return distances, arcs
-
-
 def _point_assignment_summary(
     labels: np.ndarray,
     above_base_mask: np.ndarray,
@@ -2714,7 +2419,7 @@ def _point_assignment_summary(
     analysis_above_base_count: int,
     analysis_junction_report: dict,
     full_junction_report: dict,
-    primary_surface_patch_report: dict,
+    surface_patch_report: dict,
 ) -> dict:
     labels = np.asarray(labels, dtype=int)
     above_base = _coerce_exclusion_mask(above_base_mask, len(labels))
@@ -2756,7 +2461,7 @@ def _point_assignment_summary(
             "analysis": analysis_junction_report,
             "full_resolution": full_junction_report,
         },
-        "primary_surface_patch_cleanup": primary_surface_patch_report,
+        "surface_patch_correction": surface_patch_report,
     }
 
 

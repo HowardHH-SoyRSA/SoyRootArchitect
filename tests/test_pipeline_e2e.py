@@ -48,6 +48,10 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert "tip_angle_parent_deg" in traits.columns
     assert "tip_angle_z_deg" in traits.columns
     assert (output_dir / "metadata.json").exists()
+    collar = json.loads((output_dir / "collar_qc.json").read_text())
+    metadata = json.loads((output_dir / "metadata.json").read_text())
+    assert collar == metadata["joint_root_collar"]
+    assert collar["policy"] == "joint-root-collar-v1"
     guidance = read_primary_guidance(output_dir / "primary_guidance.json", expected_input=points_path)
     start, end = pipeline_module.read_endpoint_file(endpoint_path)
     np.testing.assert_array_equal(guidance.start, start)
@@ -168,14 +172,15 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
         + assignment["unassigned_vertex_count"]
         == assignment["total_vertex_count"]
     )
-    cleanup = assignment["primary_surface_patch_cleanup"]
-    assert cleanup["policy"] == "primary-surface-small-patch-cleanup-v1"
-    assert cleanup["absorbed_patch_count"] >= 0
-    assert cleanup["absorbed_vertex_count"] >= 0
-    ownership = metadata["primary_o1_ownership"]
-    assert ownership["policy"] == "primary-o1-exposed-surface-competition-v1"
-    assert ownership["primary_mask_lock"] is False
-    assert ownership["transferred_vertex_count"] >= 0
+    cleanup = assignment["surface_patch_correction"]
+    assert cleanup["policy"] == "symmetric-mesh-surface-patches-v1"
+    assert cleanup["reassigned_patch_count"] >= 0
+    assert cleanup["reassigned_vertex_count"] >= 0
+    trimming = metadata["branch_facing_transection_trimming"]
+    assert trimming["policy"] == "branch-facing-transection-trimming-v1"
+    assert trimming["sector_half_angle_degrees"] == 45
+    assert cleanup["converged"] is True
+
 
 
 def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
