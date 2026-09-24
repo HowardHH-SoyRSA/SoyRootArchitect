@@ -226,6 +226,76 @@ def test_shared_origin_promotion_recursively_recomputes_genuine_descendant_order
     assert descendant_result.parent_id == promoted_result.root_id
 
 
+def test_origin_above_primary_top_removes_invalid_root_and_its_subtree() -> None:
+    primary = _primary()
+    parent = _root(
+        "valid-parent",
+        [[0.0, 0.0, 0.70], [0.15, 0.0, 0.92], [0.30, 0.0, 1.12]],
+        order=1,
+        parent_id="primary",
+    )
+    invalid_child = _root(
+        "above-top-child",
+        [[0.30, 0.0, 1.12], [0.33, 0.04, 1.03], [0.35, 0.08, 0.95]],
+        order=2,
+        parent_id=parent.root_id,
+    )
+    dependent_descendant = _root(
+        "dependent-descendant",
+        [[0.35, 0.08, 0.95], [0.37, 0.10, 0.91]],
+        order=3,
+        parent_id=invalid_child.root_id,
+    )
+
+    repaired, report = repair_root_hierarchy(
+        primary,
+        [parent, invalid_child, dependent_descendant],
+        d_bar=0.001,
+    )
+
+    assert len(repaired) == 1
+    assert repaired[0].order == 1
+    assert report.origins_above_primary_top_removed == 1
+    assert report.descendants_of_above_top_roots_removed == 1
+    assert len(report.above_primary_top_details) == 1
+    assert report.above_primary_top_details[0][
+        "height_above_primary_top_normalized"
+    ] == pytest.approx(0.12)
+    assert validate_root_tree(repaired, primary_path=primary) == []
+
+
+def test_tree_validation_rejects_any_order_origin_above_primary_top() -> None:
+    primary = _primary()
+    parent = _root(
+        "valid-parent",
+        [[0.0, 0.0, 0.70], [0.30, 0.0, 1.12]],
+        order=1,
+        parent_id="primary",
+    )
+    parent.insertion_index = 30
+    parent.insertion_point = primary[30].copy()
+    parent.points[0] = parent.insertion_point
+    child = _root(
+        "invalid-order-two",
+        [[0.30, 0.0, 1.12], [0.35, 0.05, 1.05]],
+        order=2,
+        parent_id=parent.root_id,
+    )
+    child.insertion_index = 1
+    child.insertion_point = parent.points[1].copy()
+    child.points[0] = child.insertion_point
+
+    errors = validate_root_tree(
+        [parent, child],
+        primary_path=primary,
+    )
+
+    assert any(
+        error.startswith("invalid-order-two: lateral origin is")
+        for error in errors
+    )
+
+
 def test_path_density_score_ignores_excluded_dense_parent_points() -> None:
     path = np.column_stack(
         [

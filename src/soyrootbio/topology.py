@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 from .geometry import (
     child_length_exceeds_parent,
     path_length,
+    primary_top_excess,
     tangent_vectors,
     vector_angle_degrees,
 )
@@ -49,6 +50,10 @@ class _ForkArmReconciliation:
     child_parent_length_ratio: float
     arm_angle_degrees: float
     descendant_parent_changes: int
+    trigger: str
+    continuation_improvement: float
+    long_to_suffix_ratio: float
+    resurvey_iteration: int
 
 
 def uncross_internal_primary_sibling_contacts(
@@ -692,8 +697,10 @@ def _reject_nonfinite_json(token: str):
 def _prune_overlong_child_subtrees(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
+    *,
+    fork_decisions: list[dict[str, object]] | None = None,
 ) -> tuple[list[RootPath], list[dict[str, object]], int]:
-    """Remove every overlong child and the descendants that depend on it."""
+    """Remove overlong subtrees after preserving geometry and rejection evidence."""
 
     children: dict[str, list[RootPath]] = defaultdict(list)
     for path in lateral_paths:
@@ -724,6 +731,13 @@ def _prune_overlong_child_subtrees(
             if child_removed:
                 removed_ids.add(child_id)
             if direct_violation:
+                child_points = np.asarray(child.points, dtype=float)
+                related_decisions = [
+                    decision
+                    for decision in (fork_decisions or [])
+                    if str(decision.get("candidate_arm_id")) == child_id
+                    and str(decision.get("action")) == "rejected"
+                ]
                 violations.append(
                     {
                         "root_id": child_id,
@@ -735,6 +749,20 @@ def _prune_overlong_child_subtrees(
                             if parent_length > 0.0
                             else None
                         ),
+                        "geometry_sha256": hashlib.sha256(
+                            child_points.astype("<f8").tobytes()
+                        ).hexdigest(),
+                        "preserved_polyline_normalized": (
+                            child_points.tolist()
+                        ),
+                        "reconciliation_rejections": related_decisions,
+                        "score_evidence": {
+                            str(key): float(value)
+                            for key, value in child.score_components.items()
+                            if isinstance(value, (int, float, np.number))
+                            and np.isfinite(float(value))
+                        },
+                        "qc_flags": list(child.qc_flags),
                     }
                 )
             queue.append((child_id, child_length, child_removed))
@@ -770,21 +798,82 @@ def _point_at_arc(
     )
 
 
+def _fork_decision_record(
+    parent: RootPath,
+    child: RootPath,
+    *,
+    action: str,
+    reason: str,
+    trigger: str,
+    iteration: int,
+    parent_length: float,
+    child_length: float,
+    suffix_length: float,
+    insertion_arc: float,
+    support: float,
+    arm_angle: float | None = None,
+    departure: float | None = None,
+    preserved_points: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Preserve reviewable geometry and evidence for one fork decision."""
+
+    child_points = np.asarray(
+        child.points if preserved_points is None else preserved_points,
+        dtype=float,
+    )
+    digest = hashlib.sha256(child_points.astype("<f8").tobytes()).hexdigest()
+    return {
+        "parent_id": str(parent.root_id),
+        "candidate_arm_id": str(child.root_id),
+        "action": str(action),
+        "reason": str(reason),
+        "trigger": str(trigger),
+        "resurvey_iteration": int(iteration),
+        "parent_length_normalized": float(parent_length),
+        "candidate_arm_length_normalized": float(child_length),
+        "post_fork_suffix_length_normalized": float(suffix_length),
+        "candidate_to_suffix_ratio": (
+            float(child_length / suffix_length)
+            if suffix_length > 0.0
+            else None
+        ),
+        "continuation_improvement_normalized": float(
+            child_length - suffix_length
+        ),
+        "insertion_arc_normalized": float(insertion_arc),
+        "connected_support": float(support),
+        "arm_angle_degrees": (
+            float(arm_angle) if arm_angle is not None else None
+        ),
+        "departure_normalized": (
+            float(departure) if departure is not None else None
+        ),
+        "geometry_sha256": digest,
+        "preserved_polyline_normalized": child_points.tolist(),
+    }
+
+
 def _reconcile_overlong_forks(
     primary_path: np.ndarray,
     paths: list[RootPath],
     *,
     d_bar: float,
+    decision_log: list[dict[str, object]] | None = None,
+    queue_stats: dict[str, int] | None = None,
+    max_iterations: int | None = None,
 ) -> tuple[list[_ForkArmReconciliation], set[str]]:
-    """Make a supported long child the continuation of its parent.
+    """Resurvey supported fork arms to a deterministic stable result.
 
     Greedy growth can follow the locally straighter, short arm at a fork and
     rediscover the persistent arm during child tracing. The ordinary length
     rule would then delete precisely the supported continuation. Reconcile only
     high-separation internal forks with automatic surface and density evidence.
     The same child-parent length control is applied to the alternative parent
-    route and its retained short child before committing the swap; all other
-    overlong children remain available to conservative pruning.
+    route and its retained short child before committing the swap. Parents
+    affected by a swap are put back on a deterministic queue, so a newly
+    exposed downstream fork is reviewed in the same call. Every accepted swap
+    strictly lengthens the post-fork continuation; pair/state guards and an
+    iteration bound prevent oscillation.
     """
 
     spacing = float(d_bar)
@@ -792,6 +881,7 @@ def _reconcile_overlong_forks(
     reconciled: list[_ForkArmReconciliation] = []
     reassigned: set[str] = set()
     consumed: set[str] = set()
+    decisions = decision_log if decision_log is not None else []
     parents = sorted(
         (
             path
@@ -829,7 +919,39 @@ def _reconcile_overlong_forks(
         ),
         key=lambda path: (int(path.order), str(path.root_id)),
     )
-    for parent in parents:
+    parent_ids = [str(path.root_id) for path in parents]
+    work_queue: deque[str] = deque(parent_ids)
+    queued = set(parent_ids)
+    seen_swap_pairs: set[tuple[str, str]] = set()
+    seen_states: set[tuple[tuple[str, str, int, int], ...]] = set()
+    iteration_limit = int(
+        max_iterations
+        if max_iterations is not None
+        else max(16, 6 * max(1, len(paths)))
+    )
+    iterations = 0
+    cycle_states = 0
+
+    def enqueue(root_id: str | None) -> None:
+        if root_id is None:
+            return
+        key = str(root_id)
+        if key == PRIMARY_ID or key in queued:
+            return
+        if any(str(path.root_id) == key for path in paths):
+            work_queue.append(key)
+            queued.add(key)
+
+    while work_queue and iterations < iteration_limit:
+        parent_id = work_queue.popleft()
+        queued.discard(parent_id)
+        parent = next(
+            (path for path in paths if str(path.root_id) == parent_id),
+            None,
+        )
+        if parent is None or int(parent.order) < 1 or len(parent.points) < 6:
+            continue
+        iterations += 1
         parent_points = np.asarray(parent.points, dtype=float)
         parent_segments = np.linalg.norm(np.diff(parent_points, axis=0), axis=1)
         parent_arc = np.concatenate([[0.0], np.cumsum(parent_segments)])
@@ -854,7 +976,7 @@ def _reconcile_overlong_forks(
         )
         if parent.parent_id != PRIMARY_ID and supervisor is None:
             continue
-        candidates: list[tuple[float, float, RootPath, dict[str, float]]] = []
+        candidates: list[tuple[float, float, RootPath, dict[str, object]]] = []
         for child in paths:
             if (
                 str(child.parent_id) != str(parent.root_id)
@@ -864,9 +986,36 @@ def _reconcile_overlong_forks(
                 or child.insertion_index is None
             ):
                 continue
+            pair = (str(parent.root_id), str(child.root_id))
+            if pair in seen_swap_pairs:
+                continue
             child_length = float(child.length)
             ratio = child_length / parent_length
-            if not child_length_exceeds_parent(child_length, parent_length):
+            insertion_index = int(
+                np.clip(child.insertion_index, 0, len(parent_points) - 1)
+            )
+            insertion_arc = float(parent_arc[insertion_index])
+            suffix_length = parent_length - insertion_arc
+            long_to_suffix_ratio = child_length / max(suffix_length, 1e-12)
+            continuation_improvement = child_length - suffix_length
+            whole_parent_violation = child_length_exceeds_parent(
+                child_length,
+                parent_length,
+            )
+            suffix_dominance = bool(
+                continuation_improvement
+                > max(8.0 * spacing, 0.05 * parent_length)
+                and long_to_suffix_ratio >= 2.5
+            )
+            early_termination = bool(
+                suffix_length
+                <= max(0.55 * child_length, 24.0 * spacing)
+            )
+            if whole_parent_violation:
+                trigger = "whole_parent_length_violation"
+            elif suffix_dominance and early_termination:
+                trigger = "post_fork_suffix_dominance_and_early_termination"
+            else:
                 continue
             support = float(
                 child.score_components.get(
@@ -879,17 +1028,64 @@ def _reconcile_overlong_forks(
                 )
             )
             if not np.isfinite(support) or support < 30.0:
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="insufficient_connected_support",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                    )
+                )
                 continue
-
-            insertion_index = int(
-                np.clip(child.insertion_index, 0, len(parent_points) - 1)
+            minimum_insertion_fraction = (
+                0.50 if whole_parent_violation else 0.30
             )
-            insertion_arc = float(parent_arc[insertion_index])
-            suffix_length = parent_length - insertion_arc
-            if (
-                insertion_arc < max(12.0 * spacing, 0.50 * parent_length)
-                or suffix_length < max(8.0 * spacing, 0.05 * parent_length)
+            if insertion_arc < max(
+                12.0 * spacing,
+                minimum_insertion_fraction * parent_length,
             ):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="fork_too_basal_for_identity_swap",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                    )
+                )
+                continue
+            if suffix_length < max(
+                8.0 * spacing,
+                0.03 * parent_length,
+            ):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="short_arm_not_sustained",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                    )
+                )
                 continue
 
             alternative_parent_length = insertion_arc + child_length
@@ -903,6 +1099,21 @@ def _reconcile_overlong_forks(
                     alternative_parent_length,
                 )
             ):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="alternative_parent_length_control",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                    )
+                )
                 continue
 
             window = max(16.0 * spacing, 0.04 * parent_length)
@@ -926,17 +1137,102 @@ def _reconcile_overlong_forks(
                 connector_skip + window,
             )
             long_direction = long_end - long_start
+            prefix_start = _point_at_arc(
+                parent_points,
+                parent_arc,
+                max(0.0, insertion_arc - window),
+            )
+            prefix_direction = (
+                parent_points[insertion_index] - prefix_start
+            )
+            short_turn = vector_angle_degrees(
+                prefix_direction,
+                short_direction,
+            )
+            long_turn = vector_angle_degrees(
+                prefix_direction,
+                long_direction,
+            )
+            child_fork_evidence = float(
+                child.score_components.get(
+                    "fork_hypothesis_evidence_score",
+                    0.0,
+                )
+            )
+            parent_fork_evidence = float(
+                parent.score_components.get(
+                    "fork_hypothesis_evidence_score",
+                    0.0,
+                )
+            )
+            if (
+                not whole_parent_violation
+                and np.isfinite(short_turn)
+                and np.isfinite(long_turn)
+                and float(long_turn) > float(short_turn) + 35.0
+                and child_fork_evidence
+                < parent_fork_evidence + 0.20
+            ):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="windowed_curvature_supports_existing_suffix",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                    )
+                )
+                continue
             arm_angle = vector_angle_degrees(short_direction, long_direction)
             if (
                 not np.isfinite(arm_angle)
                 or float(arm_angle) < 45.0
                 or float(arm_angle) > 135.0
             ):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="arm_angle_outside_supported_fork_range",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                        arm_angle=float(arm_angle),
+                    )
+                )
                 continue
 
             child_to_parent, _ = cKDTree(parent_points).query(child_points, k=1)
             departure = float(np.quantile(child_to_parent, 0.75))
             if departure < max(6.0 * spacing, 0.05 * child_length):
+                decisions.append(
+                    _fork_decision_record(
+                        parent,
+                        child,
+                        action="rejected",
+                        reason="long_arm_does_not_depart_from_parent",
+                        trigger=trigger,
+                        iteration=iterations,
+                        parent_length=parent_length,
+                        child_length=child_length,
+                        suffix_length=suffix_length,
+                        insertion_arc=insertion_arc,
+                        support=support,
+                        arm_angle=float(arm_angle),
+                        departure=departure,
+                    )
+                )
                 continue
             evidence = {
                 "insertion_index": float(insertion_index),
@@ -954,8 +1250,18 @@ def _reconcile_overlong_forks(
                 "arm_angle_degrees": float(arm_angle),
                 "long_arm_departure": departure,
                 "long_arm_support": support,
+                "short_arm_turn_degrees": float(short_turn),
+                "long_arm_turn_degrees": float(long_turn),
+                "child_fork_evidence_score": child_fork_evidence,
+                "parent_fork_evidence_score": parent_fork_evidence,
+                "trigger": trigger,
+                "continuation_improvement": continuation_improvement,
+                "long_to_suffix_ratio": long_to_suffix_ratio,
+                "resurvey_iteration": float(iterations),
             }
-            candidates.append((ratio, support, child, evidence))
+            candidates.append(
+                (long_to_suffix_ratio, support, child, evidence)
+            )
 
         if not candidates:
             continue
@@ -963,6 +1269,7 @@ def _reconcile_overlong_forks(
             candidates,
             key=lambda item: (item[0], item[1], str(item[2].root_id)),
         )
+        seen_swap_pairs.add((str(parent.root_id), str(long_child.root_id)))
         insertion_index = int(evidence["insertion_index"])
         junction = parent_points[insertion_index].copy()
         short_points = np.asarray(parent_points[insertion_index:], dtype=float).copy()
@@ -1012,7 +1319,11 @@ def _reconcile_overlong_forks(
             {
                 "fork_long_arm_reconciled": 1.0,
                 "fork_parent_length_before": parent_length,
-                **evidence,
+                **{
+                    key: float(value)
+                    for key, value in evidence.items()
+                    if key != "trigger"
+                },
             }
         )
         if "fork_long_arm_reconciled" not in parent.qc_flags:
@@ -1046,6 +1357,7 @@ def _reconcile_overlong_forks(
         )
 
         changed_descendants = 0
+        affected_descendants: list[str] = []
         parent_tree = cKDTree(parent.points)
         short_tree = cKDTree(long_child.points)
         for descendant in paths:
@@ -1073,6 +1385,7 @@ def _reconcile_overlong_forks(
             descendant.points[0] = descendant.insertion_point
             if descendant.parent_id != old_parent_id:
                 changed_descendants += 1
+                affected_descendants.append(str(descendant.root_id))
                 reassigned.add(str(descendant.root_id))
                 descendant.score_components[
                     "fork_descendant_attachment_reassessed"
@@ -1103,11 +1416,135 @@ def _reconcile_overlong_forks(
                 ),
                 arm_angle_degrees=float(evidence["arm_angle_degrees"]),
                 descendant_parent_changes=changed_descendants,
+                trigger=str(evidence["trigger"]),
+                continuation_improvement=float(
+                    evidence["continuation_improvement"]
+                ),
+                long_to_suffix_ratio=float(
+                    evidence["long_to_suffix_ratio"]
+                ),
+                resurvey_iteration=int(evidence["resurvey_iteration"]),
             )
         )
         _assign_recursive_orders(paths)
+        _refresh_parent_references(primary_path, paths)
+        state = tuple(
+            sorted(
+                (
+                    str(path.root_id),
+                    str(path.parent_id),
+                    int(path.order),
+                    int(
+                        round(
+                            float(path.length) / max(spacing, 1e-12)
+                        )
+                    ),
+                )
+                for path in paths
+            )
+        )
+        if state in seen_states:
+            cycle_states += 1
+        else:
+            seen_states.add(state)
+        decisions.append(
+            _fork_decision_record(
+                parent,
+                long_child,
+                action="accepted",
+                reason="strictly_better_supported_continuation",
+                trigger=str(evidence["trigger"]),
+                iteration=iterations,
+                parent_length=parent_length,
+                child_length=float(evidence["long_arm_length"]),
+                suffix_length=float(evidence["short_arm_length"]),
+                insertion_arc=float(evidence["insertion_arc"]),
+                support=float(evidence["long_arm_support"]),
+                arm_angle=float(evidence["arm_angle_degrees"]),
+                departure=float(evidence["long_arm_departure"]),
+                preserved_points=long_points,
+            )
+        )
+        enqueue(str(parent.root_id))
+        enqueue(str(long_child.root_id))
+        enqueue(str(parent.parent_id))
+        for descendant_id in affected_descendants:
+            descendant = next(
+                (
+                    item
+                    for item in paths
+                    if str(item.root_id) == descendant_id
+                ),
+                None,
+            )
+            if descendant is not None:
+                enqueue(str(descendant.parent_id))
+                enqueue(str(descendant.root_id))
 
+    if queue_stats is not None:
+        queue_stats["iterations"] = int(iterations)
+        queue_stats["cycle_states"] = int(cycle_states)
+        queue_stats["iteration_limit"] = int(iteration_limit)
+        queue_stats["remaining_items"] = int(len(work_queue))
     return reconciled, reassigned
+
+
+def _prune_above_primary_top_subtrees(
+    primary_path: np.ndarray,
+    paths: list[RootPath],
+    *,
+    gravity: np.ndarray,
+) -> tuple[list[RootPath], list[dict[str, object]], int]:
+    """Remove invalid lateral origins and every dependent descendant."""
+
+    primary = np.asarray(primary_path, dtype=float)
+    direction = np.asarray(gravity, dtype=float)
+    direction /= np.linalg.norm(direction)
+    up = -direction
+    top_index = int(np.argmax(primary @ up))
+    top_point = primary[top_index]
+    direct: dict[str, dict[str, object]] = {}
+    for path in paths:
+        origin = (
+            np.asarray(path.insertion_point, dtype=float)
+            if path.insertion_point is not None
+            else np.asarray(path.points[0], dtype=float)
+        )
+        excess, tolerance = primary_top_excess(
+            origin,
+            primary,
+            gravity=direction,
+        )
+        if excess <= tolerance:
+            continue
+        direct[str(path.root_id)] = {
+            "root_id": str(path.root_id),
+            "parent_id": str(path.parent_id),
+            "root_order": int(path.order),
+            "origin_normalized": origin.tolist(),
+            "height_above_primary_top_normalized": float(excess),
+            "numeric_tolerance_normalized": float(tolerance),
+            "primary_top_index": top_index,
+            "primary_top_point_normalized": top_point.tolist(),
+        }
+    if not direct:
+        return paths, [], 0
+
+    children: dict[str, list[str]] = defaultdict(list)
+    for path in paths:
+        children[str(path.parent_id)].append(str(path.root_id))
+    removed = set(direct)
+    queue = deque(sorted(removed))
+    while queue:
+        parent_id = queue.popleft()
+        for child_id in sorted(children.get(parent_id, [])):
+            if child_id in removed:
+                continue
+            removed.add(child_id)
+            queue.append(child_id)
+    descendants = len(removed - set(direct))
+    kept = [path for path in paths if str(path.root_id) not in removed]
+    return kept, [direct[root_id] for root_id in sorted(direct)], descendants
 
 
 def repair_root_hierarchy(
@@ -1116,6 +1553,9 @@ def repair_root_hierarchy(
     *,
     d_bar: float,
     primary_surface_points: np.ndarray | None = None,
+    gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
+    primary_top_reference: np.ndarray | None = None,
+    attachment_evidence: dict[str, object] | None = None,
 ) -> tuple[list[RootPath], TopologyReport]:
     """Orient, attach, validate, and deterministically label a root tree.
 
@@ -1128,6 +1568,27 @@ def repair_root_hierarchy(
 
     report = TopologyReport()
     primary_path = np.asarray(primary_path, dtype=float)
+    gravity_direction = np.asarray(gravity, dtype=float)
+    if (
+        gravity_direction.shape != (3,)
+        or not np.all(np.isfinite(gravity_direction))
+        or np.linalg.norm(gravity_direction) <= 1e-12
+    ):
+        raise ValueError("gravity must contain three finite values and have non-zero length")
+    gravity_direction /= np.linalg.norm(gravity_direction)
+    if primary_top_reference is None:
+        top_reference_path = primary_path
+    else:
+        top_point = np.asarray(primary_top_reference, dtype=float)
+        if top_point.shape != (3,) or not np.all(np.isfinite(top_point)):
+            raise ValueError("primary_top_reference must contain one finite XYZ coordinate")
+        top_reference_path = top_point[None, :].copy()
+    primary_top_index = int(np.argmax(top_reference_path @ -gravity_direction))
+    report.primary_top_point_normalized = top_reference_path[
+        primary_top_index
+    ].tolist()
+    report.primary_top_reference_policy = "immutable_preprocessing_selection"
+    report.gravity_direction = gravity_direction.tolist()
     tolerance = max(6.0 * float(d_bar), 0.008)
     available: dict[str, RootPath] = {
         PRIMARY_ID: RootPath(
@@ -1154,6 +1615,19 @@ def repair_root_hierarchy(
     )
 
     repaired: list[RootPath] = []
+    attachment_root_refs: dict[str, RootPath] = {}
+    attachment_parent_refs: dict[str, RootPath | None] = {}
+    latest_attachment: dict[str, dict] = {}
+    if attachment_evidence is not None:
+        for stage in attachment_evidence.get("per_order", []):
+            for row in stage.get("assessment", {}).get("junctions", []):
+                latest_attachment[str(row["root_id"])] = row
+    rejected_neighbors = {
+        str(neighbor)
+        for row in latest_attachment.values()
+        if str(row.get("status", "")).startswith("rejected")
+        for neighbor in row.get("neighboring_insertions_for_reassessment", [])
+    }
     old_to_current: dict[str, str] = {PRIMARY_ID: PRIMARY_ID}
     reassigned_roots: set[str] = set()
     for path in provisional:
@@ -1168,13 +1642,36 @@ def repair_root_hierarchy(
         if not candidate_parents:
             candidate_parents = [available[PRIMARY_ID]]
         preferred_parent = old_to_current.get(str(path.parent_id), str(path.parent_id))
-        surface_attachment = _primary_surface_attachment(
+        footprint_status = str(latest_attachment.get(old_id, {}).get("status", ""))
+        constrained_parent = (bool(footprint_status) and
+                              footprint_status != "accepted") or old_id in rejected_neighbors
+        if constrained_parent:
+            attachment_root_refs[old_id] = path
+            attachment_parent_refs[old_id] = available.get(preferred_parent)
+            if "attachment_parent_unresolved" not in path.qc_flags:
+                path.qc_flags.append("attachment_parent_unresolved")
+            if preferred_parent in available and preferred_parent != old_id:
+                candidate_parents = [available[preferred_parent]]
+                report.attachment_constraint_decisions.append({
+                    "root_id_before_stable_ids": old_id,
+                    "footprint_status": footprint_status,
+                    "preferred_parent": preferred_parent,
+                    "decision": "retain_traced_parent_pending_direct_attachment_evidence",
+                })
+            else:
+                report.attachment_constraint_decisions.append({
+                    "root_id_before_stable_ids": old_id,
+                    "footprint_status": footprint_status,
+                    "preferred_parent": preferred_parent,
+                    "decision": "preferred_parent_unavailable_use_existing_topology_fallback",
+                })
+        surface_attachment = (None if constrained_parent else _primary_surface_attachment(
             path,
             primary_path,
             primary_surface,
             primary_surface_tree,
             d_bar=d_bar,
-        )
+        ))
         if surface_attachment is not None:
             (
                 endpoint,
@@ -1201,7 +1698,7 @@ def repair_root_hierarchy(
                 preferred_parent=preferred_parent,
                 tolerance=tolerance,
             )
-        attachment_evidence = (
+        raw_attachment_point = (
             np.asarray(path.raw_start_point, dtype=float).copy()
             if endpoint == 0 and path.raw_start_point is not None
             else np.asarray(path.points[-1], dtype=float).copy()
@@ -1211,7 +1708,7 @@ def repair_root_hierarchy(
             if path.node_indices is not None:
                 path.node_indices = path.node_indices[::-1].copy()
             report.roots_reoriented += 1
-        path.raw_start_point = attachment_evidence
+        path.raw_start_point = raw_attachment_point
         if parent.root_id != preferred_parent:
             reassigned_roots.add(old_id)
         path.parent_id = parent.root_id
@@ -1268,6 +1765,19 @@ def repair_root_hierarchy(
         if "cycle_repaired" not in weakest.qc_flags:
             weakest.qc_flags.append("cycle_repaired")
         report.cycles_removed += 1
+    (
+        repaired,
+        initial_above_top_details,
+        initial_above_top_descendants,
+    ) = _prune_above_primary_top_subtrees(
+        top_reference_path,
+        repaired,
+        gravity=gravity_direction,
+    )
+    report.above_primary_top_details.extend(initial_above_top_details)
+    report.descendants_of_above_top_roots_removed += (
+        initial_above_top_descendants
+    )
     reassigned_roots.update(
         _promote_base_attached_children(
             primary_path,
@@ -1308,11 +1818,15 @@ def repair_root_hierarchy(
     )
     reassigned_roots.update(duplicate_promotions)
     _refresh_parent_references(primary_path, repaired)
+    fork_decisions: list[dict[str, object]] = []
+    fork_queue_stats: dict[str, int] = {}
     fork_reconciliations, fork_reassignments = (
         _reconcile_overlong_forks(
             primary_path,
             repaired,
             d_bar=d_bar,
+            decision_log=fork_decisions,
+            queue_stats=fork_queue_stats,
         )
     )
     reassigned_roots.update(fork_reassignments)
@@ -1338,20 +1852,72 @@ def repair_root_hierarchy(
             "child_parent_length_ratio_before": item.child_parent_length_ratio,
             "arm_angle_degrees": item.arm_angle_degrees,
             "descendant_parent_changes": item.descendant_parent_changes,
+            "trigger": item.trigger,
+            "continuation_improvement_normalized": (
+                item.continuation_improvement
+            ),
+            "long_to_suffix_ratio": item.long_to_suffix_ratio,
+            "resurvey_iteration": item.resurvey_iteration,
         }
         for item in fork_reconciliations
     ]
+    report.fork_resurvey_iterations = int(
+        fork_queue_stats.get("iterations", 0)
+    )
+    report.fork_resurvey_cycle_states = int(
+        fork_queue_stats.get("cycle_states", 0)
+    )
+    report.fork_resurvey_decisions = fork_decisions
     report.parents_reassigned = len(reassigned_roots)
     (
         repaired,
         report.overlong_child_details,
         report.overlong_descendants_removed,
-    ) = _prune_overlong_child_subtrees(primary_path, repaired)
+    ) = _prune_overlong_child_subtrees(
+        primary_path,
+        repaired,
+        fork_decisions=fork_decisions,
+    )
     report.overlong_children_removed = len(report.overlong_child_details)
+    report.unresolved_long_arm_details = list(report.overlong_child_details)
+    repaired, final_above_top_details, final_above_top_descendants = (
+        _prune_above_primary_top_subtrees(
+            top_reference_path,
+            repaired,
+            gravity=gravity_direction,
+        )
+    )
+    report.above_primary_top_details.extend(final_above_top_details)
+    report.descendants_of_above_top_roots_removed += (
+        final_above_top_descendants
+    )
+    report.origins_above_primary_top_removed = len(
+        report.above_primary_top_details
+    )
     report.low_confidence_roots = sum(
         float(path.confidence) < 0.55 for path in repaired
     )
-    errors = validate_root_tree(repaired, primary_path=primary_path)
+    for decision in report.attachment_constraint_decisions:
+        original_id = str(decision["root_id_before_stable_ids"])
+        root = attachment_root_refs[original_id]
+        if not any(item is root for item in repaired):
+            decision["final_status"] = "removed_by_topology_repair"
+            continue
+        expected_parent = attachment_parent_refs[original_id]
+        preserved = (expected_parent is not None and
+                     root.parent_id == expected_parent.root_id)
+        decision.update(final_status="retained", final_root_id=str(root.root_id),
+                        final_parent_id=str(root.parent_id),
+                        final_order=int(root.order),
+                        traced_parent_preserved=bool(preserved))
+        if not preserved and "attachment_parent_changed_after_repair" not in root.qc_flags:
+            root.qc_flags.append("attachment_parent_changed_after_repair")
+    errors = validate_root_tree(
+        repaired,
+        primary_path=primary_path,
+        primary_top_reference=top_reference_path[primary_top_index],
+        gravity=gravity_direction,
+    )
     report.warnings.extend(errors)
     report.disconnected_roots = sum("missing parent" in error for error in errors)
     return repaired, report
@@ -1361,12 +1927,26 @@ def validate_root_tree(
     paths: Iterable[RootPath],
     *,
     primary_path: np.ndarray | None = None,
+    primary_top_reference: np.ndarray | None = None,
+    gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
 ) -> list[str]:
     """Return invariant violations; an empty result proves a rooted tree."""
 
     paths = list(paths)
     by_id = {path.root_id: path for path in paths}
     errors: list[str] = []
+    primary_reference = (
+        np.asarray(primary_path, dtype=float)
+        if primary_path is not None
+        else None
+    )
+    if primary_top_reference is None:
+        top_reference = primary_reference
+    else:
+        top_point = np.asarray(primary_top_reference, dtype=float)
+        if top_point.shape != (3,) or not np.all(np.isfinite(top_point)):
+            raise ValueError("primary_top_reference must contain one finite XYZ coordinate")
+        top_reference = top_point[None, :]
     if len(by_id) != len(paths):
         errors.append("root IDs are not unique")
     graph = nx.DiGraph()
@@ -1383,11 +1963,27 @@ def validate_root_tree(
             )
         if path.insertion_point is None or path.insertion_index is None:
             errors.append(f"{path.root_id}: insertion location is missing")
+        if top_reference is not None and len(top_reference):
+            origin = (
+                np.asarray(path.insertion_point, dtype=float)
+                if path.insertion_point is not None
+                else np.asarray(path.points[0], dtype=float)
+            )
+            excess, tolerance = primary_top_excess(
+                origin,
+                top_reference,
+                gravity=np.asarray(gravity, dtype=float),
+            )
+            if excess > tolerance:
+                errors.append(
+                    f"{path.root_id}: lateral origin is {excess:.9g} above "
+                    "the primary-root top along the configured up direction"
+                )
         parent_length: float | None = None
         if path.parent_id == PRIMARY_ID:
             reference = (
-                np.asarray(primary_path, dtype=float)
-                if primary_path is not None
+                primary_reference
+                if primary_reference is not None
                 else (
                     np.asarray(path.parent_points, dtype=float)
                     if path.parent_points is not None
@@ -1537,6 +2133,8 @@ def apply_hierarchy_corrections(
     correction_file: str | Path,
     *,
     normalization: Normalization | None = None,
+    gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
+    primary_top_reference: np.ndarray | None = None,
 ) -> list[RootPath]:
     """Apply validated parent/order/polyline edits from an exported hierarchy."""
 
@@ -1668,7 +2266,12 @@ def apply_hierarchy_corrections(
     # deleted ID to identify different geometry and would break correction
     # audit trails.  root_order is the authoritative post-edit order.
     _refresh_parent_references(np.asarray(primary_path, dtype=float), kept)
-    errors = validate_root_tree(kept, primary_path=primary_path)
+    errors = validate_root_tree(
+        kept,
+        primary_path=primary_path,
+        primary_top_reference=primary_top_reference,
+        gravity=gravity,
+    )
     if errors:
         raise ValueError("Invalid corrected hierarchy: " + "; ".join(errors))
     return kept

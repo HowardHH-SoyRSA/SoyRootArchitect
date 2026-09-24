@@ -98,6 +98,9 @@ def compute_traits(
             "tip_gravity_angle_deg": np.nan,
             "tip_start_gravity_angle_deg": np.nan,
             "tip_primary_angle_deg": np.nan,
+            "parent_connector_mode": "none",
+            "preserved_topology_length": 0.0,
+            "topology_path_length": primary_length,
             **_point_columns(
                 "root_start",
                 primary_original[0],
@@ -200,6 +203,13 @@ def compute_traits(
                 "angle_deg": base_parent_angle,
                 "exposed_body_length": path_length(body_original),
                 "parent_connector_length": path_length(original[:body_index + 1]) if body_index else 0.0,
+                "parent_connector_mode": lateral.centerline_assessment.get("parent_connector_mode", "not_assessed"),
+                "preserved_topology_length": (
+                    path_length(original[:body_index + 1])
+                    if lateral.centerline_assessment.get("parent_connector_mode") == "preserved_topology"
+                    else 0.0
+                ),
+                "topology_path_length": length,
                 "centerline_fit_status": lateral.centerline_assessment.get("status", "not_assessed"),
                 "base_parent_angle_deg": base_parent_angle,
                 "tip_angle_parent_deg": tip_parent_angle,
@@ -251,6 +261,17 @@ def compute_traits(
                 "gravity_dz": float(gravity[2]),
             }
         )
+        connector_mode = lateral.centerline_assessment.get("parent_connector_mode")
+        if connector_mode in {"preserved_topology", "retained_prior"}:
+            # Final ownership did not establish a measurable centreline for
+            # the preserved basal path (or any of the retained prior path).
+            record["length"] = np.nan
+            record["tortuosity"] = np.nan
+        if connector_mode == "retained_prior":
+            record["chord_length"] = np.nan
+            record["exposed_body_length"] = np.nan
+            record["volume"] = np.nan
+            record["volume_method"] = "unmeasurable_retained_prior_path"
         if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support"}:
             _mark_unmeasurable(record)
         records.append(record)
@@ -509,6 +530,8 @@ def _system_summary(
     assigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels >= 0))
     uncertain_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -2))
     unassigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -1))
+    unavailable_length_count = int(traits["length"].isna().sum())
+    unavailable_volume_count = int(traits["volume"].isna().sum())
     return {
         "root_count_total": int(len(traits)),
         "lateral_root_count_total": int(len(laterals)),
@@ -517,6 +540,8 @@ def _system_summary(
         "area_unit": "mesh_unit^2",
         "volume_unit": "mesh_unit^3",
         "root_system_length": float(traits["length"].sum()),
+        "root_system_length_complete": unavailable_length_count == 0,
+        "root_system_length_unavailable_root_count": unavailable_length_count,
         "primary_root_length": float(primary["length"].sum()),
         "lateral_root_length_sum": float(laterals["length"].sum()),
         "root_system_surface_area": whole_area,
@@ -526,6 +551,8 @@ def _system_summary(
         "primary_root_surface_area": float(primary["surface_area"].sum()),
         "lateral_root_surface_area_sum": float(laterals["surface_area"].sum()),
         "root_system_volume": whole_volume,
+        "root_system_volume_estimate_complete": exact_volume_available or unavailable_volume_count == 0,
+        "root_system_volume_estimate_unavailable_root_count": unavailable_volume_count,
         "root_system_volume_method": (
             "closed_manifold_component_volume" if exact_volume_available else "sum_centerline_frustum_estimates"
         ),

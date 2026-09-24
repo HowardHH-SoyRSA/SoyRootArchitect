@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.spatial import cKDTree
 
+import soyrootbio.pipeline as pipeline_module
 from soyrootbio.geometry import mean_nearest_neighbor_distance, normalize_unit_box, path_length
+from soyrootbio.lateral import LateralStart
 from soyrootbio.pipeline import _trace_lateral_orders
 from soyrootbio.topology import repair_root_hierarchy, validate_root_tree
 from soyrootbio.types import RootPath
@@ -59,6 +62,83 @@ def _trace_known_primary(
     repaired, _ = repair_root_hierarchy(primary, traced, d_bar=d_bar)
     assert validate_root_tree(repaired) == []
     return repaired, expected
+
+
+def test_tracing_rejects_start_above_primary_top_before_candidate_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    points = np.vstack(
+        [
+            primary,
+            np.array(
+                [
+                    [0.02, 0.0, 1.10],
+                    [0.03, 0.0, 1.12],
+                    [0.04, 0.0, 1.14],
+                    [0.05, 0.0, 1.16],
+                ]
+            ),
+        ]
+    )
+    primary_mask = np.zeros(len(points), dtype=bool)
+    primary_mask[: len(primary)] = True
+    invalid_start = LateralStart(
+        start_id=0,
+        point=points[3],
+        primary_point=np.array([0.0, 0.0, 1.05]),
+        primary_index=0,
+        member_indices=np.arange(3, len(points)),
+    )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "find_lateral_starting_points",
+        lambda *args, **kwargs: [invalid_start],
+    )
+
+    def fail_candidate_growth(*args, **kwargs):
+        raise AssertionError("an above-top start reached candidate growth")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "grow_lateral_candidates",
+        fail_candidate_growth,
+    )
+    report: dict[str, object] = {}
+
+    roots, starts, candidates, order_counts = _trace_lateral_orders(
+        points,
+        primary,
+        primary_mask,
+        d_bar=0.02,
+        max_root_order=3,
+        max_paths=None,
+        origin_report=report,
+    )
+
+    assert roots == []
+    assert starts == 1
+    assert candidates == 0
+    assert order_counts == {}
+    assert report["policy"] == "lateral-origin-at-or-below-primary-top-v1"
+    assert report["rejected_start_count"] == 1
+    assert report["rejected_refined_path_count"] == 0
+    assert report["per_order"] == [
+        {
+            "root_order": 1,
+            "detected_start_count": 1,
+            "eligible_start_count": 0,
+            "rejected_start_count": 1,
+            "rejected_refined_path_count": 0,
+        }
+    ]
 
 
 def test_clean_surface_branching_stops_at_junction_and_preserves_two_orders() -> None:

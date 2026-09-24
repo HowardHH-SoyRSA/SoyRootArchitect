@@ -6,7 +6,13 @@ from typing import Callable
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .geometry import nearest_path_tangent, point_to_polyline_distance, resample_polyline, tangent_vectors
+from .geometry import (
+    nearest_path_tangent,
+    path_length,
+    point_to_polyline_distance,
+    resample_polyline,
+    tangent_vectors,
+)
 from .primary import cluster_hdbscan
 from .types import RootPath
 from .runtime import worker_threads
@@ -19,6 +25,7 @@ MAIN_TRACER_STEP_DISTANCE_WEIGHT = 0.15
 MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT = 0.08
 MAIN_TRACER_OLD_DIRECTION_WEIGHT = 0.75
 MAIN_TRACER_NEW_DIRECTION_WEIGHT = 0.25
+FORK_HYPOTHESIS_MAX_PER_VARIANT = 2
 
 
 @dataclass
@@ -34,6 +41,11 @@ class LateralStart:
     surface_contact: bool = False
     surface_gap: float | None = None
     surface_contact_count: int = 0
+    tip_guard_exception: bool = False
+    tip_departure_support: int = 0
+    tip_departure_distance: float = 0.0
+    tip_departure_extent: float = 0.0
+    tip_departure_angle_degrees: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -102,7 +114,8 @@ def is_parent_tracking_candidate(
     """Return whether a candidate is an offset trace of its parent surface.
 
     Real laterals may share a basal insertion and may briefly curl toward the
-    collar, so insertion height alone is never a rejection reason.  A path is
+    collar. Within the global at-or-below-primary-top origin invariant, this
+    parent-tracking test does not reject on insertion height alone. A path is
     rejected only after a parent-radius-sized attachment region when it keeps
     tracking the parent envelope and either runs collarward or remains strongly
     parallel.  Sustained terminal escape always preserves the candidate.
@@ -315,6 +328,7 @@ def find_lateral_starting_points(
     parent_surface_points: np.ndarray | None = None,
     surface_contact_distance: float | None = None,
     parent_tree: cKDTree | None = None,
+    tip_departure_distance: float | None = None,
 ) -> list[LateralStart]:
     """Cluster non-primary points closest to the primary root as branch starts.
 
@@ -441,9 +455,6 @@ def find_lateral_starting_points(
             selected_surface_gap = None
             contact_count = 0
         start_point = cluster_points[best_member]
-        tip_guard_nodes = int(np.ceil(float(exclude_parent_tip_fraction) * len(primary_path)))
-        if tip_guard_nodes > 0 and primary_idx >= len(primary_path) - tip_guard_nodes:
-            continue
         radial_direction = start_point - primary_path[primary_idx]
         radial_norm = float(np.linalg.norm(radial_direction))
         radial_unit = (
@@ -518,6 +529,31 @@ def find_lateral_starting_points(
         branch_angle = max(pca_branch_angle, radial_branch_angle, extent_branch_angle)
         if branch_angle < float(minimum_branch_angle_degrees):
             continue
+        tip_guard_nodes = int(
+            np.ceil(float(exclude_parent_tip_fraction) * len(primary_path))
+        )
+        inside_tip_guard = bool(
+            tip_guard_nodes > 0
+            and primary_idx >= len(primary_path) - tip_guard_nodes
+        )
+        tip_exception = False
+        tip_evidence = {
+            "support": 0,
+            "departure": 0.0,
+            "extent": 0.0,
+            "angle": branch_angle,
+        }
+        if inside_tip_guard and tip_departure_distance is not None:
+            tip_exception, tip_evidence = _supported_tip_departure(
+                cluster_points,
+                primary_path[primary_idx],
+                direction / direction_norm,
+                branch_angle_degrees=branch_angle,
+                minimum_support=max(4, int(min_cluster_size)),
+                minimum_departure=float(tip_departure_distance),
+            )
+        if inside_tip_guard and not tip_exception:
+            continue
         starts.append(
             LateralStart(
                 start_id=len(starts),
@@ -531,6 +567,11 @@ def find_lateral_starting_points(
                 surface_contact=used_surface_contact,
                 surface_gap=selected_surface_gap,
                 surface_contact_count=contact_count,
+                tip_guard_exception=tip_exception,
+                tip_departure_support=int(tip_evidence["support"]),
+                tip_departure_distance=float(tip_evidence["departure"]),
+                tip_departure_extent=float(tip_evidence["extent"]),
+                tip_departure_angle_degrees=float(tip_evidence["angle"]),
             )
         )
     valid_labels = [label for label in np.unique(labels) if label >= 0]
@@ -567,9 +608,6 @@ def find_lateral_starting_points(
             used_surface_contact = False
             selected_surface_gap = None
             contact_count = 0
-        tip_guard_nodes = int(np.ceil(float(exclude_parent_tip_fraction) * len(primary_path)))
-        if tip_guard_nodes > 0 and primary_idx >= len(primary_path) - tip_guard_nodes:
-            return starts
         direction = seed_points[best_member] - primary_path[primary_idx]
         direction_norm = max(float(np.linalg.norm(direction)), 1e-12)
         branch_angle = float(
@@ -585,6 +623,31 @@ def find_lateral_starting_points(
         )
         if branch_angle < float(minimum_branch_angle_degrees):
             return starts
+        tip_guard_nodes = int(
+            np.ceil(float(exclude_parent_tip_fraction) * len(primary_path))
+        )
+        inside_tip_guard = bool(
+            tip_guard_nodes > 0
+            and primary_idx >= len(primary_path) - tip_guard_nodes
+        )
+        tip_exception = False
+        tip_evidence = {
+            "support": 0,
+            "departure": 0.0,
+            "extent": 0.0,
+            "angle": branch_angle,
+        }
+        if inside_tip_guard and tip_departure_distance is not None:
+            tip_exception, tip_evidence = _supported_tip_departure(
+                seed_points,
+                primary_path[primary_idx],
+                direction / direction_norm,
+                branch_angle_degrees=branch_angle,
+                minimum_support=max(4, int(min_cluster_size)),
+                minimum_departure=float(tip_departure_distance),
+            )
+        if inside_tip_guard and not tip_exception:
+            return starts
         starts.append(
             LateralStart(
                 0,
@@ -596,9 +659,64 @@ def find_lateral_starting_points(
                 surface_contact=used_surface_contact,
                 surface_gap=selected_surface_gap,
                 surface_contact_count=contact_count,
+                tip_guard_exception=tip_exception,
+                tip_departure_support=int(tip_evidence["support"]),
+                tip_departure_distance=float(tip_evidence["departure"]),
+                tip_departure_extent=float(tip_evidence["extent"]),
+                tip_departure_angle_degrees=float(tip_evidence["angle"]),
             )
         )
     return starts
+
+
+def _supported_tip_departure(
+    cluster_points: np.ndarray,
+    parent_point: np.ndarray,
+    direction: np.ndarray,
+    *,
+    branch_angle_degrees: float,
+    minimum_support: int,
+    minimum_departure: float,
+) -> tuple[bool, dict[str, float | int]]:
+    """Require a coherent departing tube before bypassing the parent-tip guard.
+
+    The final fraction of a parent is normally excluded because terminal-cap
+    points easily masquerade as a child seed.  A connected seed cluster may
+    bypass that guard only when it contains several points, departs at a clear
+    angle, reaches a sampling-scaled distance from the parent, and has sustained
+    extent along the departing direction.  This is deliberately a seed-only
+    exception; the candidate must still pass ordinary tracing and ownership
+    checks.
+    """
+
+    cluster = np.asarray(cluster_points, dtype=float)
+    origin = np.asarray(parent_point, dtype=float)
+    axis = np.asarray(direction, dtype=float)
+    axis /= max(float(np.linalg.norm(axis)), 1e-12)
+    vectors = cluster - origin
+    radial = np.linalg.norm(vectors, axis=1)
+    projection = vectors @ axis
+    departure = float(np.quantile(radial, 0.90)) if len(radial) else 0.0
+    positive_projection = projection[projection > 0.0]
+    extent = (
+        float(np.quantile(positive_projection, 0.90))
+        if len(positive_projection)
+        else 0.0
+    )
+    support = int(np.count_nonzero(projection >= 0.25 * minimum_departure))
+    accepted = bool(
+        len(cluster) >= int(minimum_support)
+        and support >= max(3, int(np.ceil(0.50 * minimum_support)))
+        and float(branch_angle_degrees) >= 30.0
+        and departure >= float(minimum_departure)
+        and extent >= 0.75 * float(minimum_departure)
+    )
+    return accepted, {
+        "support": support,
+        "departure": departure,
+        "extent": extent,
+        "angle": float(branch_angle_degrees),
+    }
 
 
 def grow_lateral_candidates(
@@ -690,7 +808,7 @@ def grow_lateral_candidates(
             for multiplier in multipliers:
                 step_length = max(multiplier * d_bar, 0.004)
                 for open_angle in angles:
-                    path = _grow_one_candidate(
+                    paths = _grow_candidate_hypotheses(
                         points=points,
                         point_tree=point_tree,
                         allowed_mask=allowed_mask,
@@ -705,11 +823,20 @@ def grow_lateral_candidates(
                         density_support_index=novel_support_index,
                         cooperate=cooperate,
                     )
-                    if len(path.points) >= 3:
+                    hypothesis_group = (
+                        f"{start.start_id}:{direction_label}:"
+                        f"{multiplier:g}:{int(open_angle)}"
+                    )
+                    for hypothesis_index, path in enumerate(paths):
+                        if len(path.points) < 3:
+                            continue
                         path.root_id = (
                             f"lateral_{start.start_id}_{direction_label}"
                             f"_s{multiplier:g}_a{int(open_angle)}"
+                            f"_h{hypothesis_index}"
                         )
+                        path.fork_hypothesis_group = hypothesis_group
+                        path.fork_hypothesis_index = hypothesis_index
                         path.novel_support_indices = _path_support_indices(
                             novel_support_index.tree,
                             path.points,
@@ -737,6 +864,10 @@ def grow_lateral_candidates(
                             + 20.0 * growth_length
                             + longest_path_reward
                             + path.score_components.get("trace_rank_score", 0.0)
+                            + path.score_components.get(
+                                "fork_hypothesis_evidence_score",
+                                0.0,
+                            )
                         )
                         path.start_index = start.start_id
                         candidates.append(path)
@@ -762,6 +893,256 @@ def grow_lateral_candidates(
     return candidates
 
 
+def _grow_candidate_hypotheses(
+    *,
+    points: np.ndarray,
+    point_tree: cKDTree,
+    allowed_mask: np.ndarray,
+    start: LateralStart,
+    initial_direction: np.ndarray,
+    primary_tangent: np.ndarray,
+    step_length: float,
+    open_angle: float,
+    max_steps: int,
+    search_radius: float,
+    limit_primary_angle_to_insertion: bool,
+    density_support_index: _SupportIndex | None,
+    cooperate: Callable[[], None] | None,
+) -> list[RootPath]:
+    """Trace the default route plus one sustained recent-fork alternative.
+
+    The alternate is produced by replaying the shared prefix and forcing one
+    angularly distinct, surface-supported proposal at the unresolved fork.
+    It is retained only when several subsequent nodes form a departing tube;
+    the proposal score at the fork cannot by itself create a hypothesis.
+    """
+
+    observations: list[dict[str, float | int]] = []
+    base = _grow_one_candidate(
+        points=points,
+        point_tree=point_tree,
+        allowed_mask=allowed_mask,
+        start=start,
+        initial_direction=initial_direction,
+        primary_tangent=primary_tangent,
+        step_length=step_length,
+        open_angle=open_angle,
+        max_steps=max_steps,
+        search_radius=search_radius,
+        limit_primary_angle_to_insertion=limit_primary_angle_to_insertion,
+        density_support_index=density_support_index,
+        cooperate=cooperate,
+        fork_observations=observations,
+    )
+    base_steps = max(0, len(base.points) - 2)
+    recent_window = max(6, min(14, int(np.ceil(0.25 * max(base_steps, 1)))))
+    recent = [
+        observation
+        for observation in observations
+        if base_steps - int(observation["step_index"]) <= recent_window
+    ]
+    if not recent:
+        base.score_components["fork_hypothesis_count"] = 1.0
+        return [base]
+
+    # Prefer the most distal supported separation.  Support, radius continuity,
+    # and the alternate score make the ordering deterministic when two events
+    # occur at the same step.
+    recent.sort(
+        key=lambda observation: (
+            int(observation["step_index"]),
+            float(observation["alternate_local_support"]),
+            float(observation["alternate_radius_similarity"]),
+            float(observation["alternate_step_score"]),
+            -int(observation["alternate_point_index"]),
+        ),
+        reverse=True,
+    )
+    retained: list[RootPath] = [base]
+    for observation in recent:
+        if len(retained) >= FORK_HYPOTHESIS_MAX_PER_VARIANT:
+            break
+        fork_step = int(observation["step_index"])
+        alternate = _grow_one_candidate(
+            points=points,
+            point_tree=point_tree,
+            allowed_mask=allowed_mask,
+            start=start,
+            initial_direction=initial_direction,
+            primary_tangent=primary_tangent,
+            step_length=step_length,
+            open_angle=open_angle,
+            max_steps=max_steps,
+            search_radius=search_radius,
+            limit_primary_angle_to_insertion=limit_primary_angle_to_insertion,
+            density_support_index=density_support_index,
+            cooperate=cooperate,
+            forced_step_indices={
+                fork_step: int(observation["alternate_point_index"])
+            },
+        )
+        common_prefix = _common_prefix_node_count(
+            base.points,
+            alternate.points,
+            tolerance=max(0.10 * float(step_length), 1e-9),
+        )
+        alternate_suffix = np.asarray(
+            alternate.points[max(0, common_prefix - 1) :],
+            dtype=float,
+        )
+        base_suffix = np.asarray(
+            base.points[max(0, common_prefix - 1) :],
+            dtype=float,
+        )
+        suffix_arc = path_length(alternate_suffix)
+        base_suffix_arc = path_length(base_suffix)
+        suffix_extent = (
+            float(np.linalg.norm(alternate_suffix[-1] - alternate_suffix[0]))
+            if len(alternate_suffix) >= 2
+            else 0.0
+        )
+        base_suffix_extent = (
+            float(np.linalg.norm(base_suffix[-1] - base_suffix[0]))
+            if len(base_suffix) >= 2
+            else 0.0
+        )
+        alternate_to_base, _ = cKDTree(base.points).query(
+            alternate_suffix,
+            k=1,
+            workers=worker_threads(),
+        )
+        departure = (
+            float(np.quantile(alternate_to_base, 0.75))
+            if len(alternate_to_base)
+            else 0.0
+        )
+        suffix_nodes = max(0, len(alternate.points) - common_prefix)
+        sustained = bool(
+            common_prefix >= 2
+            and suffix_nodes >= 4
+            and suffix_extent >= max(
+                3.0 * float(step_length),
+                0.75 * float(search_radius),
+            )
+            and suffix_extent / max(suffix_arc, 1e-12) >= 0.35
+            and departure >= max(
+                1.50 * float(search_radius),
+                2.25
+                * max(
+                    float(
+                        base.score_components.get(
+                            "trace_local_radius",
+                            0.0,
+                        )
+                    ),
+                    float(
+                        alternate.score_components.get(
+                            "trace_local_radius",
+                            0.0,
+                        )
+                    ),
+                ),
+            )
+            and float(observation["arm_angle_degrees"]) >= 42.0
+            and float(
+                alternate.score_components.get("trace_mean_support", 0.0)
+            )
+            >= 1.0
+        )
+        if not sustained:
+            continue
+        selected_support = float(observation["selected_local_support"])
+        alternate_support = float(observation["alternate_local_support"])
+        support_scale = max(selected_support, alternate_support, 1.0)
+        extent_scale = max(base_suffix_extent, suffix_extent, 1e-12)
+        selected_curvature = float(
+            base.score_components.get("trace_smoothness", 0.0)
+        )
+        alternate_curvature = float(
+            alternate.score_components.get("trace_smoothness", 0.0)
+        )
+        selected_evidence_score = float(
+            0.30 * selected_support / support_scale
+            + 0.25 * float(observation["selected_radius_similarity"])
+            + 0.20 * selected_curvature
+            + 0.25 * base_suffix_extent / extent_scale
+        )
+        alternate_evidence_score = float(
+            0.30 * alternate_support / support_scale
+            + 0.25 * float(observation["alternate_radius_similarity"])
+            + 0.20 * alternate_curvature
+            + 0.25 * suffix_extent / extent_scale
+        )
+        for path, hypothesis_index in ((base, 0), (alternate, 1)):
+            path.fork_hypothesis_index = hypothesis_index
+            path.fork_common_prefix_nodes = common_prefix
+            path.score_components.update(
+                {
+                    "fork_hypothesis_count": 2.0,
+                    "fork_hypothesis_index": float(hypothesis_index),
+                    "fork_common_prefix_nodes": float(common_prefix),
+                    "fork_step_index": float(fork_step),
+                    "fork_arm_angle_degrees": float(
+                        observation["arm_angle_degrees"]
+                    ),
+                    "fork_selected_local_support": float(
+                        observation["selected_local_support"]
+                    ),
+                    "fork_alternate_local_support": float(
+                        observation["alternate_local_support"]
+                    ),
+                    "fork_selected_radius_similarity": float(
+                        observation["selected_radius_similarity"]
+                    ),
+                    "fork_alternate_radius_similarity": float(
+                        observation["alternate_radius_similarity"]
+                    ),
+                    "fork_selected_local_radius": float(
+                        observation["selected_local_radius"]
+                    ),
+                    "fork_alternate_local_radius": float(
+                        observation["alternate_local_radius"]
+                    ),
+                    "fork_alternate_departure": departure,
+                    "fork_alternate_supported_extent": suffix_extent,
+                    "fork_alternate_supported_arc": suffix_arc,
+                    "fork_selected_supported_extent": base_suffix_extent,
+                    "fork_selected_supported_arc": base_suffix_arc,
+                    "fork_selected_curvature_window_smoothness": (
+                        selected_curvature
+                    ),
+                    "fork_alternate_curvature_window_smoothness": (
+                        alternate_curvature
+                    ),
+                    "fork_hypothesis_evidence_score": (
+                        selected_evidence_score
+                        if hypothesis_index == 0
+                        else alternate_evidence_score
+                    ),
+                }
+            )
+        retained.append(alternate)
+    base.score_components["fork_hypothesis_count"] = float(len(retained))
+    return retained
+
+
+def _common_prefix_node_count(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    tolerance: float,
+) -> int:
+    count = 0
+    for left_point, right_point in zip(
+        np.asarray(left, dtype=float),
+        np.asarray(right, dtype=float),
+    ):
+        if float(np.linalg.norm(left_point - right_point)) > float(tolerance):
+            break
+        count += 1
+    return count
+
+
 def _grow_one_candidate(
     points: np.ndarray,
     point_tree: cKDTree,
@@ -779,13 +1160,10 @@ def _grow_one_candidate(
     cooperate: Callable[[], None] | None = None,
     density_support_mask: np.ndarray | None = None,
     density_support_index: _SupportIndex | None = None,
+    forced_step_indices: dict[int, int] | None = None,
+    fork_observations: list[dict[str, float | int]] | None = None,
 ) -> RootPath:
-    """Grow one greedy trace while following its evolving local tangent.
-
-    Only one hypothesis is emitted for each parameter combination.  Radius
-    continuity is a soft tie-breaker, and curvature terms affect only the
-    final path score; neither can create an alternate fork or child root.
-    """
+    """Grow one trace and optionally record or force supported fork choices."""
 
     allowed = np.asarray(allowed_mask, dtype=bool)
     if allowed.shape != (len(points),):
@@ -980,7 +1358,90 @@ def _grow_one_candidate(
             base_score
             + MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT * radius_similarity
         )
-        best_position = int(np.argmax(score))
+        ranked_positions = np.argsort(-score, kind="stable")
+        best_position = int(ranked_positions[0])
+        forced_step = bool(
+            forced_step_indices and step_index in forced_step_indices
+        )
+        if forced_step:
+            forced_matches = np.flatnonzero(
+                local == int(forced_step_indices[step_index])
+            )
+            if len(forced_matches):
+                best_position = int(forced_matches[0])
+        if fork_observations is not None and len(ranked_positions) > 1:
+            selected_direction = unit[best_position]
+            selected_density = float(density[best_position])
+            selected_score = float(score[best_position])
+            for alternate_position_raw in ranked_positions:
+                alternate_position = int(alternate_position_raw)
+                if alternate_position == best_position:
+                    continue
+                separation = float(
+                    np.degrees(
+                        np.arccos(
+                            np.clip(
+                                np.dot(
+                                    selected_direction,
+                                    unit[alternate_position],
+                                ),
+                                -1.0,
+                                1.0,
+                            )
+                        )
+                    )
+                )
+                if separation < 42.0 or separation > 145.0:
+                    continue
+                alternate_density = float(density[alternate_position])
+                alternate_score = float(score[alternate_position])
+                if alternate_density < max(
+                    float(minimum_local_support),
+                    0.35 * selected_density,
+                ):
+                    continue
+                # The turn term alone can differ by 0.57 for a right-angle
+                # fork. Keep the alternate for sustained-window validation;
+                # the one-point tangent preference must not suppress it here.
+                if alternate_score < selected_score - 0.75:
+                    continue
+                fork_observations.append(
+                    {
+                        "step_index": int(step_index),
+                        "selected_point_index": int(local[best_position]),
+                        "alternate_point_index": int(local[alternate_position]),
+                        "arm_angle_degrees": separation,
+                        "selected_step_score": selected_score,
+                        "alternate_step_score": alternate_score,
+                        "selected_local_support": selected_density,
+                        "alternate_local_support": alternate_density,
+                        "selected_radius_similarity": float(
+                            radius_similarity[best_position]
+                        ),
+                        "alternate_radius_similarity": float(
+                            radius_similarity[alternate_position]
+                        ),
+                        "selected_local_radius": float(
+                            shortlisted_radii[int(selected_radius_match[0])]
+                        )
+                        if len(
+                            selected_radius_match := np.flatnonzero(
+                                shortlist == best_position
+                            )
+                        )
+                        else 0.0,
+                        "alternate_local_radius": float(
+                            shortlisted_radii[int(alternate_radius_match[0])]
+                        )
+                        if len(
+                            alternate_radius_match := np.flatnonzero(
+                                shortlist == alternate_position
+                            )
+                        )
+                        else 0.0,
+                    }
+                )
+                break
         next_index = int(local[best_position])
         next_point = np.asarray(points[next_index], dtype=float)
         segment = next_point - current
@@ -1013,8 +1474,12 @@ def _grow_one_candidate(
             radius_observations += 1
 
         evolved_direction = (
-            MAIN_TRACER_OLD_DIRECTION_WEIGHT * direction
-            + MAIN_TRACER_NEW_DIRECTION_WEIGHT * new_direction
+            new_direction
+            if forced_step
+            else (
+                MAIN_TRACER_OLD_DIRECTION_WEIGHT * direction
+                + MAIN_TRACER_NEW_DIRECTION_WEIGHT * new_direction
+            )
         )
         direction = evolved_direction / max(
             float(np.linalg.norm(evolved_direction)),
@@ -1123,6 +1588,13 @@ def _grow_one_candidate(
             "surface_seed_contact_count": float(
                 start.surface_contact_count
             ),
+            "tip_guard_exception": float(start.tip_guard_exception),
+            "tip_departure_support": float(start.tip_departure_support),
+            "tip_departure_distance": float(start.tip_departure_distance),
+            "tip_departure_extent": float(start.tip_departure_extent),
+            "tip_departure_angle_degrees": float(
+                start.tip_departure_angle_degrees
+            ),
         }
     )
     return path
@@ -1147,6 +1619,7 @@ def _adaptive_minimum_travel_fraction(
 
 
 TIP_EXTENSION_MAX_STEPS = 90
+TIP_EXTENSION_BATCH_STEPS = 30
 
 
 def extend_lateral_tip(
@@ -1271,6 +1744,137 @@ def extend_lateral_tip(
     return path
 
 
+def resume_lateral_tip_in_batches(
+    points: np.ndarray,
+    path: RootPath,
+    blocked_mask: np.ndarray,
+    d_bar: float,
+    *,
+    max_steps: int = TIP_EXTENSION_MAX_STEPS,
+    batch_steps: int = TIP_EXTENSION_BATCH_STEPS,
+    min_support: int = 4,
+    point_tree: cKDTree | None = None,
+    cooperate: Callable[[], None] | None = None,
+) -> RootPath:
+    """Resume supported growth in bounded, ownership-safe batches.
+
+    Each batch re-probes unowned support from the newly accepted tip. A batch
+    is rolled back if its support overlaps a blocked owner or its endpoint
+    loops into a nonterminal part of the existing path. The total cap remains
+    unchanged; batching only permits evidence to be reconsidered between caps.
+    """
+
+    cloud = np.asarray(points, dtype=float)
+    blocked = np.asarray(blocked_mask, dtype=bool).copy()
+    if blocked.shape != (len(cloud),):
+        raise ValueError("blocked_mask must have one value per point")
+    tree = point_tree if point_tree is not None else cKDTree(cloud)
+    total_step_limit = max(1, int(max_steps))
+    per_batch = max(3, int(batch_steps))
+    total_steps = 0
+    total_length = 0.0
+    total_new_support = 0
+    accepted_batches = 0
+    loop_rejections = 0
+    ownership_rejections = 0
+    stopped_on_open_support = False
+
+    while total_steps < total_step_limit:
+        if cooperate is not None:
+            cooperate()
+        before_points = np.asarray(path.points, dtype=float).copy()
+        before_covered = set(path.covered_indices)
+        before_node_indices = path.node_indices
+        remaining = total_step_limit - total_steps
+        this_batch_limit = min(per_batch, remaining)
+        extend_lateral_tip(
+            cloud,
+            path,
+            blocked,
+            d_bar,
+            max_steps=this_batch_limit,
+            min_support=min_support,
+            point_tree=tree,
+            cooperate=cooperate,
+        )
+        accepted = bool(
+            path.score_components.get("tip_continuation_accepted", 0.0)
+            > 0.0
+        )
+        if not accepted:
+            break
+        batch_steps_added = int(
+            path.score_components.get("tip_extension_steps", 0.0)
+        )
+        batch_length = float(
+            path.score_components.get("tip_extension_length", 0.0)
+        )
+        new_support = set(path.covered_indices) - before_covered
+        ownership_collision = any(
+            blocked[index]
+            for index in new_support
+            if 0 <= int(index) < len(blocked)
+        )
+        loop_reentry = False
+        if len(before_points) >= 5 and len(path.points) > len(before_points):
+            protected_prefix = before_points[:-3]
+            if len(protected_prefix):
+                loop_gap, _ = cKDTree(protected_prefix).query(
+                    np.asarray(path.points[-1], dtype=float),
+                    k=1,
+                    workers=worker_threads(),
+                )
+                loop_reentry = bool(
+                    float(loop_gap) <= max(4.0 * float(d_bar), 0.006)
+                )
+        if ownership_collision or loop_reentry:
+            path.points = before_points
+            path.covered_indices = before_covered
+            path.node_indices = before_node_indices
+            path.score_components["tip_continuation_accepted"] = 0.0
+            if ownership_collision:
+                ownership_rejections += 1
+            if loop_reentry:
+                loop_rejections += 1
+            break
+
+        accepted_batches += 1
+        total_steps += batch_steps_added
+        total_length += batch_length
+        total_new_support += len(new_support)
+        if new_support:
+            blocked[np.asarray(sorted(new_support), dtype=int)] = True
+        hit_batch_cap = batch_steps_added >= this_batch_limit
+        if not hit_batch_cap:
+            stopped_on_open_support = True
+            break
+
+    path.score_components.update(
+        {
+            "tip_continuation_accepted": float(accepted_batches > 0),
+            "tip_extension_steps": float(total_steps),
+            "tip_extension_length": float(total_length),
+            "tip_continuation_new_support": float(total_new_support),
+            "tip_extension_batches": float(accepted_batches),
+            "tip_extension_batch_steps": float(per_batch),
+            "tip_extension_loop_rejections": float(loop_rejections),
+            "tip_extension_ownership_rejections": float(
+                ownership_rejections
+            ),
+            "tip_extension_hit_limit": float(
+                total_steps >= total_step_limit
+                and not stopped_on_open_support
+            ),
+        }
+    )
+    if path.score_components["tip_extension_hit_limit"] > 0.0:
+        if "tip_extension_limit" not in path.qc_flags:
+            path.qc_flags.append("tip_extension_limit")
+    elif "tip_extension_limit" in path.qc_flags:
+        path.qc_flags.remove("tip_extension_limit")
+    return path
+
+
 def _tip_direction(path: np.ndarray, *, window: float) -> np.ndarray:
     path = np.asarray(path, dtype=float)
     segment_lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
@@ -1372,8 +1976,18 @@ def _endpoint_consensus_variants(members: list[RootPath]) -> list[RootPath]:
     consensus result is retained so sparse starts are not discarded outright.
     """
 
+    deferred = [
+        path for path in members if int(path.fork_hypothesis_index) > 0
+    ]
+    members = [
+        path for path in members if int(path.fork_hypothesis_index) == 0
+    ]
+    if not members:
+        return []
     if len(members) <= 1:
-        return list(members)
+        representatives = list(members)
+        _attach_deferred_fork_hypotheses(representatives, deferred)
+        return representatives
     mode_clusters = _endpoint_mode_clusters(members)
     supported = [cluster for cluster in mode_clusters if len(cluster) >= 2]
     if not supported:
@@ -1398,7 +2012,52 @@ def _endpoint_consensus_variants(members: list[RootPath]) -> list[RootPath]:
     for mode_index, representative in enumerate(representatives):
         representative.score_components["variant_endpoint_mode_count"] = float(len(representatives))
         representative.score_components["variant_endpoint_mode_index"] = float(mode_index)
+    _attach_deferred_fork_hypotheses(representatives, deferred)
     return representatives
+
+
+def _attach_deferred_fork_hypotheses(
+    representatives: list[RootPath],
+    deferred: list[RootPath],
+) -> None:
+    """Keep alternate geometry for later-order tracing and topology review.
+
+    A forced fork arm is mutually exclusive with the ordinary continuation of
+    the same parameter trace. It therefore cannot become an additional root at
+    the current order. Repeatable alternate endpoint modes are retained on the
+    selected continuation as evidence; unassigned surface remains available to
+    the next-order pass, where the arm can become a child and enter the stable
+    fork-resurvey queue.
+    """
+
+    if not representatives or not deferred:
+        return
+    clusters = _endpoint_mode_clusters(deferred)
+    supported = [cluster for cluster in clusters if len(cluster) >= 2]
+    retained: list[RootPath] = []
+    for cluster in supported[:2]:
+        retained.append(
+            _endpoint_consensus_variant(
+                [deferred[index] for index in cluster]
+            )
+        )
+    if not retained:
+        return
+    records = [
+        {
+            "root_id": str(path.root_id),
+            "common_prefix_nodes": int(path.fork_common_prefix_nodes),
+            "points_normalized": np.asarray(path.points, dtype=float).copy(),
+            "score_components": dict(path.score_components),
+            "reason": "mutually_exclusive_continuation_deferred_to_topology",
+        }
+        for path in retained
+    ]
+    for representative in representatives:
+        representative.deferred_fork_hypotheses = list(records)
+        representative.score_components[
+            "deferred_fork_hypothesis_modes"
+        ] = float(len(records))
 
 
 def _endpoint_mode_clusters(members: list[RootPath]) -> list[list[int]]:

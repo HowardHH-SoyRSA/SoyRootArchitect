@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from copy import deepcopy
 import json
 import logging
 from pathlib import Path
@@ -14,6 +15,18 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from .collar import analyze_joint_collar
+from .attachment_constraint import (
+    AttachmentBounds,
+    assess_attachment_footprints,
+    mark_final_attachment_qc,
+    restrict_rejected_contacts,
+)
+from .final_surface_cleanup import cleanup_final_surface
+from .primary_contact import (
+    mark_higher_order_primary_contact_qc,
+    restrict_higher_order_primary_contacts,
+)
+from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
 from .junction_transections import trim_primary_junctions
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
@@ -27,7 +40,11 @@ from .primary_guidance import (
     PrimaryGuidance,
     write_primary_guidance,
 )
-from .geometry import mean_nearest_neighbor_distance, normalize_unit_box
+from .geometry import (
+    is_above_primary_top,
+    mean_nearest_neighbor_distance,
+    normalize_unit_box,
+)
 from .io import load_root_geometry
 from .lateral import (
     MAIN_TRACER_LOCAL_DENSITY_WEIGHT,
@@ -40,12 +57,12 @@ from .lateral import (
     TIP_EXTENSION_MAX_STEPS,
     backtrace_to_primary,
     estimate_parent_radius_profile,
-    extend_lateral_tip,
     find_lateral_starting_points,
     grow_lateral_candidates,
     is_ancestor_inward_candidate,
     is_parent_tracking_candidate,
     reduce_similar_paths,
+    resume_lateral_tip_in_batches,
     select_non_overlapping_paths,
 )
 from .primary import (
@@ -162,6 +179,11 @@ class PipelineConfig:
     tip_vector_window_mesh_units: float = 2.0
     worker_threads: int | None = None
     random_seed: int = 42
+    attachment_area_multiplier: float = 1.5
+    attachment_angle_factor_cap: float = 1.5
+    attachment_longitudinal_radii: float = 5.0
+    attachment_geodesic_diameter_radii: float = 6.0
+    attachment_maximum_inverse_compactness: float = 6.0
 
 
 @dataclass
@@ -181,6 +203,73 @@ class PipelineResult:
     primary_candidates: list[PrimaryCandidate] | None = None
     topology_report: TopologyReport | None = None
     traits: pd.DataFrame | None = None
+
+
+def _merge_final_contact_proposals(
+    frozen: np.ndarray, parent_proposal: np.ndarray, parent_report: dict,
+    attachment_proposal: np.ndarray, attachment_restriction: dict,
+    roots: list[RootPath],
+) -> np.ndarray:
+    """Combine independent frozen-label decisions without splitting a patch.
+
+    Withhold a child transfer if proposals compete on its vertices or if the
+    recipient parent's seam is being cut in the same snapshot. Other roots'
+    proposals remain independent.
+    """
+    before = np.asarray(frozen, int)
+    parent = np.asarray(parent_proposal, int)
+    attachment = np.asarray(attachment_proposal, int)
+    if parent.shape != before.shape or attachment.shape != before.shape:
+        raise ValueError("final contact proposals must match frozen labels")
+    parent_changed = parent != before
+    attachment_changed = attachment != before
+    conflicted = np.unique(before[parent_changed & attachment_changed])
+    conflicted = conflicted[conflicted > 0]
+    # A transfer to a recipient whose own proximal seam is being cut has no
+    # frozen proof that the recipient remains connected after both decisions.
+    by_id = {"primary": 0, **{root.root_id: i for i, root in enumerate(roots, 1)}}
+    restricted_labels = set(np.unique(before[attachment_changed]).tolist())
+    recipient_conflicts = {
+        int(row["label"]) for row in parent_report["contacts"]
+        if row["status"] == "reassigned_to_supported_parent"
+        and by_id.get(row["parent_id"]) in restricted_labels
+    }
+    if recipient_conflicts:
+        conflicted = np.union1d(conflicted, np.fromiter(recipient_conflicts, int))
+    conflict_ids = {roots[int(label) - 1].root_id for label in conflicted}
+    suppressed = np.isin(before, conflicted) if len(conflicted) else np.zeros(len(before), bool)
+    accepted_parent = parent_changed & ~suppressed
+    accepted_attachment = attachment_changed & ~suppressed
+    result = before.copy()
+    result[accepted_parent] = parent[accepted_parent]
+    result[accepted_attachment] = attachment[accepted_attachment]
+
+    parent_report["proposed_changed_vertex_count"] = int(np.count_nonzero(parent_changed))
+    parent_report["changed_vertex_count"] = int(np.count_nonzero(accepted_parent))
+    parent_report["competing_restriction_root_ids"] = sorted(conflict_ids)
+    parent_report["recipient_restriction_root_ids"] = sorted(
+        roots[label - 1].root_id for label in recipient_conflicts)
+    for row in parent_report["contacts"]:
+        if row["status"] == "reassigned_to_supported_parent" and row["root_id"] in conflict_ids:
+            row["status"] = "unresolved_competing_restriction"
+            row["changed_vertex_count"] = 0
+            parent_report["unresolved_patch_count"] += 1
+    if parent_report.get("status") != "unresolved_no_mesh":
+        parent_report["status"] = (
+            "unresolved_contacts" if parent_report["unresolved_patch_count"]
+            else "corrected" if parent_report["changed_vertex_count"] else "clear"
+        )
+    attachment_restriction["proposed_changed_vertex_count"] = int(np.count_nonzero(attachment_changed))
+    attachment_restriction["changed_vertex_count"] = int(np.count_nonzero(accepted_attachment))
+    attachment_restriction["suppressed_due_to_parent_claim_root_ids"] = sorted(conflict_ids)
+    attachment_restriction["changed_by_root"] = {
+        root_id: indices for root_id, indices in attachment_restriction["changed_by_root"].items()
+        if root_id not in conflict_ids
+    }
+    attachment_restriction["status"] = (
+        "unresolved_competing_parent_claim" if conflict_ids else "applied_or_clear"
+    )
+    return result
 
 
 def run_pipeline(
@@ -217,6 +306,13 @@ def _run_pipeline_impl(
     into a rooted acyclic hierarchy before orders and traits are calculated.
     """
     _validate_config(config)
+    attachment_bounds = AttachmentBounds(
+        area_multiplier=config.attachment_area_multiplier,
+        angle_factor_cap=config.attachment_angle_factor_cap,
+        longitudinal_radii=config.attachment_longitudinal_radii,
+        geodesic_diameter_radii=config.attachment_geodesic_diameter_radii,
+        maximum_inverse_compactness=config.attachment_maximum_inverse_compactness,
+    )
     cooperate = lambda: _cooperate(cancel_check, pause_check)
     timings: dict[str, float] = {}
     pipeline_started = time.perf_counter()
@@ -276,6 +372,10 @@ def _run_pipeline_impl(
         manual_guidance=manual_guidance,
     )
     selected_base = np.asarray(coarse_primary.points[0], dtype=float).copy()
+    # Freeze the user-selected or automatically selected collar/top before
+    # segmentation and all later centreline refits.  Every lateral-origin
+    # invariant uses this same biological reference for the whole run.
+    primary_top_reference = selected_base.copy()
     direction_index = max(
         1,
         min(len(coarse_primary.points) - 1, int(np.ceil(0.02 * len(coarse_primary.points)))),
@@ -345,6 +445,17 @@ def _run_pipeline_impl(
     LOGGER.info("Primary segmentation assigned %d/%d points", int(primary_mask.sum()), len(primary_mask))
     checkpoint("primary_segmentation", "Segmented and refined primary root", 0.46)
 
+    full_normalized = normalization.transform_points(cloud.export_points)
+    full_above_base_mask = _selected_base_exclusion_mask(
+        full_normalized,
+        selected_base,
+        base_tipward_direction,
+        gravity=np.asarray(config.gravity, dtype=float),
+        collar_neighborhood_radius=base_collar_neighborhood_radius,
+        tolerance=base_tolerance,
+    )
+    attachment_constraint_report: dict[str, object] = {"per_order": []}
+    lateral_origin_report: dict[str, object] = {}
     selected, lateral_start_count, candidate_count, order_counts = _trace_lateral_orders(
         normalized,
         primary.points,
@@ -354,6 +465,15 @@ def _run_pipeline_impl(
         max_paths=config.lateral_max_paths,
         excluded_mask=above_base_mask,
         cooperate=cooperate,
+        gravity=np.asarray(config.gravity, dtype=float),
+        primary_top_reference=primary_top_reference,
+        origin_report=lateral_origin_report,
+        mesh_points=full_normalized,
+        mesh_triangles=cloud.triangles,
+        mesh_excluded_mask=full_above_base_mask,
+        analysis_to_mesh=cloud.analysis_indices,
+        attachment_report=attachment_constraint_report,
+        attachment_bounds=attachment_bounds,
     )
     checkpoint("lateral_tracing", "Repairing root topology", 0.70)
     if lateral_start_count == 0:
@@ -365,6 +485,9 @@ def _run_pipeline_impl(
         primary_surface_points=normalized[
             np.asarray(primary_mask, dtype=bool) & ~above_base_mask
         ],
+        gravity=np.asarray(config.gravity, dtype=float),
+        primary_top_reference=primary_top_reference,
+        attachment_evidence=attachment_constraint_report,
     )
     correction_input_fingerprints = {
         "primary": _polyline_fingerprint(primary.points),
@@ -376,13 +499,28 @@ def _run_pipeline_impl(
             selected,
             config.correction_file,
             normalization=normalization,
+            gravity=np.asarray(config.gravity, dtype=float),
+            primary_top_reference=primary_top_reference,
         )
     topology_errors = validate_root_tree(
         selected,
         primary_path=primary.points,
+        primary_top_reference=primary_top_reference,
+        gravity=np.asarray(config.gravity, dtype=float),
     )
     if topology_errors:
         raise RuntimeError("Root topology validation failed: " + "; ".join(topology_errors))
+    if cloud.triangles is not None and len(cloud.triangles):
+        topology_mesh_labels = _assign_full_root_labels(
+            full_normalized, primary.points, selected, d_bar=d_bar,
+            excluded_mask=full_above_base_mask,
+        )
+        attachment_constraint_report["after_topology_repair"] = assess_attachment_footprints(
+            full_normalized, topology_mesh_labels, primary.points, selected,
+            triangles=cloud.triangles, d_bar=d_bar,
+            excluded_mask=full_above_base_mask,
+            bounds=attachment_bounds,
+        )
     checkpoint("topology_repair", "Assigning root vertices", 0.76)
     segmented_primary_mask = np.asarray(primary_mask, dtype=bool).copy()
     lateral_labels, analysis_competing_labels = _assign_lateral_points(
@@ -417,15 +555,6 @@ def _run_pipeline_impl(
         analysis_root_labels > 0
     ]
     lateral_labels[analysis_root_labels == -2] = -1
-    full_normalized = normalization.transform_points(cloud.export_points)
-    full_above_base_mask = _selected_base_exclusion_mask(
-        full_normalized,
-        selected_base,
-        base_tipward_direction,
-        gravity=np.asarray(config.gravity, dtype=float),
-        collar_neighborhood_radius=base_collar_neighborhood_radius,
-        tolerance=base_tolerance,
-    )
     full_root_labels, full_competing_labels = _assign_full_root_labels(
         full_normalized,
         primary.points,
@@ -450,6 +579,8 @@ def _run_pipeline_impl(
         topology_errors = validate_root_tree(
             selected,
             primary_path=primary.points,
+            primary_top_reference=primary_top_reference,
+            gravity=np.asarray(config.gravity, dtype=float),
         )
         if topology_errors:
             raise RuntimeError(
@@ -542,6 +673,35 @@ def _run_pipeline_impl(
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=full_above_base_mask,
     )
+    # Resolve remaining unsupported islands and bounded holes against local,
+    # mesh-connected exposed-body support before centerlines see final labels.
+    # Preserve both the shoot-side exclusion and the joint-collar decision.
+    full_root_labels, final_surface_cleanup_report = cleanup_final_surface(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=patch_excluded,
+    )
+    # Resolve non-parent contact before final attachment QC and centerline
+    # fitting, so both use the corrected full-resolution labels.
+    full_root_labels, primary_contact_report = restrict_higher_order_primary_contacts(
+        full_normalized, full_root_labels, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        excluded_mask=patch_excluded,
+    )
+    final_attachment = assess_attachment_footprints(
+        full_normalized, full_root_labels, primary.points, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        excluded_mask=full_above_base_mask,
+        bounds=attachment_bounds,
+    )
+    full_root_labels, final_attachment_restriction = restrict_rejected_contacts(
+        full_root_labels, final_attachment, selected, full_normalized,
+        triangles=cloud.triangles, d_bar=d_bar,
+    )
+    attachment_constraint_report["after_ownership_cleanup"] = final_attachment
+    attachment_constraint_report["final_contact_restriction"] = final_attachment_restriction
+    mark_final_attachment_qc(selected, final_attachment)
+    mark_higher_order_primary_contact_qc(selected, primary_contact_report)
     cleaned_analysis_labels: np.ndarray | None = None
     if analysis_to_full is not None:
         cleaned_analysis_labels = full_root_labels[analysis_to_full]
@@ -565,16 +725,104 @@ def _run_pipeline_impl(
         int(surface_patch_report["reassigned_patch_count"]),
         int(surface_patch_report["reassigned_vertex_count"]),
     )
-    checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
-    primary.points, final_centerline_report = refit_final_centerlines(
-        full_normalized,
-        full_root_labels,
-        primary.points,
-        selected,
-        d_bar=d_bar,
-        triangles=cloud.triangles,
-        cooperate=cooperate,
+    LOGGER.info(
+        "Final surface cleanup moved %d island, unassigned %d unsupported island, and filled %d hole vertices",
+        int(final_surface_cleanup_report["reassigned_island_vertex_count"]),
+        int(final_surface_cleanup_report["unassigned_island_vertex_count"]),
+        int(final_surface_cleanup_report["filled_hole_vertex_count"]),
     )
+    checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
+    fit_input_primary = deepcopy(primary)
+    fit_input_roots = deepcopy(selected)
+    parent_contact_passes: list[dict] = []
+    postfit_attachment_passes: list[dict] = []
+    for pass_index in range(4):
+        # Refit each label snapshot from the same pre-fit curves. A prior fit
+        # cannot silently move the selected biological top or become evidence
+        # for the next ownership decision.
+        primary = deepcopy(fit_input_primary)
+        selected = deepcopy(fit_input_roots)
+        primary.points, final_centerline_report = refit_final_centerlines(
+            full_normalized,
+            full_root_labels,
+            primary.points,
+            selected,
+            d_bar=d_bar,
+            triangles=cloud.triangles,
+            gravity=np.asarray(config.gravity, dtype=float),
+            primary_top_reference=primary_top_reference,
+            cooperate=cooperate,
+        )
+        frozen_labels = full_root_labels.copy()
+        attachment_assessment = assess_attachment_footprints(
+            full_normalized, frozen_labels, primary.points, selected,
+            triangles=cloud.triangles, d_bar=d_bar,
+            excluded_mask=full_above_base_mask,
+            bounds=attachment_bounds,
+        )
+        attachment_proposal, attachment_restriction = restrict_rejected_contacts(
+            frozen_labels, attachment_assessment, selected, full_normalized,
+            triangles=cloud.triangles, d_bar=d_bar,
+        )
+        parent_proposal, parent_contact_report = reconcile_parent_contacts(
+            full_normalized, frozen_labels, primary.points, selected,
+            triangles=cloud.triangles, d_bar=d_bar,
+            cleanup_report=final_surface_cleanup_report,
+            excluded_mask=patch_excluded,
+        )
+        proposal = _merge_final_contact_proposals(
+            frozen_labels, parent_proposal, parent_contact_report,
+            attachment_proposal, attachment_restriction, selected,
+        )
+        parent_contact_report["pass_index"] = pass_index
+        parent_contact_passes.append(parent_contact_report)
+        postfit_attachment_passes.append({
+            "pass_index": pass_index,
+            "assessment": attachment_assessment,
+            "restriction": attachment_restriction,
+        })
+        if np.array_equal(proposal, frozen_labels):
+            break
+        if pass_index == 3:
+            # Do not export centerlines fitted to a different label array.
+            # Keep the safe current snapshot and surface the remaining
+            # proposals as unresolved violations.
+            if parent_contact_report["changed_vertex_count"]:
+                parent_contact_report["status"] = "unresolved_iteration_limit"
+                for row in parent_contact_report["contacts"]:
+                    if row["status"] == "reassigned_to_supported_parent":
+                        row["status"] = "unresolved_iteration_limit"
+                        row["changed_vertex_count"] = 0
+                        parent_contact_report["unresolved_patch_count"] += 1
+                parent_contact_report["changed_vertex_count"] = 0
+            if attachment_restriction["changed_vertex_count"]:
+                attachment_restriction["status"] = "unresolved_iteration_limit"
+                attachment_restriction["changed_vertex_count"] = 0
+                attachment_restriction["changed_by_root"] = {}
+            break
+        full_root_labels = proposal
+        full_root_labels, primary_contact_report = restrict_higher_order_primary_contacts(
+            full_normalized, full_root_labels, selected,
+            triangles=cloud.triangles, d_bar=d_bar,
+            excluded_mask=patch_excluded,
+        )
+    attachment_constraint_report["after_centerline_reconciliation"] = assess_attachment_footprints(
+        full_normalized, full_root_labels, primary.points, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        excluded_mask=full_above_base_mask,
+        bounds=attachment_bounds,
+    )
+    attachment_constraint_report["postfit_reconciliation_passes"] = postfit_attachment_passes
+    mark_final_attachment_qc(selected, attachment_constraint_report["after_centerline_reconciliation"])
+    mark_higher_order_primary_contact_qc(selected, primary_contact_report)
+    mark_parent_contact_qc(selected, parent_contact_passes[-1])
+    if cleaned_analysis_labels is not None:
+        cleaned_analysis_labels = full_root_labels[analysis_to_full] if analysis_to_full is not None else full_root_labels
+        analysis_root_labels = np.asarray(cleaned_analysis_labels, dtype=int).copy()
+        primary_mask = analysis_root_labels == 0
+        lateral_labels = np.zeros(len(analysis_root_labels), dtype=int)
+        lateral_labels[analysis_root_labels > 0] = analysis_root_labels[analysis_root_labels > 0]
+        lateral_labels[analysis_root_labels == -2] = -1
     primary.qc_flags = list(dict.fromkeys([
         *primary.qc_flags, *final_centerline_report["primary_qc_flags"],
     ]))
@@ -637,9 +885,19 @@ def _run_pipeline_impl(
         "candidate_lateral_count": candidate_count,
         "selected_lateral_count": len(selected),
         "selected_order_counts": order_counts,
+        "lateral_origin_constraint": lateral_origin_report,
         "lateral_tracing_policy": {
-            "hypotheses_per_parameter_variant": 1,
+            "hypotheses_per_parameter_variant": 2,
             "fork_hypothesis_promotion": False,
+            "fork_hypothesis_resolution": (
+                "mutually_exclusive_geometry_deferred_to_later_order_"
+                "and_topology_resurvey"
+            ),
+            "fork_hypothesis_requires_sustained_surface_tube": True,
+            "fork_hypothesis_common_prefix_preserved": True,
+            "post_fork_suffix_dominance_review": True,
+            "fork_resurvey_policy": "deterministic_bounded_work_queue",
+            "tip_seed_guard_supported_departure_exception": True,
             "surface_aware_order1_seeding": True,
             "surface_contact_distance_d_bar": 2.5,
             "surface_contact_minimum_points": 3,
@@ -706,7 +964,16 @@ def _run_pipeline_impl(
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "final_centerline_fitting": final_centerline_report,
         "branch_facing_transection_trimming": transection_report,
+        "final_surface_cleanup": final_surface_cleanup_report,
         "joint_root_collar": collar_report,
+        "parent_contact_reconciliation": {
+            "policy": "bounded-frozen-fit-parent-contact-v1",
+            "passes": parent_contact_passes,
+            "status": parent_contact_passes[-1]["status"],
+            "changed_vertex_count": int(sum(row["changed_vertex_count"] for row in parent_contact_passes)),
+        },
+        "attachment_constraint": attachment_constraint_report,
+        "higher_order_primary_contact": primary_contact_report,
         "primary_detection_method": _primary_method(config),
         "primary_guidance_file": (
             PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None
@@ -724,6 +991,7 @@ def _run_pipeline_impl(
             analysis_junction_report=analysis_junction_report,
             full_junction_report=full_junction_report,
             surface_patch_report=surface_patch_report,
+            final_surface_cleanup_report=final_surface_cleanup_report,
         ),
         "primary_candidates": [_candidate_metadata(candidate, normalization) for candidate in primary_candidates],
         "topology_report": topology_report.__dict__,
@@ -819,6 +1087,15 @@ def _trace_lateral_orders(
     max_paths: int | None,
     excluded_mask: np.ndarray | None = None,
     cooperate: Callable[[], None] | None = None,
+    gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
+    primary_top_reference: np.ndarray | None = None,
+    origin_report: dict[str, object] | None = None,
+    mesh_points: np.ndarray | None = None,
+    mesh_triangles: np.ndarray | None = None,
+    mesh_excluded_mask: np.ndarray | None = None,
+    analysis_to_mesh: np.ndarray | None = None,
+    attachment_report: dict[str, object] | None = None,
+    attachment_bounds: AttachmentBounds = AttachmentBounds(),
 ) -> tuple[list[RootPath], int, int, dict[int, int]]:
     """Trace lateral roots iteratively from parent skeletons.
 
@@ -828,6 +1105,49 @@ def _trace_lateral_orders(
     count limit is therefore explicit through ``max_paths`` rather than a
     hidden per-parent or pre-reduction truncation.
     """
+    primary_path = np.asarray(primary_path, dtype=float)
+    gravity_direction = np.asarray(gravity, dtype=float)
+    if (
+        gravity_direction.shape != (3,)
+        or not np.all(np.isfinite(gravity_direction))
+        or np.linalg.norm(gravity_direction) <= 1e-12
+    ):
+        raise ValueError(
+            "gravity must contain three finite values and have non-zero length"
+        )
+    gravity_direction /= np.linalg.norm(gravity_direction)
+    if (
+        primary_path.ndim != 2
+        or primary_path.shape[1] != 3
+        or not len(primary_path)
+        or not np.all(np.isfinite(primary_path))
+    ):
+        raise ValueError("primary_path must contain finite XYZ coordinates")
+    if primary_top_reference is None:
+        top_reference_path = primary_path.copy()
+    else:
+        top_point = np.asarray(primary_top_reference, dtype=float)
+        if top_point.shape != (3,) or not np.all(np.isfinite(top_point)):
+            raise ValueError("primary_top_reference must contain one finite XYZ coordinate")
+        top_reference_path = top_point[None, :].copy()
+    primary_top_index = int(np.argmax(top_reference_path @ -gravity_direction))
+    origin_constraint: dict[str, object] = {
+        "policy": "lateral-origin-at-or-below-primary-top-v1",
+        "rule": (
+            "The stored origin of every lateral-root order must be at or "
+            "below the immutable selected primary top along the configured "
+            "up direction."
+        ),
+        "gravity_direction": gravity_direction.tolist(),
+        "primary_top_index": primary_top_index,
+        "primary_top_point_normalized": top_reference_path[
+            primary_top_index
+        ].tolist(),
+        "primary_top_reference_policy": "immutable_preprocessing_selection",
+        "rejected_start_count": 0,
+        "rejected_refined_path_count": 0,
+        "per_order": [],
+    }
     selected_all: list[RootPath] = []
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
     occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded
@@ -870,6 +1190,33 @@ def _trace_lateral_orders(
         order_starts = 0
         order_candidate_count = 0
         order_parent_tracking_rejections = 0
+        blocked_attachment_starts = 0
+        blocked_parent_footprints: dict[str, list[tuple[cKDTree, float]]] = {}
+        if order > 1 and attachment_report is not None and mesh_points is not None:
+            previous = attachment_report.get("per_order", [])
+            if previous:
+                for junction in previous[-1]["assessment"]["junctions"]:
+                    if not str(junction.get("status", "")).startswith("rejected"):
+                        continue
+                    vertices = np.asarray(junction.get("patch_vertex_indices", []), int)
+                    if not len(vertices):
+                        continue
+                    patch_tree = cKDTree(np.asarray(mesh_points, float)[vertices])
+                    radius = 2*float(junction.get("child_radius", 0)) + 2*d_bar
+                    for blocked_id in [str(junction["root_id"]),
+                                       *junction.get("neighboring_insertions_for_reassessment", [])]:
+                        blocked_parent_footprints.setdefault(blocked_id, []).append(
+                            (patch_tree, radius))
+        order_origin_row = {
+            "root_order": int(order),
+            "detected_start_count": 0,
+            "eligible_start_count": 0,
+            "rejected_start_count": 0,
+            "rejected_refined_path_count": 0,
+        }
+        per_order_origin = origin_constraint["per_order"]
+        assert isinstance(per_order_origin, list)
+        per_order_origin.append(order_origin_row)
         for parent_id, parent_path in parent_paths:
             if cooperate is not None:
                 cooperate()
@@ -937,8 +1284,36 @@ def _trace_lateral_orders(
                     else None
                 ),
                 parent_tree=parent_tree,
+                tip_departure_distance=(
+                    max(3.0 * float(d_bar), 0.004)
+                    if order > 1
+                    else None
+                ),
             )
+            if parent_id in blocked_parent_footprints:
+                starts, deferred = _defer_rejected_attachment_starts(
+                    starts, blocked_parent_footprints[parent_id])
+                blocked_attachment_starts += deferred
             order_starts += len(starts)
+            order_origin_row["detected_start_count"] += len(starts)
+            eligible_starts = [
+                start
+                for start in starts
+                if not is_above_primary_top(
+                    start.primary_point,
+                    top_reference_path,
+                    gravity=gravity_direction,
+                )
+            ]
+            rejected_starts = len(starts) - len(eligible_starts)
+            order_origin_row["eligible_start_count"] += len(eligible_starts)
+            order_origin_row["rejected_start_count"] += rejected_starts
+            origin_constraint["rejected_start_count"] = int(
+                origin_constraint["rejected_start_count"]
+            ) + rejected_starts
+            starts = eligible_starts
+            if not starts:
+                continue
             max_steps = 80 if order == 1 else 35
             candidates = grow_lateral_candidates(
                 points,
@@ -1100,6 +1475,20 @@ def _trace_lateral_orders(
                     if len(centered) >= 2:
                         traced.points = centered
                 refined.append(traced)
+        eligible_refined: list[RootPath] = []
+        for traced in refined:
+            if is_above_primary_top(
+                traced.points[0],
+                top_reference_path,
+                gravity=gravity_direction,
+            ):
+                order_origin_row["rejected_refined_path_count"] += 1
+                origin_constraint["rejected_refined_path_count"] = int(
+                    origin_constraint["rejected_refined_path_count"]
+                ) + 1
+                continue
+            eligible_refined.append(traced)
+        refined = eligible_refined
         if not refined:
             break
         provisional_labels = _assign_lateral_points(
@@ -1118,7 +1507,7 @@ def _trace_lateral_orders(
         for traced in refined:
             if traced.score_components.get("parent_tracking_rejected", 0.0) > 0.0:
                 continue
-            extend_lateral_tip(
+            resume_lateral_tip_in_batches(
                 points,
                 traced,
                 continuation_blocked,
@@ -1167,6 +1556,20 @@ def _trace_lateral_orders(
                     continue
                 final_refined.append(traced)
             refined = final_refined
+        eligible_refined = []
+        for traced in refined:
+            if is_above_primary_top(
+                traced.points[0],
+                top_reference_path,
+                gravity=gravity_direction,
+            ):
+                order_origin_row["rejected_refined_path_count"] += 1
+                origin_constraint["rejected_refined_path_count"] = int(
+                    origin_constraint["rejected_refined_path_count"]
+                ) + 1
+                continue
+            eligible_refined.append(traced)
+        refined = eligible_refined
         if not refined:
             break
         selected_all.extend(refined)
@@ -1180,6 +1583,43 @@ def _trace_lateral_orders(
             d_bar,
             excluded_mask=excluded,
         )
+        if mesh_points is not None and mesh_triangles is not None and len(mesh_triangles):
+            frozen_mesh_labels = _assign_full_root_labels(
+                mesh_points, primary_path, selected_all, d_bar=d_bar,
+                excluded_mask=mesh_excluded_mask,
+            )
+            assessment = assess_attachment_footprints(
+                mesh_points, frozen_mesh_labels, primary_path, selected_all,
+                triangles=mesh_triangles, d_bar=d_bar,
+                excluded_mask=mesh_excluded_mask,
+                bounds=attachment_bounds,
+            )
+            restricted_mesh_labels, restriction = restrict_rejected_contacts(
+                frozen_mesh_labels, assessment, selected_all, mesh_points,
+                triangles=mesh_triangles, d_bar=d_bar,
+            )
+            # Release only matching sampled proximal interface labels.  The
+            # mesh-native guard preserves every retained child component;
+            # starts at the rejected junction itself are deferred above.
+            interface_analysis = 0
+            mapping = None
+            if analysis_to_mesh is not None:
+                mapping = np.asarray(analysis_to_mesh, int)
+            elif len(points) == len(mesh_points) and np.array_equal(points, mesh_points):
+                mapping = np.arange(len(points), dtype=int)
+            if mapping is not None:
+                if len(mapping) == len(points) and np.all((mapping >= 0) & (mapping < len(mesh_points))):
+                    affected = (frozen_mesh_labels[mapping] > 0) & (restricted_mesh_labels[mapping] == -2)
+                    affected &= labels == frozen_mesh_labels[mapping]
+                    interface_analysis = int(affected.sum())
+                    labels[affected] = -2
+            if attachment_report is not None:
+                per_order = attachment_report.setdefault("per_order", [])
+                assert isinstance(per_order, list)
+                per_order.append({"root_order": int(order), "assessment": assessment,
+                                  "contact_restriction": restriction,
+                                  "proximal_interface_analysis_vertex_count": interface_analysis,
+                                  "deferred_rejected_footprint_start_count": blocked_attachment_starts})
         occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded | (labels > 0)
         parent_paths = [
             (path.root_id, path.points)
@@ -1187,12 +1627,14 @@ def _trace_lateral_orders(
             if int(path.order) == order
         ]
         LOGGER.info(
-            "Selected %d order-%d lateral paths (%d tip-extended) from %d starts and %d candidates; flagged %d parent-tracking variants",
+            "Selected %d order-%d lateral paths (%d tip-extended) from %d starts and %d candidates; rejected %d above-primary-top origins and flagged %d parent-tracking variants",
             len(refined),
             order,
             extended_count,
             order_starts,
             order_candidate_count,
+            int(order_origin_row["rejected_start_count"])
+            + int(order_origin_row["rejected_refined_path_count"]),
             order_parent_tracking_rejections,
         )
     selected_all = _prune_parent_tracking_paths(selected_all)
@@ -1201,7 +1643,26 @@ def _trace_lateral_orders(
         for order in range(1, max(1, int(max_root_order)) + 1)
     }
     order_counts = {order: count for order, count in order_counts.items() if count > 0}
+    if origin_report is not None:
+        origin_report.clear()
+        origin_report.update(origin_constraint)
     return selected_all, total_starts, total_candidates, order_counts
+
+
+def _defer_rejected_attachment_starts(
+    starts: list,
+    footprints: list[tuple[cKDTree, float]],
+) -> tuple[list, int]:
+    """Keep distal starts; defer only a start at a rejected junction."""
+    eligible = []
+    for start in starts:
+        within_rejected = any(
+            min(float(tree.query(start.point)[0]),
+                float(tree.query(start.primary_point)[0])) <= radius
+            for tree, radius in footprints)
+        if not within_rejected:
+            eligible.append(start)
+    return eligible, len(starts) - len(eligible)
 
 
 def _is_parent_owned_basal_connector(
@@ -1447,6 +1908,17 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("Both --start and --end must be provided together.")
     if config.worker_threads is not None and int(config.worker_threads) < 1:
         raise ValueError("worker_threads must be a positive integer when provided")
+    attachment_values = (
+        config.attachment_area_multiplier, config.attachment_angle_factor_cap,
+        config.attachment_longitudinal_radii,
+        config.attachment_geodesic_diameter_radii,
+        config.attachment_maximum_inverse_compactness,
+    )
+    if any(not np.isfinite(value) or value <= 0 for value in attachment_values):
+        raise ValueError("attachment limits must be positive finite values")
+    if (config.attachment_angle_factor_cap < 1 or
+            config.attachment_maximum_inverse_compactness < 1):
+        raise ValueError("attachment angle and compactness caps must be at least one")
 
 
 def _manual_primary_guidance(config: PipelineConfig) -> PrimaryGuidance | None:
@@ -1792,38 +2264,36 @@ def _assign_lateral_points(
     non_primary = np.flatnonzero(~np.asarray(primary_mask, dtype=bool) & ~excluded)
     if len(non_primary) == 0:
         return (labels, {}) if return_competing_labels else labels
-    path_nodes = np.vstack([path.points for path in paths])
-    node_to_label = np.concatenate([np.full(len(path.points), idx, dtype=int) for idx, path in enumerate(paths, start=1)])
-    tree = cKDTree(path_nodes)
-    query_k = 2 if len(path_nodes) > 1 else 1
-    distances, node_idx = tree.query(points[non_primary], k=query_k, workers=worker_threads())
-    if query_k == 1:
-        distances = distances[:, None]
-        node_idx = node_idx[:, None]
+    exposed = [(idx, np.asarray(path.points, float)[max(0, int(path.body_start_index)):])
+               for idx, path in enumerate(paths, start=1)]
+    exposed = [(idx, body) for idx, body in exposed if len(body)]
+    if not exposed:
+        return (labels, {}) if return_competing_labels else labels
     radius = max(4.0 * d_bar, 0.006)
-    assigned = distances[:, 0] <= radius
-    nearest_labels = node_to_label[node_idx[:, 0]]
+    nearest_distance, nearest_labels, competing_distance, second_labels = _nearest_exposed_segments(
+        points[non_primary], exposed, d_bar=d_bar, radius=radius,
+        margin=max(0.75 * d_bar, 0.001),
+    )
+    assigned = nearest_distance <= radius
     labels[non_primary[assigned]] = nearest_labels[assigned]
     competing_labels: dict[int, tuple[int, int]] = {}
-    if query_k > 1:
-        second_labels = node_to_label[node_idx[:, 1]]
-        ambiguous = (
-            assigned
-            & (nearest_labels != second_labels)
-            & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
-        )
-        ambiguous_indices = non_primary[ambiguous]
-        labels[ambiguous_indices] = -1
-        if return_competing_labels:
-            competing_labels = {
-                int(vertex_index): (int(first_label), int(second_label))
-                for vertex_index, first_label, second_label in zip(
-                    ambiguous_indices,
-                    nearest_labels[ambiguous],
-                    second_labels[ambiguous],
-                    strict=True,
-                )
-            }
+    competitor_gap = np.full(len(non_primary), np.inf)
+    has_competitor = second_labels >= 0
+    competitor_gap[has_competitor] = (competing_distance[has_competitor]
+                                      - nearest_distance[has_competitor])
+    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, 0.001))
+    ambiguous_indices = non_primary[ambiguous]
+    labels[ambiguous_indices] = -1
+    if return_competing_labels:
+        competing_labels = {
+            int(vertex_index): (int(first_label), int(second_label))
+            for vertex_index, first_label, second_label in zip(
+                ambiguous_indices,
+                nearest_labels[ambiguous],
+                second_labels[ambiguous],
+                strict=True,
+            )
+        }
     if return_competing_labels:
         return labels, competing_labels
     return labels
@@ -2420,6 +2890,7 @@ def _point_assignment_summary(
     analysis_junction_report: dict,
     full_junction_report: dict,
     surface_patch_report: dict,
+    final_surface_cleanup_report: dict,
 ) -> dict:
     labels = np.asarray(labels, dtype=int)
     above_base = _coerce_exclusion_mask(above_base_mask, len(labels))
@@ -2462,7 +2933,86 @@ def _point_assignment_summary(
             "full_resolution": full_junction_report,
         },
         "surface_patch_correction": surface_patch_report,
+        "final_surface_cleanup": final_surface_cleanup_report,
     }
+
+
+def _nearest_exposed_segments(
+    points: np.ndarray, paths: list[tuple[int, np.ndarray]], *,
+    d_bar: float, radius: float, margin: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Find the closest two distinct roots by exact eligible-segment distance.
+
+    Subdivide only for spatial indexing. Every indexed piece remains on an
+    existing centerline segment. A midpoint can be at most half a piece length
+    farther from a point than that piece, so the search radius includes that
+    bound and cannot omit an owner or competitor inside the ambiguity margin.
+    """
+    query = np.asarray(points, float)
+    nearest = np.full(len(query), np.inf)
+    owner = np.full(len(query), -1, int)
+    competitor_distance = np.full(len(query), np.inf)
+    competitor = np.full(len(query), -1, int)
+    if not len(query) or not paths:
+        return nearest, owner, competitor_distance, competitor
+    max_piece = max(2.0 * d_bar, 0.001)
+    starts: list[np.ndarray] = []
+    ends: list[np.ndarray] = []
+    labels: list[int] = []
+    for label, path in paths:
+        line = np.asarray(path, float)
+        if not len(line):
+            continue
+        if len(line) == 1:
+            starts.append(line[0])
+            ends.append(line[0])
+            labels.append(label)
+            continue
+        for begin, end in zip(line[:-1], line[1:]):
+            pieces = max(1, int(np.ceil(np.linalg.norm(end - begin) / max_piece)))
+            fraction = np.arange(pieces + 1, dtype=float) / pieces
+            bounds = begin + fraction[:, None] * (end - begin)
+            starts.extend(bounds[:-1])
+            ends.extend(bounds[1:])
+            labels.extend([label] * pieces)
+    if not starts:
+        return nearest, owner, competitor_distance, competitor
+    start = np.asarray(starts)
+    end = np.asarray(ends)
+    segment_labels = np.asarray(labels, int)
+    delta = end - start
+    length_squared = np.einsum("ij,ij->i", delta, delta)
+    half_length = float(np.sqrt(length_squared.max())) / 2.0
+    tree = cKDTree((start + end) / 2.0)
+    search_radius = radius + margin + half_length + 1e-12
+    for offset in range(0, len(query), 2_048):
+        chunk = query[offset:offset + 2_048]
+        nearby = tree.query_ball_point(chunk, search_radius, workers=worker_threads())
+        counts = np.fromiter((len(row) for row in nearby), int, count=len(chunk))
+        if not counts.sum():
+            continue
+        query_index = np.repeat(np.arange(len(chunk)), counts)
+        segment_index = np.concatenate([np.asarray(row, int) for row in nearby if len(row)])
+        relative = chunk[query_index] - start[segment_index]
+        along = np.clip(np.einsum("ij,ij->i", relative, delta[segment_index]) /
+                        np.maximum(length_squared[segment_index], 1e-24), 0.0, 1.0)
+        residual = relative - along[:, None] * delta[segment_index]
+        distance = np.linalg.norm(residual, axis=1)
+        order = np.lexsort((segment_labels[segment_index], distance, query_index))
+        ordered_point = query_index[order]
+        ordered_label = segment_labels[segment_index[order]]
+        ordered_distance = distance[order]
+        first = np.r_[True, ordered_point[1:] != ordered_point[:-1]]
+        first_point = ordered_point[first]
+        nearest[offset + first_point] = ordered_distance[first]
+        owner[offset + first_point] = ordered_label[first]
+        different = ordered_label != owner[offset + ordered_point]
+        other_point = ordered_point[different]
+        if len(other_point):
+            other_first = np.r_[True, other_point[1:] != other_point[:-1]]
+            competitor_distance[offset + other_point[other_first]] = ordered_distance[different][other_first]
+            competitor[offset + other_point[other_first]] = ordered_label[different][other_first]
+    return nearest, owner, competitor_distance, competitor
 
 
 def _assign_full_root_labels(
@@ -2474,43 +3024,37 @@ def _assign_full_root_labels(
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
-    all_paths = [np.asarray(primary_path, dtype=float)] + [np.asarray(path.points, dtype=float) for path in lateral_paths]
-    path_nodes = np.vstack(all_paths)
-    node_labels = np.concatenate(
-        [np.full(len(path), label, dtype=int) for label, path in enumerate(all_paths)]
-    )
-    tree = cKDTree(path_nodes)
-    query_k = 2 if len(path_nodes) > 1 else 1
-    distances, node_indices = tree.query(points, k=query_k, workers=worker_threads())
-    if query_k == 1:
-        distances = distances[:, None]
-        node_indices = node_indices[:, None]
+    exposed = [(0, np.asarray(primary_path, dtype=float))]
+    exposed.extend((label, np.asarray(path.points, dtype=float)[max(0, int(path.body_start_index)):])
+                   for label, path in enumerate(lateral_paths, start=1))
+    exposed = [(label, body) for label, body in exposed if len(body)]
     labels = np.full(len(points), -1, dtype=int)
     radius = max(5.0 * d_bar, 0.008)
+    nearest_distance, nearest, competitor_distance, second = _nearest_exposed_segments(
+        points, exposed, d_bar=d_bar, radius=radius,
+        margin=max(0.75 * d_bar, 0.001),
+    )
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
-    assigned = (distances[:, 0] <= radius) & ~excluded
-    nearest = node_labels[node_indices[:, 0]]
+    assigned = (nearest_distance <= radius) & ~excluded
     labels[assigned] = nearest[assigned]
     competing_labels: dict[int, tuple[int, int]] = {}
-    if query_k > 1:
-        second = node_labels[node_indices[:, 1]]
-        ambiguous = (
-            assigned
-            & (nearest != second)
-            & ((distances[:, 1] - distances[:, 0]) <= max(0.75 * d_bar, 0.001))
-        )
-        labels[ambiguous] = -2
-        if return_competing_labels:
-            ambiguous_indices = np.flatnonzero(ambiguous)
-            competing_labels = {
-                int(vertex_index): (int(first_label), int(second_label))
-                for vertex_index, first_label, second_label in zip(
-                    ambiguous_indices,
-                    nearest[ambiguous],
-                    second[ambiguous],
-                    strict=True,
-                )
-            }
+    competitor_gap = np.full(len(points), np.inf)
+    has_competitor = second >= 0
+    competitor_gap[has_competitor] = (competitor_distance[has_competitor]
+                                      - nearest_distance[has_competitor])
+    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, 0.001))
+    labels[ambiguous] = -2
+    if return_competing_labels:
+        ambiguous_indices = np.flatnonzero(ambiguous)
+        competing_labels = {
+            int(vertex_index): (int(first_label), int(second_label))
+            for vertex_index, first_label, second_label in zip(
+                ambiguous_indices,
+                nearest[ambiguous],
+                second[ambiguous],
+                strict=True,
+            )
+        }
     if return_competing_labels:
         return labels, competing_labels
     return labels

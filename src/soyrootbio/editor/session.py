@@ -19,7 +19,12 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from ..export import order_color, write_rsml
-from ..geometry import child_length_exceeds_parent, path_length
+from ..geometry import (
+    child_length_exceeds_parent,
+    is_above_primary_top,
+    path_length,
+    primary_top_excess,
+)
 from ..hardware import HardwareInfo, detect_hardware
 from ..io import write_labeled_ply
 from ..traits import compute_traits
@@ -569,6 +574,7 @@ class EditorSession:
                     root.centerline_assessment["assignment_changed_since_fit"] = True
                     root.qc_flags = list(dict.fromkeys([*root.qc_flags, "centerline_fit_stale_assignment"]))
             self._refresh_attachments()
+            self._validate_changed_lateral_origins(roots_before)
             self._validate_state()
             self._recompute_traits()
         except Exception:
@@ -1307,6 +1313,53 @@ class EditorSession:
         assigned = self.mesh.root_labels >= 0
         if np.any(~np.isin(self.mesh.root_labels[assigned], valid_labels)):
             raise EditorValidationError("Mesh vertices reference a deleted or unknown root.")
+
+    def _validate_changed_lateral_origins(
+        self,
+        roots_before: dict[str, RootNode],
+    ) -> None:
+        """Reject edits that introduce an origin above the primary top."""
+
+        primary = self.roots[PRIMARY_ID]
+        previous_primary = roots_before.get(PRIMARY_ID)
+        primary_changed = (
+            previous_primary is None
+            or not np.array_equal(primary.points, previous_primary.points)
+        )
+        for root in self.roots.values():
+            if root.root_id == PRIMARY_ID:
+                continue
+            previous = roots_before.get(root.root_id)
+            origin_changed = (
+                previous is None
+                or root.parent_id != previous.parent_id
+                or root.insertion_index != previous.insertion_index
+                or root.insertion_point is None
+                or previous.insertion_point is None
+                or not np.array_equal(root.insertion_point, previous.insertion_point)
+            )
+            if not primary_changed and not origin_changed:
+                continue
+            origin = (
+                np.asarray(root.insertion_point, dtype=float)
+                if root.insertion_point is not None
+                else np.asarray(root.points[0], dtype=float)
+            )
+            if not is_above_primary_top(
+                origin,
+                primary.points,
+                gravity=self.gravity,
+            ):
+                continue
+            excess, _ = primary_top_excess(
+                origin,
+                primary.points,
+                gravity=self.gravity,
+            )
+            raise EditorValidationError(
+                f"{root.root_id} has a lateral origin {excess:.9g} above "
+                "the primary-root top."
+            )
 
     def _validate_new_parent(self, root_id: str, parent_id: str) -> None:
         if root_id == PRIMARY_ID:

@@ -52,6 +52,7 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     metadata = json.loads((output_dir / "metadata.json").read_text())
     assert collar == metadata["joint_root_collar"]
     assert collar["policy"] == "joint-root-collar-v1"
+    assert metadata["higher_order_primary_contact"]["status"] == "unresolved_no_mesh"
     guidance = read_primary_guidance(output_dir / "primary_guidance.json", expected_input=points_path)
     start, end = pipeline_module.read_endpoint_file(endpoint_path)
     np.testing.assert_array_equal(guidance.start, start)
@@ -84,6 +85,18 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert len(fitting["roots"]) == len(traits)
     assert fitting["roots"][0]["assigned_point_count"] == int(np.sum(result.full_root_labels == 0))
     assert fitting["roots"][0]["length_after"] * result.normalization.scale == pytest.approx(float(traits.iloc[0]["length"]))
+    assert fitting["primary_method"] == (
+        "prior-guided-area-angular-sections-curvature-spline-v2"
+    )
+    assert fitting["primary_fit_qc_passed"] is fitting["roots"][0][
+        "fit_qc_passed"
+    ]
+    assert fitting["primary_fit_applied"] is fitting["roots"][0]["fit_applied"]
+    assert fitting["roots"][0]["traits_geometry_source"] in {
+        "accepted_fit",
+        "retained_prior",
+        "unmeasurable_support",
+    }
     assert "centerline_region" in lateral_skeletons.columns
     assert metadata["lateral_tracing_policy"][
         "child_length_may_not_exceed_parent"
@@ -109,6 +122,44 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     )
     assert metadata["topology_report"]["overlong_children_removed"] >= 0
     assert metadata["topology_report"]["overlong_descendants_removed"] >= 0
+    assert metadata["topology_report"]["origins_above_primary_top_removed"] >= 0
+    assert metadata["topology_report"][
+        "descendants_of_above_top_roots_removed"
+    ] >= 0
+    assert len(metadata["topology_report"]["primary_top_point_normalized"]) == 3
+    assert metadata["final_centerline_fitting"][
+        "origins_above_primary_top"
+    ] == 0
+    origin_constraint = metadata["lateral_origin_constraint"]
+    assert origin_constraint["policy"] == (
+        "lateral-origin-at-or-below-primary-top-v1"
+    )
+    assert origin_constraint["primary_top_reference_policy"] == (
+        "immutable_preprocessing_selection"
+    )
+    assert len(origin_constraint["primary_top_point_normalized"]) == 3
+    assert len(origin_constraint["gravity_direction"]) == 3
+    assert origin_constraint["rejected_start_count"] >= 0
+    assert origin_constraint["rejected_refined_path_count"] >= 0
+    np.testing.assert_allclose(
+        origin_constraint["primary_top_point_normalized"],
+        metadata["topology_report"]["primary_top_point_normalized"],
+    )
+    assert metadata["topology_report"]["primary_top_reference_policy"] == (
+        "immutable_preprocessing_selection"
+    )
+    np.testing.assert_allclose(
+        origin_constraint["primary_top_point_normalized"],
+        metadata["final_centerline_fitting"]["primary_top_point_normalized"],
+    )
+    assert metadata["final_centerline_fitting"][
+        "primary_top_reference_policy"
+    ] == "immutable_preprocessing_selection"
+    assert len(
+        metadata["final_centerline_fitting"][
+            "fitted_primary_top_point_normalized"
+        ]
+    ) == 3
 
 
 def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path: Path):
@@ -179,6 +230,10 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
     trimming = metadata["branch_facing_transection_trimming"]
     assert trimming["policy"] == "branch-facing-transection-trimming-v1"
     assert trimming["sector_half_angle_degrees"] == 45
+    final_cleanup = assignment["final_surface_cleanup"]
+    assert final_cleanup["policy"] == "final-local-surface-cleanup-v1"
+    assert final_cleanup["changed_vertex_count"] >= 0
+    assert metadata["final_surface_cleanup"] == final_cleanup
     assert cleanup["converged"] is True
 
 

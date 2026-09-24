@@ -14,6 +14,7 @@ from soyrootbio.topology import (
     _join_contacted_sibling_continuations,
     _merge_parallel_parent_duplicates,
     _merge_same_insertion_primary_duplicates,
+    _prune_overlong_child_subtrees,
     _reconcile_overlong_forks,
     _reparent_same_insertion_divergences,
     _swap_internal_contact_suffixes,
@@ -245,6 +246,55 @@ def test_surface_contact_seed_beats_centerline_nearest_singleton(
     assert starts[0].surface_contact_count == 3
     assert starts[0].surface_gap < 0.06
     assert starts[0].point[0] > 1.0
+
+
+def test_parent_tip_guard_allows_only_a_sustained_departing_tube(
+    monkeypatch,
+) -> None:
+    primary_path = np.column_stack(
+        [np.zeros(21), np.zeros(21), np.linspace(0.0, 1.0, 21)]
+    )
+    departure = np.column_stack(
+        [
+            np.linspace(0.01, 0.12, 16),
+            np.zeros(16),
+            np.full(16, 0.95),
+        ]
+    )
+    points = np.vstack([primary_path, departure])
+    occupied = np.zeros(len(points), dtype=bool)
+    occupied[: len(primary_path)] = True
+    monkeypatch.setattr(
+        lateral_module,
+        "cluster_hdbscan",
+        lambda values, min_cluster_size: np.zeros(len(values), dtype=int),
+    )
+
+    guarded = find_lateral_starting_points(
+        points,
+        occupied,
+        primary_path,
+        min_cluster_size=4,
+        max_parent_distance=0.15,
+        minimum_branch_angle_degrees=18.0,
+        exclude_parent_tip_fraction=0.20,
+    )
+    supported = find_lateral_starting_points(
+        points,
+        occupied,
+        primary_path,
+        min_cluster_size=4,
+        max_parent_distance=0.15,
+        minimum_branch_angle_degrees=18.0,
+        exclude_parent_tip_fraction=0.20,
+        tip_departure_distance=0.04,
+    )
+
+    assert guarded == []
+    assert len(supported) == 1
+    assert supported[0].tip_guard_exception
+    assert supported[0].tip_departure_support >= 8
+    assert supported[0].tip_departure_distance >= 0.04
 
 
 def test_endpoint_primary_surface_contact_overrides_contacted_lateral() -> None:
@@ -989,6 +1039,35 @@ def test_overlong_child_without_supported_internal_fork_is_not_reconciled() -> N
     np.testing.assert_allclose(terminal_child.points[-1], [10.0, 24.0, 0.0])
 
 
+def test_overlong_pruning_preserves_geometry_and_rejection_evidence() -> None:
+    overlong = _root(
+        "overlong",
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 25.0]],
+        order=1,
+        parent_id="primary",
+    )
+    rejection = {
+        "candidate_arm_id": "overlong",
+        "action": "rejected",
+        "reason": "alternative_parent_length_control",
+    }
+
+    retained, details, descendants = _prune_overlong_child_subtrees(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]]),
+        [overlong],
+        fork_decisions=[rejection],
+    )
+
+    assert retained == []
+    assert descendants == 0
+    assert len(details) == 1
+    assert details[0]["preserved_polyline_normalized"] == (
+        overlong.points.tolist()
+    )
+    assert details[0]["reconciliation_rejections"] == [rejection]
+    assert len(details[0]["geometry_sha256"]) == 64
+
+
 def test_overlong_child_below_twice_parent_length_resurveys_alternative_parent() -> None:
     parent = _root(
         "parent",
@@ -1128,6 +1207,69 @@ def test_overlong_later_order_child_resurveys_against_revised_parent() -> None:
         [[15.0, 6.0, 0.0], [15.0, 7.0, 0.0], [15.0, 8.0, 0.0],
          [15.0, 9.0, 0.0], [15.0, 10.0, 0.0]],
     )
+
+
+def test_fork_work_queue_revisits_parent_after_descendant_swap() -> None:
+    # The first-order path initially has no qualifying alternative: its child
+    # is only twice the short suffix. Once that child adopts its own supported
+    # continuation, it becomes 3.6 times the first-order suffix. The work queue
+    # must revisit the earlier fork in the same reconciliation call.
+    first_points = [
+        [float(x), 0.0, 0.0] for x in range(16)
+    ] + [
+        [15.0, float(y), 0.0] for y in range(1, 6)
+    ]
+    first_order = _root(
+        "first-order",
+        first_points,
+        order=1,
+        parent_id="primary",
+    )
+    first_order.score_components["surface_aware_seed"] = 1.0
+
+    second_points = [
+        [float(x), 0.0, 0.0] for x in range(15, 22)
+    ] + [
+        [21.0, 0.0, float(z)] for z in range(1, 5)
+    ]
+    second_order = _root(
+        "second-order",
+        second_points,
+        order=2,
+        parent_id="first-order",
+    )
+    second_order.insertion_index = 15
+    second_order.score_components["novel_density_support"] = 100.0
+
+    third_order = _root(
+        "third-order",
+        [[float(x), 0.0, 0.0] for x in range(21, 34)],
+        order=3,
+        parent_id="second-order",
+    )
+    third_order.insertion_index = 6
+    third_order.score_components["novel_density_support"] = 120.0
+    decisions: list[dict[str, object]] = []
+    stats: dict[str, int] = {}
+
+    reconciled, _ = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
+        [first_order, second_order, third_order],
+        d_bar=0.05,
+        decision_log=decisions,
+        queue_stats=stats,
+    )
+
+    assert len(reconciled) == 2
+    assert reconciled[0].parent is second_order
+    assert reconciled[1].parent is first_order
+    assert reconciled[1].trigger == (
+        "post_fork_suffix_dominance_and_early_termination"
+    )
+    assert stats["iterations"] > 3
+    assert stats["cycle_states"] == 0
+    assert [row["action"] for row in decisions].count("accepted") == 2
+    np.testing.assert_allclose(first_order.points[-1], [33.0, 0.0, 0.0])
 
 
 def test_brief_primary_sibling_crossing_is_not_cropped() -> None:

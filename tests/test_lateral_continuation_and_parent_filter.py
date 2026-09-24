@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from soyrootbio.lateral import (
+    LateralStart,
+    _grow_candidate_hypotheses,
     estimate_parent_radius_profile,
     extend_lateral_tip,
     is_parent_tracking_candidate,
+    resume_lateral_tip_in_batches,
 )
 from soyrootbio.pipeline import (
     _is_parent_owned_basal_connector,
@@ -13,6 +17,50 @@ from soyrootbio.pipeline import (
     _prune_parent_tracking_paths,
 )
 from soyrootbio.types import RootPath
+
+
+def test_recent_fork_keeps_a_sustained_departing_arm_hypothesis() -> None:
+    common = np.column_stack(
+        [np.arange(0.01, 0.101, 0.01), np.zeros(10), np.zeros(10)]
+    )
+    short_arm = np.column_stack(
+        [np.arange(0.11, 0.151, 0.01), np.zeros(5), np.zeros(5)]
+    )
+    long_axis = np.arange(0.01, 0.301, 0.01)
+    long_arm = np.column_stack(
+        [np.full(len(long_axis), 0.10), long_axis, np.zeros(len(long_axis))]
+    )
+    points = np.vstack([common, short_arm, long_arm])
+    start = LateralStart(
+        start_id=0,
+        point=np.array([0.01, 0.0, 0.0]),
+        primary_point=np.zeros(3),
+        primary_index=0,
+        member_indices=np.arange(len(points)),
+        direction=np.array([1.0, 0.0, 0.0]),
+    )
+
+    hypotheses = _grow_candidate_hypotheses(
+        points=points,
+        point_tree=cKDTree(points),
+        allowed_mask=np.ones(len(points), dtype=bool),
+        start=start,
+        initial_direction=np.array([1.0, 0.0, 0.0]),
+        primary_tangent=np.array([0.0, 1.0, 0.0]),
+        step_length=0.01,
+        open_angle=90.0,
+        max_steps=45,
+        search_radius=0.022,
+        limit_primary_angle_to_insertion=True,
+        density_support_index=None,
+        cooperate=None,
+    )
+
+    assert len(hypotheses) == 2
+    assert hypotheses[0].fork_common_prefix_nodes >= 2
+    assert hypotheses[1].score_components["fork_alternate_supported_extent"] > 0.10
+    assert hypotheses[1].score_components["fork_alternate_departure"] > 0.02
+    assert hypotheses[1].score_components["fork_hypothesis_evidence_score"] > 0.0
 
 
 def _x_tube(stations: np.ndarray, radius: float = 0.0015, ring_points: int = 8) -> np.ndarray:
@@ -91,6 +139,37 @@ def test_tip_continuation_crosses_assignment_halo_and_reaches_supported_tip() ->
     assert result.score_components["tip_extension_steps"] > 80.0
     assert result.score_components["tip_extension_length"] > 0.20
     assert len(result.covered_indices) > 100
+
+
+def test_tip_continuation_resumes_in_bounded_batches() -> None:
+    points = _x_tube(np.arange(0.108, 0.601, 0.001))
+    path = RootPath(
+        root_id="root-a",
+        points=np.array(
+            [
+                [0.000, 0.0, 0.0],
+                [0.040, 0.0, 0.0],
+                [0.080, 0.0, 0.0],
+                [0.100, 0.0, 0.0],
+            ]
+        ),
+        covered_indices={0},
+    )
+
+    resume_lateral_tip_in_batches(
+        points,
+        path,
+        np.zeros(len(points), dtype=bool),
+        d_bar=0.001,
+        max_steps=90,
+        batch_steps=25,
+    )
+
+    assert path.points[-1, 0] > 0.56
+    assert path.score_components["tip_extension_steps"] > 80.0
+    assert path.score_components["tip_extension_batches"] >= 4.0
+    assert path.score_components["tip_extension_loop_rejections"] == 0.0
+    assert path.score_components["tip_extension_ownership_rejections"] == 0.0
 
 
 def test_tip_continuation_rejects_sparse_forward_noise() -> None:

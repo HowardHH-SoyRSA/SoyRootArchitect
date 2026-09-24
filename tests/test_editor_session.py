@@ -1316,6 +1316,43 @@ def test_editor_rejects_overlong_child_atomically(editor_bundle: Path) -> None:
     assert not session.log_path.exists()
 
 
+def test_editor_rejects_new_higher_order_origin_above_primary_top_atomically(
+    editor_bundle: Path,
+) -> None:
+    session = _new_session(editor_bundle, "origin-above-primary-top")
+    session.apply_operation(
+        "redraw_root",
+        {
+            "root_id": "root-a",
+            "points": [
+                [0.0, 0.0, 3.0],
+                [0.5, 0.0, 10.5],
+            ],
+        },
+        operation_id="raise-parent-tip",
+    )
+    before = _materialised_snapshot(session)
+
+    with pytest.raises(EditorValidationError, match="above the primary-root top"):
+        session.apply_operation(
+            "create_root",
+            {
+                "parent_id": "root-a",
+                "points": [
+                    [0.5, 0.0, 10.5],
+                    [0.6, 0.1, 10.4],
+                ],
+                "indices": [17],
+                "new_root_id": "invalid-above-top-child",
+            },
+            operation_id="invalid-above-top-origin",
+        )
+
+    assert _materialised_snapshot(session) == before
+    assert "invalid-above-top-child" not in session.roots
+    assert session.public_state()["operation_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("operation_type", "arguments", "message"),
     [

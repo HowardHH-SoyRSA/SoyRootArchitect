@@ -189,6 +189,9 @@ def write_rsml(
         ("body_start_index", "integer", "none"),
         ("exposed_body_length", "real", "mesh_unit"),
         ("parent_connector_length", "real", "mesh_unit"),
+        ("preserved_topology_length", "real", "mesh_unit"),
+        ("topology_path_length", "real", "mesh_unit"),
+        ("parent_connector_mode", "string", "none"),
     ):
         definition = ET.SubElement(property_definitions, "property-definition")
         ET.SubElement(definition, "label").text = name
@@ -254,6 +257,9 @@ def _rsml_root_element(
         "body_start_index": body_start_index,
         "exposed_body_length": np.nan if trait is None else trait.get("exposed_body_length", np.nan),
         "parent_connector_length": np.nan if trait is None else trait.get("parent_connector_length", np.nan),
+        "preserved_topology_length": np.nan if trait is None else trait.get("preserved_topology_length", np.nan),
+        "topology_path_length": np.nan if trait is None else trait.get("topology_path_length", np.nan),
+        "parent_connector_mode": "not_assessed" if trait is None else trait.get("parent_connector_mode", "not_assessed"),
     }
     for name, value in values.items():
         ET.SubElement(properties, name, {"value": str(value)})
@@ -440,7 +446,14 @@ def _lateral_skeleton_frame(paths: list[RootPath], normalization: Normalization)
                     "coordinate_unit": "mesh_unit",
                     "confidence": path.confidence,
                     "qc_flags": ";".join(path.qc_flags),
-                    "centerline_region": "parent_connector" if node_id < path.body_start_index else "exposed_body",
+                    "centerline_region": (
+                        "retained_prior"
+                        if path.centerline_assessment.get("parent_connector_mode") == "retained_prior"
+                        else "preserved_topology"
+                        if node_id < path.body_start_index
+                        and path.centerline_assessment.get("parent_connector_mode") == "preserved_topology"
+                        else "parent_connector" if node_id < path.body_start_index else "exposed_body"
+                    ),
                 }
             )
     return pd.DataFrame(

@@ -10,6 +10,7 @@ from .types import Normalization
 
 CHILD_PARENT_LENGTH_ABSOLUTE_TOLERANCE = 1e-12
 CHILD_PARENT_LENGTH_RELATIVE_TOLERANCE = 1e-9
+DEFAULT_GRAVITY = np.array([0.0, 0.0, -1.0])
 
 
 def normalize_unit_box(points: np.ndarray) -> tuple[np.ndarray, Normalization]:
@@ -52,6 +53,68 @@ def child_length_exceeds_parent(
         * max(abs(child), abs(parent)),
     )
     return child > parent + tolerance
+
+
+def primary_top_excess(
+    point: np.ndarray,
+    primary_path: np.ndarray,
+    *,
+    gravity: np.ndarray = DEFAULT_GRAVITY,
+) -> tuple[float, float]:
+    """Return signed height above the primary top and its float tolerance.
+
+    Height is measured opposite the configured gravity vector.  The primary
+    top is the highest primary centreline point on that axis, so the rule does
+    not depend on Z being vertical or on perfectly monotone primary sampling.
+    Positive excess beyond the returned tolerance is above the primary top.
+    """
+
+    origin = np.asarray(point, dtype=float)
+    primary = np.asarray(primary_path, dtype=float)
+    direction = np.asarray(gravity, dtype=float)
+    if origin.shape != (3,) or not np.all(np.isfinite(origin)):
+        raise ValueError("point must contain one finite XYZ coordinate")
+    if (
+        primary.ndim != 2
+        or primary.shape[1] != 3
+        or not len(primary)
+        or not np.all(np.isfinite(primary))
+    ):
+        raise ValueError("primary_path must contain finite XYZ coordinates")
+    if (
+        direction.shape != (3,)
+        or not np.all(np.isfinite(direction))
+        or np.linalg.norm(direction) <= 1e-12
+    ):
+        raise ValueError("gravity must contain three finite values and have non-zero length")
+    up = -direction / np.linalg.norm(direction)
+    primary_heights = primary @ up
+    top_height = float(np.max(primary_heights))
+    origin_height = float(np.dot(origin, up))
+    numeric_scale = max(
+        1.0,
+        abs(top_height),
+        abs(origin_height),
+        float(np.ptp(primary_heights)),
+    )
+    tolerance = max(1e-12, 64.0 * np.finfo(float).eps * numeric_scale)
+    return origin_height - top_height, tolerance
+
+
+def is_above_primary_top(
+    point: np.ndarray,
+    primary_path: np.ndarray,
+    *,
+    gravity: np.ndarray = DEFAULT_GRAVITY,
+) -> bool:
+    """Return whether a point is measurably above the primary-root top."""
+
+    excess, tolerance = primary_top_excess(
+        point,
+        primary_path,
+        gravity=gravity,
+    )
+    return bool(excess > tolerance)
 
 
 def resample_polyline(points: np.ndarray, spacing: float) -> np.ndarray:

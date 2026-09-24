@@ -84,6 +84,16 @@ class RootPath:
     # exposed body. Zero means there is no supported internal connector.
     body_start_index: int = 0
     centerline_assessment: dict[str, Any] = field(default_factory=dict)
+    # Alternate continuations emitted at one supported fork share this key and
+    # the same basal prefix.  They remain separate paths so later consensus and
+    # topology passes can preserve both arm geometries while deciding which
+    # arm owns the continuation identity.
+    fork_hypothesis_group: str | None = None
+    fork_hypothesis_index: int = 0
+    fork_common_prefix_nodes: int = 0
+    deferred_fork_hypotheses: list[dict[str, Any]] = field(
+        default_factory=list
+    )
 
     @property
     def length(self) -> float:
@@ -114,12 +124,23 @@ class TopologyReport:
 
     roots_reoriented: int = 0
     parents_reassigned: int = 0
+    attachment_constraint_decisions: list[dict[str, Any]] = field(default_factory=list)
     cycles_removed: int = 0
     fork_arms_reconciled: int = 0
     fork_arm_details: list[dict[str, Any]] = field(default_factory=list)
+    fork_resurvey_iterations: int = 0
+    fork_resurvey_cycle_states: int = 0
+    fork_resurvey_decisions: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_long_arm_details: list[dict[str, Any]] = field(default_factory=list)
     overlong_children_removed: int = 0
     overlong_descendants_removed: int = 0
     overlong_child_details: list[dict[str, Any]] = field(default_factory=list)
+    origins_above_primary_top_removed: int = 0
+    descendants_of_above_top_roots_removed: int = 0
+    above_primary_top_details: list[dict[str, Any]] = field(default_factory=list)
+    primary_top_point_normalized: list[float] = field(default_factory=list)
+    primary_top_reference_policy: str = ""
+    gravity_direction: list[float] = field(default_factory=list)
     disconnected_roots: int = 0
     low_confidence_roots: int = 0
     warnings: list[str] = field(default_factory=list)

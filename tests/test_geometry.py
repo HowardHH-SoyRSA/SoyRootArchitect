@@ -1,6 +1,13 @@
 import numpy as np
 
-from soyrootbio.geometry import mean_nearest_neighbor_distance, normalize_unit_box, path_length, resample_polyline
+from soyrootbio.geometry import (
+    is_above_primary_top,
+    mean_nearest_neighbor_distance,
+    normalize_unit_box,
+    path_length,
+    primary_top_excess,
+    resample_polyline,
+)
 
 
 def test_normalize_unit_box_and_inverse():
@@ -22,4 +29,27 @@ def test_resample_polyline_preserves_length_endpoints():
     np.testing.assert_allclose(resampled[0], points[0])
     np.testing.assert_allclose(resampled[-1], points[-1])
     assert np.isclose(path_length(resampled), 1.0)
+
+
+def test_primary_top_rule_uses_configured_gravity_axis():
+    primary = np.array(
+        [
+            [2.0, 0.0, 0.0],
+            [1.0, 0.0, 4.0],
+            [0.0, 0.0, 8.0],
+        ]
+    )
+    gravity = np.array([-1.0, 0.0, 0.0])
+
+    assert is_above_primary_top(
+        np.array([2.1, 0.0, -100.0]),
+        primary,
+        gravity=gravity,
+    )
+    excess, tolerance = primary_top_excess(
+        np.array([2.0, 0.0, 100.0]),
+        primary,
+        gravity=gravity,
+    )
+    assert abs(excess) <= tolerance
 
