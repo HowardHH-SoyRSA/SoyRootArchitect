@@ -1,5 +1,16 @@
 # Project rules for future changes
 
+## GPU development and publication
+
+This checkout is the isolated GPU version. Commit and push all future changes
+here to `HowardHH-SoyRSA/SoyRootArchitect`, branch `GPU-version`, never to the
+default/Current-build branch. Use an explicit `HEAD:refs/heads/GPU-version`
+push and verify its remote SHA. Preserve `E:\SoyRSA Build`, its environment,
+outputs, and desktop shortcut. Use `.venv-gpu` and the GPU launcher for this
+checkout. Keep a CPU backend for controlled parity tests. GPU speed claims
+require synchronized timings and whole-bundle comparison against frozen CPU
+source, inputs, sampling and primary guidance.
+
 These rules apply to all changes in this repository, including tracing, segmentation, topology, attachment, cleanup, editing, validation, and export.
 
 1. **Keep the primary-root top immutable.** Once a primary-root top is selected, preserve that same biological reference throughout tracing, topology, attachment, and validation. A shortened final centerline fit must not move or redefine it.

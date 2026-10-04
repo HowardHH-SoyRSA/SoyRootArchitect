@@ -1,0 +1,807 @@
+--- a/src/soyrootbio/centerline.py
++++ b/src/soyrootbio/centerline.py
+@@ -17,6 +17,7 @@
+ from scipy.spatial import ConvexHull, QhullError, cKDTree
+ 
+ from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
++from .native_sections import recovered_wall_sections
+ 
+ from .geometry import (
+     is_above_primary_top,
+@@ -795,7 +796,35 @@
+     )
+ 
+ 
+-def _retained_attachment_prefix(old, body, support, child_hints, top_reference, gravity_direction, spacing):
++def _native_junction_footprint(points, labels, edges, parent_label, child_label,
++                               hint, radius, spacing, top_reference, gravity):
++    """Recover contact evidence across a deliberately unassigned junction cut.
++
++    This certifies topology only. It neither assigns those vertices nor creates
++    a centerline connector. Uncertain/foreign/above-top vertices are barriers.
++    """
++    limit = max(8*spacing, 5*radius)
++    local = np.linalg.norm(points-hint,axis=1) <= limit
++    local &= np.isin(labels, [parent_label, child_label, -1])
++    up = -np.asarray(gravity,dtype=float)
++    up /= max(np.linalg.norm(up),1e-12)
++    local &= (points-np.asarray(top_reference).reshape(3)) @ up <= 1e-12
++    vertices = np.flatnonzero(local)
++    if not np.any(labels[vertices]==parent_label) or not np.any(labels[vertices]==child_label):
++        return np.empty((0,3))
++    native = edges[local[edges].all(axis=1)]
++    links = np.searchsorted(vertices,native)
++    length = np.linalg.norm(points[native[:,0]]-points[native[:,1]],axis=1)
++    graph = coo_matrix((np.r_[length,length], (np.r_[links[:,0],links[:,1]],
++        np.r_[links[:,1],links[:,0]])),shape=(len(vertices),len(vertices))).tocsr()
++    distance = dijkstra(graph,directed=False,indices=np.flatnonzero(labels[vertices]==parent_label),
++                        min_only=True,limit=max(4*spacing,3*radius))
++    reached = (labels[vertices]==child_label) & np.isfinite(distance)
++    return points[vertices[reached]]
++
++
++def _retained_attachment_prefix(old, body, support, child_hints, top_reference, gravity_direction, spacing,
++                                *, measured_radius=None):
+     """Keep a repaired basal path only when it joins the fitted body locally.
+ 
+     The old path is topology evidence, not new owned surface. A distant join
+@@ -816,17 +845,42 @@
+     last_required = max(required)
+     if last_required >= len(old) - 1:
+         return None
+-    tail = old[last_required + 1:]
+-    join_index = last_required + 1 + int(np.argmin(np.linalg.norm(tail - body[0], axis=1)))
+-    join_gap = float(np.linalg.norm(old[join_index] - body[0]))
+-    if join_gap > 3.0 * spacing:
++    # A basal cross-section can move radially while the next few fitted
++    # sections converge on the retained attachment. Search only a short local
++    # overlap; joining a later turn would silently skip the supported body.
++    old_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(old, axis=0), axis=1))]
++    body_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(body, axis=0), axis=1))]
++    nearest_start = last_required + 1 + int(np.argmin(
++        np.linalg.norm(old[last_required + 1:] - body[0], axis=1)))
++    # A recovered thick shaft may need several transverse radii to converge
++    # after a basal branch junction. Bound the overlap independently of root
++    # length, and retain the same small, surface-supported bridge limit.
++    overlap = 8.0 * spacing
++    if measured_radius is not None and np.isfinite(measured_radius):
++        overlap = max(overlap, min(24.0 * spacing, 6.0 * measured_radius))
++    old_indices = np.flatnonzero((np.arange(len(old)) > last_required)
++                                & (np.abs(old_arc - old_arc[nearest_start]) <= overlap))
++    body_indices = np.flatnonzero(body_arc <= overlap)
++    join = None
++    for body_index in body_indices:
++        distances = np.linalg.norm(old[old_indices] - body[body_index], axis=1)
++        for offset in np.argsort(distances, kind='stable'):
++            if distances[offset] > 3.0 * spacing:
++                break
++            index = int(old_indices[offset])
++            bridge = np.vstack((old[index], body[body_index]))
++            if distances[offset] > 1e-10 and not _supported_connector(bridge, support, support, spacing):
++                continue
++            join = index, int(body_index), float(distances[offset])
++            break
++        if join is not None:
++            break
++    if join is None:
+         return None
+-    if join_gap > 1e-10:
+-        if not len(support):
+-            return None
+-        bridge_samples = np.linspace(old[join_index], body[0], 5)
+-        if np.max(cKDTree(support).query(bridge_samples)[0]) > 2.0 * spacing:
+-            return None
++    join_index, body_index, join_gap = join
++    body = body[body_index:]
++    if len(body) < 2:
++        return None
+     incoming = old[join_index] - old[join_index - 1]
+     outgoing = body[1] - body[0]
+     if float(np.dot(incoming, outgoing)) < -0.25 * float(np.linalg.norm(incoming) * np.linalg.norm(outgoing)):
+@@ -946,6 +1000,7 @@
+     for root in roots:
+         hint = root.insertion_point if root.insertion_point is not None else prior[root.root_id][0]
+         child_hints.setdefault(root.parent_id, []).append((root.root_id, np.asarray(hint, dtype=float).copy()))
++    original_child_hints = {parent_id: list(hints) for parent_id, hints in child_hints.items()}
+     staged = {}
+     for root in [None, *ordered]:
+         if cooperate:
+@@ -984,7 +1039,29 @@
+                 body = np.median(support, axis=0)[None, :]
+                 detail["status"] = "insufficient_support"
+             else:
+-                if root is None:
++                if root is not None and root.score_components.get("native_recovered_extension", 0) > 0 and triangles is not None and len(triangles):
++                    section_context = mesh_context or MeshGeometryContext.build(points, triangles)
++                    _, _, initial, measured = recovered_wall_sections(points, labels, old, label,
++                        section_context, spacing, labels != label)
++                    # Missing contour stations at child junctions must not
++                    # alternate between a measured centre and an off-centre
++                    # prior. This is only a pilot: the subsequent section fit
++                    # independently requires final owned surface throughout.
++                    measured_indices = np.flatnonzero(measured)
++                    for first, last in zip(measured_indices[:-1], measured_indices[1:]):
++                        if last - first <= 12:  # at most 24 full-resolution spacings
++                            initial[first:last+1] = np.linspace(initial[first], initial[last], last-first+1)
++                    for _ in range(2):
++                        initial[1:-1] = (initial[:-2] + 2*initial[1:-1] + initial[2:])/4
++                    body, fit_report = _fit_primary_body(support, initial, spacing,
++                        vertex_area_weights[indices][keep])
++                    if not fit_report.get('fit_applied', False):
++                        body = old.copy()
++                    fit_report['method'] = 'native-contour-guided-recovered-body'
++                    fit_report['native_measured_section_count'] = int(measured.sum())
++                    fit_report['qc_flags'] = [flag.replace('centerline_primary_', 'centerline_recovered_')
++                                             for flag in fit_report.get('qc_flags', [])]
++                elif root is None:
+                     body, fit_report = _fit_primary_body(
+                         support,
+                         old,
+@@ -1019,6 +1096,73 @@
+         if detail["status"] != "fitted":
+             flags.append("centerline_" + detail["status"])
+         staged[rid] = (body, support, detail, flags)
++
++    # A late recovered shaft can have an off-centre prior. Resolve its child
++    # origins against frozen native junction footprints before the parent
++    # family is committed; stale radial hint positions are not immutable tops.
++    if triangles is not None and len(triangles):
++        for parent_root in ordered:
++            parent_id = parent_root.root_id
++            if parent_root.score_components.get("native_recovered_extension", 0) <= 0:
++                continue
++            parent_body, parent_surface, parent_detail, _ = staged[parent_id]
++            if not parent_detail.get("fit_applied", False) or len(parent_surface) < 8:
++                continue
++            parent_tree = cKDTree(parent_surface)
++            revised = []
++            for child_id, hint in child_hints.get(parent_id, []):
++                nearest = int(np.argmin(np.linalg.norm(parent_body-hint, axis=1)))
++                radius = max(d_bar, float(np.median(parent_tree.query(parent_body[nearest], k=16)[0])))
++                # Oblique emergence has a longitudinal footprint several
++                # parent radii long; use the attachment survey's five-radius
++                # neighbourhood, still requiring observed native contact.
++                limit = max(8*d_bar, 5*radius)
++                boundary = ownership.boundary_edges(by_id[parent_id][0], by_id[child_id][0], edges)
++                contacts = points[np.unique(boundary)]
++                contact_mode = "direct_native_contact"
++                if not len(contacts):
++                    contacts = _native_junction_footprint(points, labels, edges,
++                        by_id[parent_id][0], by_id[child_id][0], hint, radius, d_bar,
++                        top_reference, gravity_direction)
++                    contact_mode = "bounded_native_path_across_unassigned_cut"
++                replacement = None
++                connector_supported = False
++                if len(contacts):
++                    candidates = _legal_attachment_indices(parent_body, top_reference, gravity_direction)
++                    candidates = candidates[np.linalg.norm(parent_body[candidates]-hint,axis=1)<=limit]
++                    near_contact = cKDTree(contacts).query(parent_body[candidates])[0]<=limit
++                    if not np.any(near_contact) and contact_mode == "direct_native_contact":
++                        contacts = _native_junction_footprint(points, labels, edges,
++                            by_id[parent_id][0], by_id[child_id][0], hint, radius, d_bar,
++                            top_reference, gravity_direction)
++                        contact_mode = "bounded_native_path_across_unassigned_cut"
++                        near_contact = (cKDTree(contacts).query(parent_body[candidates])[0]<=limit
++                                        if len(contacts) else np.zeros(len(candidates),bool))
++                    candidates = candidates[near_contact]
++                    child_body, child_surface, _, _ = staged[child_id]
++                    for index in candidates[np.argsort(np.linalg.norm(parent_body[candidates]-child_body[0],axis=1),kind='stable')]:
++                        if _supported_connector(np.vstack((parent_body[index],child_body[0])),
++                                                parent_surface,child_surface,d_bar):
++                            replacement = parent_body[index].copy()
++                            connector_supported = True
++                            break
++                    if replacement is None and len(candidates):
++                        # Native contact certifies the parent relationship.
++                        # A missing straight internal connector is reported on
++                        # the child below; it must not displace an independently
++                        # supported parent body back onto its old surface wall.
++                        index = candidates[int(np.argmin(np.linalg.norm(parent_body[candidates]-child_body[0],axis=1)))]
++                        replacement = parent_body[index].copy()
++                revised.append((child_id, hint if replacement is None else replacement))
++                if replacement is not None:
++                    parent_detail.setdefault("native_recentered_child_origins", {})[child_id] = {
++                        "prior_hint": hint.tolist(), "resolved_hint": replacement.tolist(),
++                        "displacement": float(np.linalg.norm(replacement-hint)),
++                        "native_contact_vertex_count": int(len(contacts)),
++                        "straight_connector_supported": connector_supported,
++                        "native_contact_mode": contact_mode,
++                    }
++            child_hints[parent_id] = revised
+ 
+     curves, supports, reports = {}, {}, []
+     resolved = {}
+@@ -1090,11 +1234,12 @@
+         # rollback; a locally joined basal prefix retains the accepted body.
+         required = child_hints.get(rid, [])
+         allowed = _legal_attachment_indices(line, top_reference, gravity_direction)
++        shifted = [
++            (child_id, hint) for child_id, hint in required
++            if not len(allowed) or np.min(np.linalg.norm(line[allowed] - hint, axis=1)) > 4.0 * d_bar
++        ]
+         largest_shift = max(
+-            (
+-                float(np.min(np.linalg.norm(line[allowed] - child_hint, axis=1)))
+-                for _, child_hint in required
+-            ),
++            (float(np.min(np.linalg.norm(line[allowed] - hint, axis=1))) for _, hint in shifted),
+             default=0.0,
+         ) if len(allowed) else np.inf
+         if required and (not len(allowed) or root is not None and largest_shift > 4.0 * d_bar):
+@@ -1106,11 +1251,20 @@
+                 old,
+                 body,
+                 support,
+-                [hint for _, hint in required],
++                [hint for _, hint in shifted],
+                 top_reference,
+                 gravity_direction,
+                 d_bar,
++                measured_radius=(detail.get("section_radius_median")
++                                 if detail.get("method") == "native-contour-guided-recovered-body" else None),
+             )
++            if retained is not None:
++                candidate_allowed = _legal_attachment_indices(retained[0], top_reference, gravity_direction)
++                if not len(candidate_allowed) or any(
++                    np.min(np.linalg.norm(retained[0][candidate_allowed] - hint, axis=1)) > 4.0 * d_bar
++                    for child_id, hint in required
++                ):
++                    retained = None
+             if retained is not None:
+                 line, body_start, join_gap = retained
+                 flags.append("centerline_preserved_topology_prefix")
+@@ -1123,7 +1277,7 @@
+                     attachment_preservation_reason=preservation_reason,
+                     preserved_topology_length=path_length(line[:body_start + 1]),
+                     preserved_topology_join_gap=join_gap,
+-                    preserved_topology_required_by=sorted(child_id for child_id, _ in required),
++                    preserved_topology_required_by=sorted(child_id for child_id, _ in shifted),
+                     exposed_body_length=path_length(body),
+                     exposed_body_supported=True,
+                 )
+@@ -1131,6 +1285,10 @@
+                 detail["attachment_gap"] = float(np.linalg.norm(line[0] - anchor))
+             else:
+                 line = old.copy()
++                required = original_child_hints.get(rid, [])
++                child_hints[rid] = required
++                if "native_recentered_child_origins" in detail:
++                    detail["rejected_native_child_origin_proposals"] = detail.pop("native_recentered_child_origins")
+                 body_start = 0 if root is None else int(root.body_start_index)
+                 flags.append("centerline_attachment_preserving_prior_retained")
+                 retained_status = (
+--- /dev/null
++++ b/src/soyrootbio/native_sections.py
+@@ -0,0 +1,111 @@
++"""Closed transverse contours from native triangle intersections."""
++import numpy as np
++from scipy.sparse import coo_matrix
++from scipy.sparse.csgraph import connected_components
++from scipy.spatial import cKDTree
++
++from .geometry import resample_polyline
++from .primary import _plane_basis
++from .surface_patches import _segment_radius_profile
++
++
++def recovered_wall_sections(points, labels, path, owner, context, spacing, excluded):
++    """Measure a recovered shaft without treating a one-sided label as a tube.
++
++    Each accepted contour closes through original triangle edges, contains
++    existing owner support, and stays local to the prior shaft. Missing or
++    competing contours are withheld. Only native vertices of those contours
++    can become wall evidence; offshoot components are never flood-filled.
++    """
++    faces = context.triangles
++    wall = np.zeros(len(points), bool)
++    line = resample_polyline(path, 2 * spacing)
++    centers = line.copy()
++    accepted = np.zeros(len(line), bool)
++    radii = np.full(len(points), spacing)
++    if faces is None or not len(faces) or np.count_nonzero(labels == owner) < 20:
++        return wall, radii, centers, accepted
++    owned = points[labels == owner]
++    ps, pr = _segment_radius_profile(owned, path, spacing)
++    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0),axis=1))]
++    radius = np.interp(arc, ps, pr)
++    width = np.maximum(3*spacing, 2*radius)
++    tangents = np.column_stack([np.interp(np.minimum(arc[-1],arc+width),arc,line[:,i])
++        -np.interp(np.maximum(0,arc-width),arc,line[:,i]) for i in range(3)])
++    tangents /= np.maximum(np.linalg.norm(tangents,axis=1)[:,None],1e-12)
++    incident = coo_matrix((np.ones(faces.size), (faces.ravel(), np.repeat(np.arange(len(faces)),3))),
++                         shape=(len(points),len(faces))).tocsr()
++    unsafe = np.zeros(len(points), bool)
++    unsafe[np.unique(context.edges[context.edge_incidence != 2])] = True
++    eligible = ((labels == -1) | (labels == owner)) & ~excluded & ~unsafe
++    for i, (station, tangent) in enumerate(zip(line,tangents)):
++        station = station + tangent * spacing * 1e-6
++        reach = max(4*radius[i], 8*spacing)
++        nearby = context.point_tree.query_ball_point(station, reach)
++        local_faces = np.unique(incident[nearby].indices)
++        tri = faces[local_faces]
++        tri = tri[eligible[tri].all(axis=1)]
++        heights = (points[tri]-station) @ tangent
++        crosses = (heights.min(axis=1)<0) & (heights.max(axis=1)>0)
++        tri, heights = tri[crosses], heights[crosses]
++        if len(tri)<8:
++            continue
++        edge = tri[:,[[0,1],[1,2],[2,0]]]
++        edge_height = heights[:,[[0,1],[1,2],[2,0]]]
++        cut = edge_height[:,:,0]*edge_height[:,:,1]<0
++        if np.any(cut.sum(axis=1)!=2):
++            continue
++        intersections = np.sort(edge[cut],axis=1)
++        native_edges, node = np.unique(intersections,axis=0,return_inverse=True)
++        segments = node.reshape(-1,2)
++        graph = coo_matrix((np.ones(2*len(segments)), (np.r_[segments[:,0],segments[:,1]],
++                          np.r_[segments[:,1],segments[:,0]])),shape=(len(native_edges),len(native_edges))).tocsr()
++        count, part = connected_components(graph,directed=False)
++        a,b=points[native_edges[:,0]],points[native_edges[:,1]]
++        ha,hb=(a-station)@tangent,(b-station)@tangent
++        xyz=a+(ha/(ha-hb))[:,None]*(b-a)
++        basis=_plane_basis(tangent)
++        uv=(xyz-station)@basis.T
++        candidates=[]
++        for component in range(count):
++            nodes=np.flatnonzero(part==component)
++            if (len(nodes)<8 or np.any(np.diff(graph.indptr)[nodes]!=2)
++                    or np.any(graph[nodes].data != 1)):
++                continue
++            vertices=np.unique(native_edges[nodes])
++            if np.count_nonzero(labels[vertices]==owner)<3:
++                continue
++            sequence=[int(nodes[0])];previous=-1;current=sequence[0]
++            while True:
++                neighbors=graph.indices[graph.indptr[current]:graph.indptr[current+1]]
++                following=int(neighbors[0] if neighbors[0]!=previous else neighbors[1])
++                if following==sequence[0]:
++                    break
++                if following in sequence:
++                    sequence=[];break
++                sequence.append(following);previous,current=current,following
++            if len(sequence)!=len(nodes):
++                continue
++            polygon=uv[sequence];next_polygon=np.roll(polygon,-1,axis=0)
++            cross=polygon[:,0]*next_polygon[:,1]-next_polygon[:,0]*polygon[:,1]
++            area=.5*cross.sum()
++            if abs(area)<spacing**2:
++                continue
++            centroid=((polygon+next_polygon)*cross[:,None]).sum(axis=0)/(6*area)
++            radial=np.linalg.norm(polygon-centroid,axis=1)
++            perimeter=np.linalg.norm(next_polygon-polygon,axis=1).sum()
++            # A long merged side branch is not a transverse shaft section.
++            if (perimeter**2/(4*np.pi*abs(area))>2.5 or radial.max()>3*np.median(radial)
++                    or np.linalg.norm(centroid)>max(3*radius[i],4*spacing)
++                    or np.max(np.linalg.norm(polygon,axis=1))>reach):
++                continue
++            candidates.append((vertices,station+centroid@basis,float(np.median(radial))))
++        if len(candidates)!=1:
++            continue
++        vertices,center,measured=candidates[0]
++        vertices=vertices[np.abs((points[vertices]-station)@tangent)<=2*spacing]
++        wall[vertices]=True
++        radii[vertices]=measured
++        centers[i]=center
++        accepted[i]=True
++    return wall,radii,centers,accepted
+--- a/src/soyrootbio/pipeline.py
++++ b/src/soyrootbio/pipeline.py
+@@ -39,6 +39,7 @@
+ from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
+ from .primary_surface import reconcile_primary_surface_tracks
+ from .fork_recovery import recover_unassigned_fork_arms
++from .recovered_children import recover_children_on_extensions
+ from .junction_transections import trim_primary_junctions
+ from .surface_patches import (
+     correct_surface_patches as _correct_surface_patches,
+@@ -965,6 +966,19 @@
+         ambiguity_margin=max(0.75 * d_bar, 0.001),
+         competing_labels=full_competing_labels,
+     )
++    # Earlier committed topology swaps/joins also postdate lateral tracing;
++    # the recovery pass includes their surviving parents from root provenance.
++    selected, full_root_labels, recovered_children_report = recover_children_on_extensions(
++        full_normalized, full_root_labels, primary.points, selected,
++        parent_ids={row["parent_id"] for row in fork_recovery_report["decisions"]
++                    if row["action"] == "accepted"},
++        d_bar=d_bar, mesh_context=mesh_context, excluded_mask=full_nonroot_mask,
++        analysis_to_mesh=cloud.analysis_indices, primary_top_reference=primary_top_reference,
++        gravity=np.asarray(config.gravity), max_root_order=config.max_root_order,
++        max_paths=config.lateral_max_paths, cooperate=cooperate,
++    )
++    for root in selected:
++        correction_input_fingerprints.setdefault(root.root_id, _polyline_fingerprint(root.points))
+     full_root_labels, selected, primary_surface_report = reconcile_primary_surface_tracks(
+         full_normalized, full_root_labels, primary.points, selected,
+         d_bar=d_bar, triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
+@@ -1456,6 +1470,7 @@
+         ),
+         "internal_o1_contact_decisions": internal_o1_contact_decisions,
+         "unassigned_fork_recovery": fork_recovery_report,
++        "recovered_descendants": recovered_children_report,
+         "primary_surface_track_reconciliation": primary_surface_report,
+         "final_centerline_fitting": final_centerline_report,
+         "branch_facing_transection_trimming": transection_report,
+--- /dev/null
++++ b/src/soyrootbio/recovered_children.py
+@@ -0,0 +1,347 @@
++"""Native-component child discovery on confirmed root continuations."""
++from collections import defaultdict
++from copy import deepcopy
++
++import numpy as np
++from scipy.sparse import coo_matrix
++from scipy.sparse.csgraph import connected_components, dijkstra
++from scipy.spatial import cKDTree
++
++from .lateral import (estimate_parent_radius_profile, find_lateral_starting_points,
++    grow_lateral_candidates, is_parent_tracking_candidate, reduce_similar_paths,
++    resume_lateral_tip_in_batches, select_non_overlapping_paths)
++from .primary_surface import _unsafe_native_vertices
++from .native_sections import recovered_wall_sections
++from .geometry import is_above_primary_top
++from .topology import validate_root_tree, _terminal_continuation_evidence
++
++
++def confirmed_extension_parents(roots, late_parent_ids):
++    """Include committed topology repairs, not merely proposed fork arms.
++
++    Topology repair runs after per-order lateral tracing. Its swapped and
++    joined continuations therefore need the same surface/descendant survey
++    as arms recovered later from unassigned vertices. Use the surviving
++    root's provenance so stable-ID changes do not lose the repaired parent.
++    """
++    markers = ('fork_long_arm_reconciled', 'terminal_continuation_joined',
++               'contacted_sibling_continuation_joined', 'displaced_tip_continuation_joined')
++    return {root.root_id: ([key for key in markers if
++                           root.score_components.get(key, 0) > 0 or key in root.qc_flags]
++                          + (['unassigned_fork_recovered'] if root.root_id in late_parent_ids else []))
++            for root in roots
++            if root.root_id in late_parent_ids or any(
++                root.score_components.get(key, 0) > 0 or key in root.qc_flags for key in markers)}
++
++
++def _free_tip_continuation(points, labels, parent, candidate, paths, *, label,
++                           mesh_context, excluded, spacing):
++    """Assess a free terminal tube using measured native transverse centres.
++
++    The tracing endpoint can sit on one side of an incompletely labelled
++    tube. Closed contours supply direction evidence without changing any
++    assigned ownership. Ordinary radius, competing-arm and mesh checks still
++    apply; only the tracing growth-cap prerequisite is inapplicable here.
++    """
++    if candidate.insertion_index != len(parent.points) - 1:
++        return {'status': 'rejected', 'reason': 'attachment_not_at_parent_tip'}
++    support = np.asarray(sorted(candidate.covered_indices), int)
++    temporary = labels.copy()
++    temporary[support] = label
++    barrier = excluded | ~np.isin(temporary, [-1, label])
++    _, _, pc, pm = recovered_wall_sections(points, temporary, parent.points, label,
++                                           mesh_context, spacing, barrier)
++    _, _, cc, cm = recovered_wall_sections(points, temporary, candidate.points, label,
++                                           mesh_context, spacing, barrier)
++    if pm.sum() < 8 or cm.sum() < 8:
++        return {'status': 'rejected', 'reason': 'terminal_closed_contours_missing'}
++    # Do not let dropping unmeasured contour stations bridge a missing neck.
++    if (len(pm) - 1 - np.flatnonzero(pm)[-1] > 4 or np.flatnonzero(cm)[0] > 4):
++        return {'status': 'rejected', 'reason': 'terminal_closed_contours_not_at_junction'}
++    measured_parent, measured_child = deepcopy(parent), deepcopy(candidate)
++    measured_parent.points = pc[pm]
++    measured_parent.covered_indices = set(np.flatnonzero(labels == label).tolist())
++    measured_parent.novel_support_indices = set(measured_parent.covered_indices)
++    measured_child.points = np.vstack([measured_parent.points[-1], cc[cm]])
++    measured_child.insertion_index = len(measured_parent.points) - 1
++    measured_child.insertion_point = measured_parent.points[-1].copy()
++    measured_child.score_components['novel_density_support'] = float(len(support))
++    # Existing paths carry analysis indices; the ownership snapshot is the
++    # full mesh. Native foreign-label barriers already exclude their support.
++    others = [deepcopy(root) for root in paths if root is not parent and root is not candidate]
++    for root in others:
++        root.covered_indices = set()
++        root.novel_support_indices = set()
++    evidence = _terminal_continuation_evidence(measured_parent, measured_child,
++        [measured_parent, measured_child, *others], spacing=spacing, support_points=points,
++        mesh_points=points, mesh_triangles=mesh_context.triangles,
++        mesh_excluded_mask=barrier, mesh_tree=mesh_context.point_tree,
++        mesh_context=mesh_context, require_growth_cap=False)
++    if evidence['status'] == 'accepted':
++        # A terminal curve must not return to the established basal body.
++        basal = parent.points[:-max(4, int(np.ceil(.02 * len(parent.points))))]
++        if len(basal) and cKDTree(basal).query(candidate.points[-1])[0] <= max(
++                4 * spacing, 2 * evidence['parent_radius']):
++            evidence.update(status='rejected', reason='continuation_loops_into_parent')
++    evidence.update(parent_measured_sections=int(pm.sum()), child_measured_sections=int(cm.sum()))
++    return evidence
++
++
++def fill_recovered_surfaces(points, labels, roots, parent_ids, *, mesh_context, d_bar, excluded_mask):
++    """Fill only measured free wall connected locally to its frozen owner.
++
++    Offshoots can share a free component with a hole in the parent wall. A
++    whole-component fill or branch trace cannot distinguish the two. Closed
++    transverse evidence and a bounded smooth native path separate the wall;
++    competing claims and every already assigned/uncertain vertex are retained.
++    """
++    before = np.asarray(labels, int)
++    result = before.copy()
++    proposals = np.full(len(points), -1, int)
++    conflicts = np.zeros(len(points), bool)
++    report = {'changed_vertex_count': 0, 'roots': []}
++    faces = mesh_context.triangles
++    if faces is None or not len(faces) or not parent_ids:
++        return result, report
++    unsafe = _unsafe_native_vertices(faces, len(points)) | excluded_mask
++    normals = np.zeros_like(points)
++    face_normal = np.cross(points[faces[:,1]]-points[faces[:,0]], points[faces[:,2]]-points[faces[:,0]])
++    for column in range(3):
++        np.add.at(normals, faces[:,column], face_normal)
++    normals /= np.maximum(np.linalg.norm(normals,axis=1)[:,None], 1e-12)
++    edges = mesh_context.bounded_edges(d_bar)
++    smooth = np.einsum('ij,ij->i',normals[edges[:,0]],normals[edges[:,1]]) >= np.cos(np.deg2rad(30))
++    edges = edges[smooth & ~unsafe[edges].any(axis=1)]
++    for label, root in enumerate(roots, 1):
++        if root.root_id not in parent_ids:
++            continue
++        wall, radius, centers, measured = recovered_wall_sections(points, before, root.points,
++            label, mesh_context, d_bar, unsafe | ((before != -1) & (before != label)))
++        active = ((before == label) | ((before == -1) & wall)) & ~unsafe
++        local = edges[active[edges].all(axis=1)]
++        cost = np.linalg.norm(points[local[:,0]]-points[local[:,1]],axis=1) / np.maximum(
++            .5*(radius[local[:,0]]+radius[local[:,1]]), d_bar)
++        graph = coo_matrix((np.r_[cost,cost], (np.r_[local[:,0],local[:,1]],
++            np.r_[local[:,1],local[:,0]])), shape=(len(points),len(points))).tocsr()
++        seeds = np.flatnonzero((before == label) & ~unsafe)
++        distance = (dijkstra(graph, directed=False, indices=seeds, min_only=True, limit=3.)
++                    if len(seeds) else np.full(len(points), np.inf))
++        claim = (before == -1) & active & np.isfinite(distance)
++        conflicts |= claim & (proposals >= 0)
++        proposals[claim] = label
++        report['roots'].append({'root_id': root.root_id, 'accepted_section_count': int(measured.sum()),
++                               'proposed_vertex_count': int(claim.sum())})
++    take = (proposals >= 0) & ~conflicts
++    result[take] = proposals[take]
++    report['changed_vertex_count'] = int(take.sum())
++    report['competing_vertex_count'] = int(conflicts.sum())
++    return result, report
++
++
++def recover_children_on_extensions(points, labels, primary, roots, *, parent_ids, d_bar,
++    mesh_context, excluded_mask, analysis_to_mesh, primary_top_reference, gravity,
++    max_root_order=3, max_paths=None, cooperate=None):
++    """Use frozen native ownership; never search inside another assigned root.
++
++    A free component needs exactly one eligible touching parent. Parameter
++    variants compete for its support before any new root is committed. New
++    children can expose further children up to the requested order.
++    """
++    parent_reasons = confirmed_extension_parents(roots, parent_ids)
++    report = {'policy': 'native-recovered-descendants-v2', 'accepted_count': 0, 'decisions': [],
++              'survey_parent_reasons': parent_reasons, 'terminal_continuations': []}
++    if (not parent_reasons or mesh_context is None or mesh_context.triangles is None
++            or not len(mesh_context.triangles)):
++        return roots, np.asarray(labels).copy(), report
++    p = np.asarray(points)
++    mesh_context.validate(p, mesh_context.triangles)
++    excluded = np.asarray(excluded_mask, bool)
++    working = np.asarray(labels, int).copy()
++    result = list(roots)
++    focus = set(parent_reasons)
++    edges = mesh_context.bounded_edges(d_bar)
++    unsafe = _unsafe_native_vertices(mesh_context.triangles, len(p)) | excluded
++    used_ids = {str(r.root_id) for r in roots}
++    native_support = {}
++    working, surface_report = fill_recovered_surfaces(p, working, result, focus,
++        mesh_context=mesh_context, d_bar=d_bar, excluded_mask=excluded)
++    changed_parents = set(parent_ids) | {row['root_id'] for row in surface_report['roots']
++                                        if row['proposed_vertex_count'] > 0}
++    report['surface_passes'] = [surface_report]
++    # A terminal continuation consumes a survey pass but not a root order.
++    for generation in range(2 * max_root_order):
++        if max_paths is not None and len(result) >= max_paths:
++            break
++        eligible = {i: r for i, r in enumerate(result, 1)
++                    if r.root_id in focus and r.order < max_root_order}
++        if not eligible:
++            break
++        free = (working == -1) & ~excluded
++        same = edges[free[edges].all(axis=1)]
++        graph = coo_matrix((np.ones(len(same)), (same[:, 0], same[:, 1])),
++                           shape=(len(p), len(p))).tocsr()
++        _, component = connected_components(graph, directed=False)
++        members_by_part = {}
++        free_indices = np.flatnonzero(free)
++        order = np.argsort(component[free_indices], kind='stable')
++        ordered = free_indices[order]
++        cuts = np.flatnonzero(np.diff(component[ordered])) + 1
++        for members in np.split(ordered, cuts):
++            if len(members) >= 30:
++                members_by_part[int(component[members[0]])] = members
++        boundary = edges[free[edges[:, 0]] ^ free[edges[:, 1]]]
++        contacts = defaultdict(list)
++        owners = defaultdict(set)
++        for a, b in boundary:
++            vertex, other = (a, b) if free[a] else (b, a)
++            part = int(component[vertex]); owner = int(working[other])
++            if owner >= 0:
++                owners[part].add(owner)
++            if owner in eligible:
++                contacts[part].append(int(vertex))
++        proposals = []
++        for part in sorted(contacts, key=lambda value: members_by_part[value][0] if value in members_by_part else len(p)):
++            if cooperate:
++                cooperate()
++            members = members_by_part.get(part)
++            if members is None or len(owners[part]) != 1:
++                continue
++            label = next(iter(owners[part])); parent = eligible[label]
++            contact = np.unique(contacts[part])
++            if np.any(unsafe[contact]):
++                continue
++            parent_tree = cKDTree(parent.points)
++            support = p[working == label]
++            radius = estimate_parent_radius_profile(parent.points, support, d_bar, parent_tree=parent_tree)
++            blocked = np.ones(len(p), bool); blocked[members] = False
++            starts = find_lateral_starting_points(p, blocked, parent.points,
++                min_cluster_size=4, max_parent_distance=np.maximum(3*radius, 12*d_bar),
++                minimum_branch_angle_degrees=18., exclude_parent_tip_fraction=0.,
++                parent_surface_points=support, surface_contact_distance=2.5*d_bar,
++                parent_tree=parent_tree)
++            starts = [start for start in starts if not is_above_primary_top(
++                start.primary_point, np.asarray(primary_top_reference)[None], gravity=np.asarray(gravity))]
++            candidates = reduce_similar_paths(grow_lateral_candidates(p, starts, parent.points,
++                blocked, d_bar, max_steps=50, point_tree=mesh_context.point_tree,
++                parent_tree=parent_tree, parent_radius_profile=radius, cooperate=cooperate))
++            accepted = []
++            for candidate in candidates:
++                resume_lateral_tip_in_batches(p, candidate, blocked, d_bar,
++                    point_tree=mesh_context.point_tree, cooperate=cooperate)
++                covered = np.asarray(sorted(candidate.covered_indices), int)
++                if len(covered) < 30 or np.any(blocked[covered] | unsafe[covered]):
++                    continue
++                rejected, metrics = is_parent_tracking_candidate(candidate, parent.points, radius, d_bar,
++                                                                 parent_tree=parent_tree)
++                candidate.score_components.update(metrics)
++                if rejected:
++                    continue
++                accepted.append(candidate)
++            selected = select_non_overlapping_paths(accepted, p, d_bar, rename_selected=False,
++                                                    point_tree=mesh_context.point_tree)
++            for candidate in selected:
++                # Attach within this native contact footprint, not at a nearby
++                # turn or a neighbouring root with a similar spatial position.
++                near = contact[np.argmin(np.linalg.norm(p[contact]-candidate.points[0], axis=1))]
++                index = int(parent_tree.query(p[near])[1])
++                candidate.points = np.vstack((parent.points[index], candidate.points))
++                candidate.parent_id = parent.root_id
++                candidate.parent_points = parent.points
++                candidate.order = parent.order + 1
++                candidate.insertion_index = index
++                candidate.insertion_point = parent.points[index].copy()
++                candidate.score_components['native_recovered_child'] = 1.
++                candidate.qc_flags.append('native_recovered_child')
++                proposals.append((part, parent, candidate))
++            report['decisions'].append({'parent_id': str(parent.root_id), 'component_first_vertex': int(members[0]),
++                'component_size': len(members), 'start_count': len(starts), 'candidate_count': len(candidates),
++                'selected_count': len(selected), 'generation': generation})
++        focus = set()
++        generation_claims = np.full(len(p), -1, int)
++        contested = np.zeros(len(p), bool)
++        terminal = {}
++        for part, parent, candidate in proposals:
++            if candidate.insertion_index != len(parent.points) - 1:
++                continue
++            parent_label = next(i for i, root in enumerate(result, 1) if root is parent)
++            evidence = _free_tip_continuation(p, working, parent, candidate,
++                result + [row[2] for row in proposals], label=parent_label,
++                mesh_context=mesh_context, excluded=unsafe, spacing=d_bar)
++            report['terminal_continuations'].append({'parent_id': parent.root_id,
++                'component_first_vertex': int(members_by_part[part][0]), **evidence})
++            if evidence['status'] == 'accepted':
++                terminal[id(candidate)] = parent_label
++        joined_parents = set()
++        for part, parent, candidate in proposals:
++            if id(candidate) in terminal:
++                label = terminal[id(candidate)]
++                parent.points = np.vstack([parent.points, candidate.points[1:]])
++                parent.node_indices = None
++                for descendant in result:
++                    if descendant.parent_id == parent.root_id:
++                        descendant.parent_points = parent.points
++                # Translate only this new full-mesh support into the parent's
++                # existing analysis-index space.
++                indices = np.asarray(sorted(candidate.covered_indices), int)
++                full = np.zeros(len(p), bool); full[indices] = True
++                if parent.root_id in native_support:
++                    native_support[parent.root_id].update(indices.tolist())
++                    added = set(indices.tolist())
++                else:
++                    added = set(np.flatnonzero(full[analysis_to_mesh]).tolist()) if analysis_to_mesh is not None else set(indices.tolist())
++                parent.covered_indices |= added
++                parent.novel_support_indices = set(parent.novel_support_indices or ()) | added
++                parent.score_components['native_terminal_continuation_joined'] = 1.
++                if 'native_terminal_continuation_joined' not in parent.qc_flags:
++                    parent.qc_flags.append('native_terminal_continuation_joined')
++                claim = indices[working[indices] == -1]
++                contested[claim] |= generation_claims[claim] >= 0
++                generation_claims[claim] = label
++                changed_parents.add(parent.root_id)
++                joined_parents.add(parent.root_id)
++                focus.add(parent.root_id)
++                continue
++            if max_paths is not None and len(result) >= max_paths:
++                break
++            number = 1
++            while f'root-o{candidate.order}-{number:03d}' in used_ids:
++                number += 1
++            candidate.root_id = f'root-o{candidate.order}-{number:03d}'
++            used_ids.add(candidate.root_id)
++            native_support[candidate.root_id] = set(candidate.covered_indices)
++            trial = result + [candidate]
++            if validate_root_tree(trial, primary_path=primary,
++                    primary_top_reference=primary_top_reference, gravity=np.asarray(gravity)):
++                continue
++            result.append(candidate)
++            changed_parents.add(parent.root_id)
++            focus.add(candidate.root_id)
++            # A temporary ownership snapshot is used only to discover the next
++            # order. Existing assigned/uncertain/collar labels remain barriers.
++            indices = np.asarray(sorted(candidate.covered_indices), int)
++            claim = indices[working[indices] == -1]
++            contested[claim] |= generation_claims[claim] >= 0
++            generation_claims[claim] = len(result)
++            report['accepted_count'] += 1
++        take = (generation_claims >= 0) & ~contested
++        working[take] = generation_claims[take]
++        working[contested] = -2
++        if joined_parents:
++            working, surface_report = fill_recovered_surfaces(p, working, result, joined_parents,
++                mesh_context=mesh_context, d_bar=d_bar, excluded_mask=excluded)
++            report['surface_passes'].append(surface_report)
++        if not focus:
++            break
++    for root in result:
++        if root.root_id in changed_parents:
++            root.score_components['native_recovered_extension'] = 1.
++    if analysis_to_mesh is not None:
++        for root in result:
++            if root.root_id not in native_support:
++                continue
++            full = np.zeros(len(p), bool)
++            full[list(native_support[root.root_id])] = True
++            root.covered_indices = set(np.flatnonzero(full[analysis_to_mesh]).tolist())
++            root.novel_support_indices = set(root.covered_indices)
++    report['accepted_root_ids'] = sorted(native_support.keys() & {r.root_id for r in result})
++    return result, working, report
+--- a/src/soyrootbio/topology.py
++++ b/src/soyrootbio/topology.py
+@@ -1017,13 +1017,19 @@
+     mesh_excluded_mask: np.ndarray | None,
+     mesh_tree: cKDTree,
+     mesh_context: MeshGeometryContext | None = None,
++    require_growth_cap: bool = True,
+ ) -> dict[str, object]:
+-    """Require a single sustained tube beyond a capped parent endpoint."""
++    """Require a single sustained tube beyond a parent endpoint.
++
++    Existing child absorption requires a growth cap. A newly traced free
++    native component at a confirmed repaired tip may lack that tracing flag;
++    its caller can waive the flag while retaining all geometric checks.
++    """
+ 
+     evidence: dict[str, object] = {"status": "rejected", "reason": ""}
+     parent_points = np.asarray(parent.points, dtype=float)
+     child_points = np.asarray(child.points, dtype=float)
+-    if "tip_extension_limit" not in parent.qc_flags:
++    if require_growth_cap and "tip_extension_limit" not in parent.qc_flags:
+         evidence["reason"] = "parent_did_not_reach_growth_cap"
+         return evidence
+     if child.insertion_index != len(parent_points) - 1:
+@@ -1033,7 +1039,7 @@
+         evidence["reason"] = "centerline_tip_gap"
+         return evidence
+     child_length = float(child.length)
+-    if child_length < 24.0 * spacing:
++    if child_length < (24.0 if require_growth_cap else 8.0) * spacing:
+         evidence["reason"] = "continuation_not_sustained"
+         return evidence
+     support_count = float(child.score_components.get(

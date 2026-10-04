@@ -1,0 +1,160 @@
+{
+  "verified_at_local_date": "2026-10-04",
+  "reviewer": "GPT-6.1 Sol, Extra High",
+  "dependency_thread": {
+    "id": "01a0fd65-6c4f-75d1-a799-72a50174a8cc",
+    "title": "Install GPU Python libraries",
+    "turns_reviewed": 2,
+    "final_installation_turn_status": "completed"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "driver": "616.56",
+    "memory_mib": 32607,
+    "compute_capability": "12.0"
+  },
+  "windows": {
+    "python": "3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:05:38) [MSC v.1929 64 bit (AMD64)]",
+    "executable": "C:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\work\\gpu-windows\\Scripts\\python.exe",
+    "packages": {
+      "cupy-cuda13x": "14.2.0",
+      "torch": "2.13.0+cu130",
+      "numba": "0.68.0",
+      "numba-cuda": "0.30.4",
+      "numpy": "2.4.6",
+      "cuda-toolkit": "13.4.2",
+      "nvidia-nvvm": "13.0.88"
+    },
+    "application_modules": {
+      "scipy": false,
+      "sklearn": false,
+      "networkx": true,
+      "open3d": false,
+      "pandas": false,
+      "trimesh": false,
+      "plotly": false,
+      "tkinter": true,
+      "pytest": false
+    },
+    "pip_check": "No broken requirements found.",
+    "smoke_tests": {
+      "cupy_sum": 45,
+      "numba_cuda_add_one": "passed",
+      "torch_sum": 45,
+      "import_orders": [
+        "torch-first",
+        "cupy-first"
+      ],
+      "float64_sparse_point_segment": {
+        "kind": "float64_sparse_point_segment_smoke",
+        "pair_count": 4096,
+        "zero_length_segments": 16,
+        "dtype": "float64",
+        "fast_math": false,
+        "fmad": false,
+        "max_absolute_error": 0,
+        "np_allclose_1e_14": true,
+        "gpu_device": "NVIDIA GeForce RTX 5090",
+        "compute_capability": [
+          12,
+          0
+        ],
+        "gpu_memory_bytes": 34162016256,
+        "cuda_runtime_version": 13020,
+        "cuda_driver_version": 13040,
+        "application_modules": {
+          "open3d": false,
+          "numpy": true,
+          "scipy": false,
+          "hdbscan": false,
+          "sklearn": false,
+          "networkx": true,
+          "pandas": false,
+          "matplotlib": false,
+          "openpyxl": false,
+          "psutil": false,
+          "threadpoolctl": false,
+          "flask": false,
+          "tkinterdnd2": false,
+          "pytest": false,
+          "cuml": false,
+          "cugraph": false
+        }
+      }
+    }
+  },
+  "wsl": {
+    "distribution": "Ubuntu-24.04",
+    "user": "gpu",
+    "executable": "/home/gpu/gpu-stack/bin/python",
+    "packages": {
+      "cupy-cuda13x": "14.2.0",
+      "torch": "2.14.1+cu132",
+      "numba": "0.64.0",
+      "numba-cuda": "0.30.4",
+      "numpy": "2.4.6",
+      "cuml-cu13": "26.8.0",
+      "cugraph-cu13": "26.8.0"
+    },
+    "pip_check": "No broken requirements found.",
+    "smoke_tests": {
+      "cupy_sum": 45,
+      "numba_cuda_add_one": "passed",
+      "torch_sum": 45,
+      "cuml_kmeans": "two clusters",
+      "cugraph_pagerank": "three vertices",
+      "import_order": "torch-first"
+    },
+    "sandbox_access": "Initial Wsl/Service/E_ACCESSDENIED resolved by approved require_escalated read-only commands."
+  },
+  "cpu_runtime": {
+    "executable": "E:\\SoyRSA Build\\.venv\\Scripts\\python.exe",
+    "gpu_modules_installed": false,
+    "numpy": "2.5.1",
+    "scipy": "1.18.0",
+    "cupy_compatibility_smoke": {
+      "cpu_numpy": "2.5.1",
+      "numpy_path": "E:\\SoyRSA Build\\.venv\\Lib\\site-packages\\numpy\\__init__.py",
+      "cupy": "14.2.0",
+      "cupy_path": "C:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\work\\gpu-windows\\Lib\\site-packages\\cupy\\__init__.py",
+      "sum": 49995000,
+      "raw_float64_kernel_exact": true,
+      "python_executable": "E:\\SoyRSA Build\\.venv\\Scripts\\python.exe",
+      "test_only_foreign_site_packages_added": true
+    },
+    "mutation": "No installed packages or source changed; GPU wheel search paths added only in transient test process."
+  },
+  "isolated_gpu_application": {
+    "editable_source_root": "C:\\Users\\57340\\.codex\\worktrees\\0be1\\SoyRSA Build\\src",
+    "editable_pth_count": 1,
+    "other_pth_files": ["distutils-precedence.pth"],
+    "cpu_editable_source_root": "E:\\SoyRSA Build\\src",
+    "include_system_site_packages": false,
+    "python": "3.12.14",
+    "isolated_runtime_verification_scope": "Read-only editable package and CUDA package metadata; final runtime CUDA tests and pip check performed by implementation agent.",
+    "preferred_backend": "Native Windows CuPy sparse float64 RawKernel",
+    "minimal_package_set_to_validate": {
+      "cupy-cuda13x": "14.2.0",
+      "cuda-pathfinder": "1.8.3",
+      "nvidia-cuda-runtime": "13.4.92",
+      "nvidia-cuda-nvrtc": "13.4.92"
+    },
+    "bootstrap": "Normal install into isolated interpreter enables pathfinder DLL/header discovery; set writable CUPY_CACHE_DIR. A bare sys.path append is insufficient.",
+    "not_required_for_selected_kernel": [
+      "torch",
+      "numba",
+      "numba-cuda",
+      "cuml",
+      "cugraph",
+      "nvidia-nvvm"
+    ],
+    "requires_application_dependencies": true
+  },
+  "evidence": {
+    "original_verifier": "C:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\outputs\\verify_gpu.py",
+    "windows_output": "C:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\work\\gpu-windows\\Lib\\site-packages\\numba_cuda\\numba\\cuda\\dispatcher.py:748: NumbaPerformanceWarning: Grid size 1 will likely result in GPU under-utilization due to low occupancy.\r\n  warn(errors.NumbaPerformanceWarning(msg))\r\nCuPy 14.2.0: GPU sum = 45\r\nNumba 0.68.0: CUDA kernel passed\r\nPyTorch 2.13.0+cu130: GPU sum = 45; device = NVIDIA GeForce RTX 5090\r\nNo broken requirements found.\r\n{\"python\": \"3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:05:38) [MSC v.1929 64 bit (AMD64)]\", \"executable\": \"C:\\\\Users\\\\57340\\\\Documents\\\\Codex\\\\2026-10-03\\\\cupy-pytorch-numba-cuml-and-cugraph\\\\work\\\\gpu-windows\\\\Scripts\\\\python.exe\", \"packages\": {\"cupy-cuda13x\": \"14.2.0\", \"torch\": \"2.13.0+cu130\", \"numba\": \"0.68.0\", \"numba-cuda\": \"0.30.4\", \"numpy\": \"2.4.6\", \"cuda-toolkit\": \"13.4.2\", \"nvidia-nvvm\": \"13.0.88\"}, \"application_modules\": {\"scipy\": false, \"sklearn\": false, \"networkx\": true, \"open3d\": false, \"pandas\": false, \"trimesh\": false, \"plotly\": false, \"tkinter\": true, \"pytest\": false}}\r\n",
+    "wsl_output": "/home/gpu/gpu-stack/lib/python3.12/site-packages/cugraph/link_analysis/pagerank.py:206: UserWarning: Pagerank expects the 'store_transposed' flag to be set to 'True' for optimal performance during the graph creation\n  warnings.warn(warning_msg, UserWarning)\nCuPy 14.2.0: GPU sum = 45\nNumba 0.64.0: CUDA kernel passed\nPyTorch 2.14.1+cu132: GPU sum = 45; device = NVIDIA GeForce RTX 5090\ncuML 26.08.00: KMeans found two clusters\ncuGraph 26.08.00: PageRank returned three vertices\nNo broken requirements found.\naiohappyeyeballs==2.7.1\naiohttp==3.14.3\naiosignal==1.4.0\nattrs==26.1.0\ncachetools==7.2.0\nclick==8.5.0\ncloudpickle==3.1.2\ncuda-bindings==13.4.3\ncuda-core==1.2.1\ncuda-pathfinder==1.8.3\ncuda-toolkit==13.2.2\ncudf-cu13==26.8.1\ncugraph-cu13==26.8.0\ncuml-cu13==26.8.0\ncupy-cuda13x==14.2.0\ndask==2026.7.1\ndask-cuda==26.8.0\ndask-cudf-cu13==26.8.1\ndistributed==2026.7.1\ndistributed-ucxx-cu13==0.51.1\nfilelock==3.32.3\nfrozenlist==1.8.0\nfsspec==2026.9.0\nidna==3.20\nJinja2==3.1.6\njoblib==1.6.0\nlibcudf-cu13==26.8.1\nlibcugraph-cu13==26.8.0\nlibcuml-cu13==26.8.0\nlibcuvs-cu13==26.8.1\nlibkvikio-cu13==26.8.0\nlibnvforest-cu13==26.8.0\nlibraft-cu13==26.8.0\nlibrmm-cu13==26.8.0\nlibucx-cu13==1.20.1\nlibucxx-cu13==0.51.1\nllvmlite==0.46.0\nlocket==1.0.0\nmarkdown-it-py==4.2.0\nMarkupSafe==3.0.4\nmdurl==0.1.2\nmpmath==1.3.0\nmsgpack==1.2.3\nmultidict==6.9.1\nnarwhals==2.26.0\nnetworkx==3.6.1\nnumba==0.64.0\nnumba-cuda==0.30.4\nnumba_cuda_mlir==0.5.4\nnumpy==2.4.6\nnvforest-cu13==26.8.0\nnvidia-cublas==13.4.1.3\nnvidia-cuda-cccl==13.3.4.3.1\nnvidia-cuda-crt==13.4.92\nnvidia-cuda-cupti==13.2.86\nnvidia-cuda-nvcc==13.4.92\nnvidia-cuda-nvrtc==13.2.86\nnvidia-cuda-runtime==13.2.86\nnvidia-cudnn-cu13==9.24.0.43\nnvidia-cufft==12.2.0.57\nnvidia-cufile==1.17.1.22\nnvidia-curand==10.4.2.66\nnvidia-cusolver==12.2.0.11\nnvidia-cusparse==12.7.10.12\nnvidia-cusparselt-cu13==0.8.1\nnvidia-libnvcomp-cu13==5.3.0.16\nnvidia-ml-py==13.615.71\nnvidia-nccl-cu13==2.30.7\nnvidia-nvjitlink==13.4.92\nnvidia-nvshmem-cu13==3.4.5\nnvidia-nvtx==13.2.86\nnvidia-nvvm==13.4.92\nnvtx==0.2.16\npackaging==26.3\npandas==3.0.3\npartd==1.4.2\npip==24.0\npropcache==0.5.4\npsutil==7.2.2\npyarrow==23.0.1\nPygments==2.21.0\npylibcudf-cu13==26.8.1\npylibcugraph-cu13==26.8.0\npylibraft-cu13==26.8.0\npython-dateutil==2.9.0.post0\nPyYAML==6.0.3\nraft-dask-cu13==26.8.0\nrapids-dask-dependency==26.8.0\nrapids-logger==0.2.3\nrich==15.0.0\nrmm-cu13==26.8.0\nscikit-learn==1.9.1\nscipy==1.18.1\nsetuptools==78.1.0\nsix==1.17.0\nsortedcontainers==2.4.0\nsympy==1.14.0\ntblib==3.2.2\nthreadpoolctl==3.7.0\ntoolz==1.1.0\ntorch==2.14.1+cu132\ntornado==6.5.10\ntreelite==4.7.2\ntriton==3.8.0\ntyping_extensions==4.16.0\nucxx-cu13==0.51.1\nyarl==1.25.1\nzict==3.0.0\n",
+    "float64_kernel_output": "{\"kind\": \"float64_sparse_point_segment_smoke\", \"pair_count\": 4096, \"zero_length_segments\": 16, \"dtype\": \"float64\", \"fast_math\": false, \"fmad\": false, \"max_absolute_error\": 0.0, \"np_allclose_1e_14\": true, \"gpu_device\": \"NVIDIA GeForce RTX 5090\", \"compute_capability\": [12, 0], \"gpu_memory_bytes\": 34162016256, \"cuda_runtime_version\": 13020, \"cuda_driver_version\": 13040, \"application_modules\": {\"open3d\": false, \"numpy\": true, \"scipy\": false, \"hdbscan\": false, \"sklearn\": false, \"networkx\": true, \"pandas\": false, \"matplotlib\": false, \"openpyxl\": false, \"psutil\": false, \"threadpoolctl\": false, \"flask\": false, \"tkinterdnd2\": false, \"pytest\": false, \"cuml\": false, \"cugraph\": false}}\r\nC:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\work\\gpu-windows\\Lib\\site-packages\\numba_cuda\\numba\\cuda\\dispatcher.py:748: NumbaPerformanceWarning: Grid size 1 will likely result in GPU under-utilization due to low occupancy.\r\n  warn(errors.NumbaPerformanceWarning(msg))\r\nCuPy 14.2.0: GPU sum = 45\r\nNumba 0.68.0: CUDA kernel passed\r\nPyTorch 2.13.0+cu130: GPU sum = 45; device = NVIDIA GeForce RTX 5090\r\n",
+    "cpu_numpy_compatibility_output": "{\"cpu_numpy\": \"2.5.1\", \"numpy_path\": \"E:\\\\SoyRSA Build\\\\.venv\\\\Lib\\\\site-packages\\\\numpy\\\\__init__.py\", \"cupy\": \"14.2.0\", \"cupy_path\": \"C:\\\\Users\\\\57340\\\\Documents\\\\Codex\\\\2026-10-03\\\\cupy-pytorch-numba-cuml-and-cugraph\\\\work\\\\gpu-windows\\\\Lib\\\\site-packages\\\\cupy\\\\__init__.py\", \"sum\": 49995000.0, \"raw_float64_kernel_exact\": true, \"python_executable\": \"E:\\\\SoyRSA Build\\\\.venv\\\\Scripts\\\\python.exe\", \"test_only_foreign_site_packages_added\": true}\r\nOS                           : Windows-11-10.0.26200-SP0\r\nPython Version               : 3.12.14\r\nCuPy Version                 : 14.2.0\r\nCuPy Platform                : NVIDIA CUDA\r\nNumPy Version                : 2.5.1\r\nSciPy Version                : 1.18.0\r\nCython Build Version         : 3.2.4\r\nCython Runtime Version       : None\r\nCUDA Root                    : C:\\Users\\57340\\Documents\\Codex\\2026-10-03\\cupy-pytorch-numba-cuml-and-cugraph\\work\\gpu-windows\\Lib\\site-packages\\nvidia\\cu13\r\nNVCC PATH                    : None\r\nCUDA Build Version           : 13020\r\nCUDA Driver Version          : 13040\r\nCUDA Runtime Version         : 13020 (linked to CuPy) / 13040 (locally installed)\r\nCUDA Extra Include Dirs      : ['C:\\\\Users\\\\57340\\\\Documents\\\\Codex\\\\2026-10-03\\\\cupy-pytorch-numba-cuml-and-cugraph\\\\work\\\\gpu-windows\\\\Lib\\\\site-packages\\\\nvidia\\\\cu13\\\\include']\r\ncuBLAS Version               : (available)\r\ncuFFT Version                : 12400\r\ncuRAND Version               : 10404\r\ncuSOLVER Version             : (12, 3, 4)\r\ncuSPARSE Version             : (available)\r\nNVRTC Version                : (13, 4)\r\nThrust Version               : 300102\r\nCUB Build Version            : 300102\r\nJitify Build Version         : 1a0ca0e\r\nNCCL Build Version           : None\r\nNCCL Runtime Version         : None\r\ncuTENSOR Version             : None\r\ncuSPARSELt Build Version     : None\r\nDevice 0 Name                : NVIDIA GeForce RTX 5090\r\nDevice 0 Compute Capability  : 120\r\nDevice 0 PCI Bus ID          : 0000:01:00.0\r\n"
+  }
+}

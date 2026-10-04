@@ -37,6 +37,12 @@ from .primary_guidance import read_primary_guidance
 
 
 SUPPORTED_INPUTS = {".ply", ".stl", ".obj", ".xyz", ".csv"}
+
+
+def _gpu_mode() -> bool:
+    return os.environ.get("SOYROOTBIO_BACKEND", "cpu") == "cuda"
+
+
 PRIMARY_METHODS = {
     "Scored automatic": "scored",
     "Z-axis extrema": "z",
@@ -105,7 +111,8 @@ class BioInsAlgoBatchApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _configure_window(self) -> None:
-        self.root.title("SoyRootBio — Soybean Root Architecture Analysis")
+        self.root.title("SoyRootBio — Soybean Root Architecture Analysis" +
+                        (" [GPU / CUDA]" if _gpu_mode() else ""))
         self.root.geometry("1320x860")
         self.root.minsize(1080, 720)
         style = ttk.Style(self.root)
@@ -123,7 +130,7 @@ class BioInsAlgoBatchApp:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(4, weight=1)
 
-        ttk.Label(outer, text="SoyRootBio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(outer, text="SoyRootBio GPU" if _gpu_mode() else "SoyRootBio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(outer, textvariable=self.hardware_var, foreground="#4b5563").grid(row=1, column=0, sticky="w", pady=(1, 9))
 
         toolbar = ttk.Frame(outer)
@@ -246,7 +253,8 @@ class BioInsAlgoBatchApp:
             memory = f"{format_bytes(self.hardware.available_memory_bytes)} available / {memory}"
         return (
             f"{self.hardware.physical_cpus} physical / {self.hardware.logical_cpus} logical CPUs · "
-            f"{memory} RAM · {gpu} (GPU acceleration optional)"
+            f"{memory} RAM · {gpu} "
+            + ("(CUDA required)" if _gpu_mode() else "(CPU analysis)")
         )
 
     def _register_drop_target(self) -> None:
@@ -317,8 +325,8 @@ class BioInsAlgoBatchApp:
         if text:
             return Path(text).expanduser()
         if self.entries:
-            return next(iter(self.entries.values())).input_path.parent / "SoyRootBio_outputs"
-        return Path.cwd() / "SoyRootBio_outputs"
+            return next(iter(self.entries.values())).input_path.parent / ("SoyRootBio_GPU_outputs" if _gpu_mode() else "SoyRootBio_outputs")
+        return Path.cwd() / ("SoyRootBio_GPU_outputs" if _gpu_mode() else "SoyRootBio_outputs")
 
     def choose_output_root(self) -> None:
         value = filedialog.askdirectory(title="Choose batch output root")
@@ -600,6 +608,7 @@ class BioInsAlgoBatchApp:
         return PipelineConfig(
             input_path=entry.input_path,
             output_dir=entry.output_dir,
+            compute_backend="cuda" if _gpu_mode() else "cpu",
             start=start,
             end=end,
             auto_endpoints=("scored" if method == "soil" else method) if method not in {"interactive", "coordinates"} else None,

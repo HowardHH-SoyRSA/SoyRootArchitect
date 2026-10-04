@@ -17,6 +17,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
+from .native_sections import recovered_wall_sections
 
 from .geometry import (
     is_above_primary_top,
@@ -795,7 +796,35 @@ def _legal_attachment_indices(line, top_reference, gravity_direction):
     )
 
 
-def _retained_attachment_prefix(old, body, support, child_hints, top_reference, gravity_direction, spacing):
+def _native_junction_footprint(points, labels, edges, parent_label, child_label,
+                               hint, radius, spacing, top_reference, gravity):
+    """Recover contact evidence across a deliberately unassigned junction cut.
+
+    This certifies topology only. It neither assigns those vertices nor creates
+    a centerline connector. Uncertain/foreign/above-top vertices are barriers.
+    """
+    limit = max(8*spacing, 5*radius)
+    local = np.linalg.norm(points-hint,axis=1) <= limit
+    local &= np.isin(labels, [parent_label, child_label, -1])
+    up = -np.asarray(gravity,dtype=float)
+    up /= max(np.linalg.norm(up),1e-12)
+    local &= (points-np.asarray(top_reference).reshape(3)) @ up <= 1e-12
+    vertices = np.flatnonzero(local)
+    if not np.any(labels[vertices]==parent_label) or not np.any(labels[vertices]==child_label):
+        return np.empty((0,3))
+    native = edges[local[edges].all(axis=1)]
+    links = np.searchsorted(vertices,native)
+    length = np.linalg.norm(points[native[:,0]]-points[native[:,1]],axis=1)
+    graph = coo_matrix((np.r_[length,length], (np.r_[links[:,0],links[:,1]],
+        np.r_[links[:,1],links[:,0]])),shape=(len(vertices),len(vertices))).tocsr()
+    distance = dijkstra(graph,directed=False,indices=np.flatnonzero(labels[vertices]==parent_label),
+                        min_only=True,limit=max(4*spacing,3*radius))
+    reached = (labels[vertices]==child_label) & np.isfinite(distance)
+    return points[vertices[reached]]
+
+
+def _retained_attachment_prefix(old, body, support, child_hints, top_reference, gravity_direction, spacing,
+                                *, measured_radius=None):
     """Keep a repaired basal path only when it joins the fitted body locally.
 
     The old path is topology evidence, not new owned surface. A distant join
@@ -816,17 +845,42 @@ def _retained_attachment_prefix(old, body, support, child_hints, top_reference, 
     last_required = max(required)
     if last_required >= len(old) - 1:
         return None
-    tail = old[last_required + 1:]
-    join_index = last_required + 1 + int(np.argmin(np.linalg.norm(tail - body[0], axis=1)))
-    join_gap = float(np.linalg.norm(old[join_index] - body[0]))
-    if join_gap > 3.0 * spacing:
+    # A basal cross-section can move radially while the next few fitted
+    # sections converge on the retained attachment. Search only a short local
+    # overlap; joining a later turn would silently skip the supported body.
+    old_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(old, axis=0), axis=1))]
+    body_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(body, axis=0), axis=1))]
+    nearest_start = last_required + 1 + int(np.argmin(
+        np.linalg.norm(old[last_required + 1:] - body[0], axis=1)))
+    # A recovered thick shaft may need several transverse radii to converge
+    # after a basal branch junction. Bound the overlap independently of root
+    # length, and retain the same small, surface-supported bridge limit.
+    overlap = 8.0 * spacing
+    if measured_radius is not None and np.isfinite(measured_radius):
+        overlap = max(overlap, min(24.0 * spacing, 6.0 * measured_radius))
+    old_indices = np.flatnonzero((np.arange(len(old)) > last_required)
+                                & (np.abs(old_arc - old_arc[nearest_start]) <= overlap))
+    body_indices = np.flatnonzero(body_arc <= overlap)
+    join = None
+    for body_index in body_indices:
+        distances = np.linalg.norm(old[old_indices] - body[body_index], axis=1)
+        for offset in np.argsort(distances, kind='stable'):
+            if distances[offset] > 3.0 * spacing:
+                break
+            index = int(old_indices[offset])
+            bridge = np.vstack((old[index], body[body_index]))
+            if distances[offset] > 1e-10 and not _supported_connector(bridge, support, support, spacing):
+                continue
+            join = index, int(body_index), float(distances[offset])
+            break
+        if join is not None:
+            break
+    if join is None:
         return None
-    if join_gap > 1e-10:
-        if not len(support):
-            return None
-        bridge_samples = np.linspace(old[join_index], body[0], 5)
-        if np.max(cKDTree(support).query(bridge_samples)[0]) > 2.0 * spacing:
-            return None
+    join_index, body_index, join_gap = join
+    body = body[body_index:]
+    if len(body) < 2:
+        return None
     incoming = old[join_index] - old[join_index - 1]
     outgoing = body[1] - body[0]
     if float(np.dot(incoming, outgoing)) < -0.25 * float(np.linalg.norm(incoming) * np.linalg.norm(outgoing)):
@@ -946,6 +1000,7 @@ def refit_final_centerlines(
     for root in roots:
         hint = root.insertion_point if root.insertion_point is not None else prior[root.root_id][0]
         child_hints.setdefault(root.parent_id, []).append((root.root_id, np.asarray(hint, dtype=float).copy()))
+    original_child_hints = {parent_id: list(hints) for parent_id, hints in child_hints.items()}
     staged = {}
     for root in [None, *ordered]:
         if cooperate:
@@ -984,7 +1039,29 @@ def refit_final_centerlines(
                 body = np.median(support, axis=0)[None, :]
                 detail["status"] = "insufficient_support"
             else:
-                if root is None:
+                if root is not None and root.score_components.get("native_recovered_extension", 0) > 0 and triangles is not None and len(triangles):
+                    section_context = mesh_context or MeshGeometryContext.build(points, triangles)
+                    _, _, initial, measured = recovered_wall_sections(points, labels, old, label,
+                        section_context, spacing, labels != label)
+                    # Missing contour stations at child junctions must not
+                    # alternate between a measured centre and an off-centre
+                    # prior. This is only a pilot: the subsequent section fit
+                    # independently requires final owned surface throughout.
+                    measured_indices = np.flatnonzero(measured)
+                    for first, last in zip(measured_indices[:-1], measured_indices[1:]):
+                        if last - first <= 12:  # at most 24 full-resolution spacings
+                            initial[first:last+1] = np.linspace(initial[first], initial[last], last-first+1)
+                    for _ in range(2):
+                        initial[1:-1] = (initial[:-2] + 2*initial[1:-1] + initial[2:])/4
+                    body, fit_report = _fit_primary_body(support, initial, spacing,
+                        vertex_area_weights[indices][keep])
+                    if not fit_report.get('fit_applied', False):
+                        body = old.copy()
+                    fit_report['method'] = 'native-contour-guided-recovered-body'
+                    fit_report['native_measured_section_count'] = int(measured.sum())
+                    fit_report['qc_flags'] = [flag.replace('centerline_primary_', 'centerline_recovered_')
+                                             for flag in fit_report.get('qc_flags', [])]
+                elif root is None:
                     body, fit_report = _fit_primary_body(
                         support,
                         old,
@@ -1019,6 +1096,73 @@ def refit_final_centerlines(
         if detail["status"] != "fitted":
             flags.append("centerline_" + detail["status"])
         staged[rid] = (body, support, detail, flags)
+
+    # A late recovered shaft can have an off-centre prior. Resolve its child
+    # origins against frozen native junction footprints before the parent
+    # family is committed; stale radial hint positions are not immutable tops.
+    if triangles is not None and len(triangles):
+        for parent_root in ordered:
+            parent_id = parent_root.root_id
+            if parent_root.score_components.get("native_recovered_extension", 0) <= 0:
+                continue
+            parent_body, parent_surface, parent_detail, _ = staged[parent_id]
+            if not parent_detail.get("fit_applied", False) or len(parent_surface) < 8:
+                continue
+            parent_tree = cKDTree(parent_surface)
+            revised = []
+            for child_id, hint in child_hints.get(parent_id, []):
+                nearest = int(np.argmin(np.linalg.norm(parent_body-hint, axis=1)))
+                radius = max(d_bar, float(np.median(parent_tree.query(parent_body[nearest], k=16)[0])))
+                # Oblique emergence has a longitudinal footprint several
+                # parent radii long; use the attachment survey's five-radius
+                # neighbourhood, still requiring observed native contact.
+                limit = max(8*d_bar, 5*radius)
+                boundary = ownership.boundary_edges(by_id[parent_id][0], by_id[child_id][0], edges)
+                contacts = points[np.unique(boundary)]
+                contact_mode = "direct_native_contact"
+                if not len(contacts):
+                    contacts = _native_junction_footprint(points, labels, edges,
+                        by_id[parent_id][0], by_id[child_id][0], hint, radius, d_bar,
+                        top_reference, gravity_direction)
+                    contact_mode = "bounded_native_path_across_unassigned_cut"
+                replacement = None
+                connector_supported = False
+                if len(contacts):
+                    candidates = _legal_attachment_indices(parent_body, top_reference, gravity_direction)
+                    candidates = candidates[np.linalg.norm(parent_body[candidates]-hint,axis=1)<=limit]
+                    near_contact = cKDTree(contacts).query(parent_body[candidates])[0]<=limit
+                    if not np.any(near_contact) and contact_mode == "direct_native_contact":
+                        contacts = _native_junction_footprint(points, labels, edges,
+                            by_id[parent_id][0], by_id[child_id][0], hint, radius, d_bar,
+                            top_reference, gravity_direction)
+                        contact_mode = "bounded_native_path_across_unassigned_cut"
+                        near_contact = (cKDTree(contacts).query(parent_body[candidates])[0]<=limit
+                                        if len(contacts) else np.zeros(len(candidates),bool))
+                    candidates = candidates[near_contact]
+                    child_body, child_surface, _, _ = staged[child_id]
+                    for index in candidates[np.argsort(np.linalg.norm(parent_body[candidates]-child_body[0],axis=1),kind='stable')]:
+                        if _supported_connector(np.vstack((parent_body[index],child_body[0])),
+                                                parent_surface,child_surface,d_bar):
+                            replacement = parent_body[index].copy()
+                            connector_supported = True
+                            break
+                    if replacement is None and len(candidates):
+                        # Native contact certifies the parent relationship.
+                        # A missing straight internal connector is reported on
+                        # the child below; it must not displace an independently
+                        # supported parent body back onto its old surface wall.
+                        index = candidates[int(np.argmin(np.linalg.norm(parent_body[candidates]-child_body[0],axis=1)))]
+                        replacement = parent_body[index].copy()
+                revised.append((child_id, hint if replacement is None else replacement))
+                if replacement is not None:
+                    parent_detail.setdefault("native_recentered_child_origins", {})[child_id] = {
+                        "prior_hint": hint.tolist(), "resolved_hint": replacement.tolist(),
+                        "displacement": float(np.linalg.norm(replacement-hint)),
+                        "native_contact_vertex_count": int(len(contacts)),
+                        "straight_connector_supported": connector_supported,
+                        "native_contact_mode": contact_mode,
+                    }
+            child_hints[parent_id] = revised
 
     curves, supports, reports = {}, {}, []
     resolved = {}
@@ -1090,11 +1234,12 @@ def refit_final_centerlines(
         # rollback; a locally joined basal prefix retains the accepted body.
         required = child_hints.get(rid, [])
         allowed = _legal_attachment_indices(line, top_reference, gravity_direction)
+        shifted = [
+            (child_id, hint) for child_id, hint in required
+            if not len(allowed) or np.min(np.linalg.norm(line[allowed] - hint, axis=1)) > 4.0 * d_bar
+        ]
         largest_shift = max(
-            (
-                float(np.min(np.linalg.norm(line[allowed] - child_hint, axis=1)))
-                for _, child_hint in required
-            ),
+            (float(np.min(np.linalg.norm(line[allowed] - hint, axis=1))) for _, hint in shifted),
             default=0.0,
         ) if len(allowed) else np.inf
         if required and (not len(allowed) or root is not None and largest_shift > 4.0 * d_bar):
@@ -1106,11 +1251,20 @@ def refit_final_centerlines(
                 old,
                 body,
                 support,
-                [hint for _, hint in required],
+                [hint for _, hint in shifted],
                 top_reference,
                 gravity_direction,
                 d_bar,
+                measured_radius=(detail.get("section_radius_median")
+                                 if detail.get("method") == "native-contour-guided-recovered-body" else None),
             )
+            if retained is not None:
+                candidate_allowed = _legal_attachment_indices(retained[0], top_reference, gravity_direction)
+                if not len(candidate_allowed) or any(
+                    np.min(np.linalg.norm(retained[0][candidate_allowed] - hint, axis=1)) > 4.0 * d_bar
+                    for child_id, hint in required
+                ):
+                    retained = None
             if retained is not None:
                 line, body_start, join_gap = retained
                 flags.append("centerline_preserved_topology_prefix")
@@ -1123,7 +1277,7 @@ def refit_final_centerlines(
                     attachment_preservation_reason=preservation_reason,
                     preserved_topology_length=path_length(line[:body_start + 1]),
                     preserved_topology_join_gap=join_gap,
-                    preserved_topology_required_by=sorted(child_id for child_id, _ in required),
+                    preserved_topology_required_by=sorted(child_id for child_id, _ in shifted),
                     exposed_body_length=path_length(body),
                     exposed_body_supported=True,
                 )
@@ -1131,6 +1285,10 @@ def refit_final_centerlines(
                 detail["attachment_gap"] = float(np.linalg.norm(line[0] - anchor))
             else:
                 line = old.copy()
+                required = original_child_hints.get(rid, [])
+                child_hints[rid] = required
+                if "native_recentered_child_origins" in detail:
+                    detail["rejected_native_child_origin_proposals"] = detail.pop("native_recentered_child_origins")
                 body_start = 0 if root is None else int(root.body_start_index)
                 flags.append("centerline_attachment_preserving_prior_retained")
                 retained_status = (

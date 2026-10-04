@@ -1,5 +1,24 @@
 # SoyRootBio / BioInsAlgo 0.2
 
+## GPU-version branch
+
+This branch is an isolated CUDA build. The GPU desktop launcher requires CUDA
+and writes to a separate output location. It runs sparse point-to-segment
+projection on CUDA using CuPy float64 kernels; spatial indexing, exact final contender
+distances, topology, tracing control and export remain on the CPU. A CPU backend
+is retained for reproducible comparisons. See [GPU setup and scope](docs/gpu/README.md),
+[dependency verification](docs/gpu/dependency_verification.md), and
+[six-sample comparison](docs/gpu/benchmark_comparison.md).
+
+The six full-resolution samples matched exactly across 180 scientific exports
+and 24 rendered figures. Total elapsed time was 2,900.95 seconds on CPU and
+2,904.50 seconds on CUDA: this prototype demonstrates output parity, without
+an overall pipeline speed gain. Existing unresolved biological QC remains
+visible in the comparison; matching outputs do not establish biological compliance.
+
+All updates in this checkout are published to `GPU-version`. The CPU checkout
+and its desktop shortcut remain separate.
+
 SoyRootBio is a desktop and command-line application for topology-aware measurement of reconstructed soybean root system architecture (RSA). Its primary inputs are root-only micro-CT surface meshes in STL or PLY format. The software detects a primary root, traces lateral roots recursively, repairs the result into a rooted hierarchy, measures traits in source mesh units, and writes editable and validation-ready outputs.
 
 The project prioritizes the measurement objectives in this repository over exact reproduction of any one publication. It evolved from the MIT-licensed [BioInsAlgo baseline](https://github.com/HowardHH-SoyRSA/BioInsAlgo/tree/agent/refine-primary-centerline-log) and remains MIT licensed. Zhou et al. (2025) motivated the original bio-inspired workflow, but this is not the authors' implementation and is not a bit-for-bit reproduction. See [Research lineage and licensing](#research-lineage-and-licensing) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
@@ -42,15 +61,17 @@ Initial lateral candidate growth and subsequent tip extension each have a **300-
 
 ## Installation
 
-Python 3.10 or newer is required. On Windows PowerShell:
+This GPU branch was validated with Python 3.12 on Windows and an NVIDIA CUDA 13
+driver. Install it in its own checkout and environment:
 
 ```powershell
-git clone https://github.com/HowardHH-SoyRSA/BioInsAlgo.git
-cd BioInsAlgo
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+git clone --branch GPU-version --single-branch https://github.com/HowardHH-SoyRSA/SoyRootArchitect.git SoyRootArchitect-GPU
+cd SoyRootArchitect-GPU
+python -m venv .venv-gpu
+.\.venv-gpu\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e ".[gpu]"
+$env:CUPY_CACHE_DIR = (Join-Path (Get-Location) '.cupy-cache')
 ```
 
 The main dependencies are Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX, pandas, Matplotlib, openpyxl, psutil, Flask, and tkinterdnd2. A normal Python.org Windows installation includes Tcl/Tk for the desktop interface.
@@ -58,8 +79,10 @@ The main dependencies are Open3D, NumPy, SciPy, HDBSCAN, scikit-learn, NetworkX,
 For development and tests:
 
 ```powershell
-python -m pip install -e ".[test]"
-python -m pytest -q
+python -m pip install -e ".[gpu,test]"
+New-Item -ItemType Directory -Force .pytest-runs | Out-Null
+$env:SOYROOTBIO_TEST_CUDA = '1'
+python -m pytest -q tests --basetemp .pytest-runs\gpu
 ```
 
 Large repository data use Git LFS. If a clone contains pointer files rather than meshes, install Git LFS and run:
@@ -74,7 +97,7 @@ git lfs pull
 Launch the application with:
 
 ```powershell
-soyrootbio gui
+python scripts\launch_gpu.py
 ```
 
 Optionally prefill one input and an output root:
@@ -82,6 +105,10 @@ Optionally prefill one input and an output root:
 ```powershell
 soyrootbio gui --input "D:\roots\sample.ply" --output "D:\results"
 ```
+
+The CLI defaults to required CUDA on this branch. Use `--backend cpu` explicitly
+for the reference path. See [GPU setup](docs/gpu/README.md) to install the separate
+desktop shortcut and inspect backend provenance.
 
 The GUI supports these primary-root modes:
 
@@ -105,7 +132,7 @@ Automatic batch thread allocation uses at most two worker threads per sample, so
 
 Each active batch sample runs in its own spawned Python process, so independent analyses can use separate CPU cores. The GUI supervises these processes and receives progress and compact result summaries; geometry arrays stay in the sample process. Each process exits after its sample to release memory. The existing concurrency/RAM allocation and manual overrides still apply. Worker threads per sample controls supported spatial searches and caps supported native numerical thread pools within that process.
 
-Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Pause stops work at checkpoints and excludes paused time from the displayed runtime. Cancellation wakes paused workers; if a cancelled process has not exited within 10 seconds, it is terminated and reaped, including when closing the application. Cancelled output directories can contain partial files and must not be reused as completed results. A worker exception preserves its original traceback in `processing_error.log`; an unexpected process exit reports its exit code and allows other samples to continue. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` for timing history. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
+Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Pause stops work at checkpoints and excludes paused time from the displayed runtime. Cancellation wakes paused workers; if a cancelled process has not exited within 10 seconds, it is terminated and reaped, including when closing the application. Cancelled output directories can contain partial files and must not be reused as completed results. A worker exception preserves its original traceback in `processing_error.log`; an unexpected process exit reports its exit code and allows other samples to continue. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` for timing history. The separate GPU launcher requires CUDA for sparse point-to-segment projection; the other analysis stages remain on the CPU.
 
 ## Interactive 3D result editor
 
@@ -410,7 +437,7 @@ Optional **Nodule-aware analysis** is available in the batch GUI and with `--nod
 - The automatic primary scorer assumes the coordinate system has meaningful Z orientation and gravity is `(0,0,-1)`.
 - Fine laterals below the reconstruction/mesh resolution cannot be recovered reliably.
 - Per-root diameter and volume are centreline/assignment estimates, not voxel-exact organ measurements.
-- The batch GUI is currently Tk-based and the scientific analysis path is CPU based. The 3D editor uses the browser GPU for rendering and worker/BVH acceleration for parsing and picking; trait recomputation remains CPU based.
+- The batch GUI is Tk-based. This branch uses CUDA for sparse point-to-segment projection and CPU processing for the remaining scientific stages. The 3D editor uses the browser GPU for rendering and worker/BVH acceleration for parsing and picking; trait recomputation remains CPU based.
 - STL contains no portable unit standard. Source-unit hints may be recorded as provenance, but this temporary build does not apply them to traits or thresholds.
 
 ## Research lineage and licensing

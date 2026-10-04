@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+gpu = ["cupy-cuda13x==14.2.0", "cuda-toolkit[cudart,nvrtc]==13.4.2"]
 
 [project.scripts]
 soyrootbio = "soyrootbio.cli:main"

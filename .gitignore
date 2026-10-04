@@ -17,6 +17,8 @@ htmlcov/
 build/
 dist/
 .venv/
+.venv-gpu/
+.cupy-cache/
 venv/
 outputs/
 *.log

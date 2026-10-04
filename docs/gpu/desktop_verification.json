@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "title": "SoyRootBio \u2014 Soybean Root Architecture Analysis [GPU / CUDA]",
+  "compute_backend": "cuda",
+  "default_output": "C:\\Users\\57340\\.codex\\worktrees\\0be1\\SoyRSA Build\\outputs\\gpu_gui",
+  "python": "C:\\Users\\57340\\.codex\\worktrees\\0be1\\SoyRSA Build\\.venv-gpu\\Scripts\\python.exe",
+  "startup_cuda_self_check": true
+}

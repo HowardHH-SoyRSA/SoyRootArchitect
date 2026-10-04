@@ -39,6 +39,7 @@ from .mesh_geometry import MeshGeometryContext
 from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
 from .primary_surface import reconcile_primary_surface_tracks
 from .fork_recovery import recover_unassigned_fork_arms
+from .recovered_children import recover_children_on_extensions
 from .junction_transections import trim_primary_junctions
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
@@ -99,6 +100,7 @@ from .traits import compute_traits
 from .nodules import detect_nodules, quantify_nodules, apply_nodule_review
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
+from .gpu_backend import active_backend, compute_backend
 from .visualize import save_angle_front_views, save_overview_plot
 
 
@@ -405,6 +407,7 @@ class PipelineConfig:
     input_mode: str = "auto"
     nodule_aware: bool = False
     nodule_review_file: Path | None = None
+    compute_backend: str = "cpu"
 
 
 @dataclass
@@ -504,8 +507,8 @@ def run_pipeline(
 ) -> PipelineResult:
     """Run one analysis with an isolated per-job SciPy worker limit."""
 
-    with worker_thread_limit(config.worker_threads):
-        return _run_pipeline_impl(
+    with worker_thread_limit(config.worker_threads), compute_backend(config.compute_backend) as backend:
+        result = _run_pipeline_impl(
             config,
             preloaded_cloud=preloaded_cloud,
             progress_callback=progress_callback,
@@ -513,6 +516,15 @@ def run_pipeline(
             pause_check=pause_check,
             resource_callback=resource_callback,
         )
+        provenance = backend.snapshot() if backend is not None else {"backend": "cpu"}
+        (config.output_dir / "backend_provenance.json").write_text(
+            json.dumps(provenance, indent=2), encoding="utf-8")
+        metadata_path = config.output_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["outputs"] = sorted(set(metadata["outputs"]) | {"backend_provenance.json"})
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False),
+                                 encoding="utf-8")
+        return result
 
 
 def _run_pipeline_impl(
@@ -965,6 +977,19 @@ def _run_pipeline_impl(
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=full_competing_labels,
     )
+    # Earlier committed topology swaps/joins also postdate lateral tracing;
+    # the recovery pass includes their surviving parents from root provenance.
+    selected, full_root_labels, recovered_children_report = recover_children_on_extensions(
+        full_normalized, full_root_labels, primary.points, selected,
+        parent_ids={row["parent_id"] for row in fork_recovery_report["decisions"]
+                    if row["action"] == "accepted"},
+        d_bar=d_bar, mesh_context=mesh_context, excluded_mask=full_nonroot_mask,
+        analysis_to_mesh=cloud.analysis_indices, primary_top_reference=primary_top_reference,
+        gravity=np.asarray(config.gravity), max_root_order=config.max_root_order,
+        max_paths=config.lateral_max_paths, cooperate=cooperate,
+    )
+    for root in selected:
+        correction_input_fingerprints.setdefault(root.root_id, _polyline_fingerprint(root.points))
     full_root_labels, selected, primary_surface_report = reconcile_primary_surface_tracks(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
@@ -1456,6 +1481,7 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "unassigned_fork_recovery": fork_recovery_report,
+        "recovered_descendants": recovered_children_report,
         "primary_surface_track_reconciliation": primary_surface_report,
         "final_centerline_fitting": final_centerline_report,
         "branch_facing_transection_trimming": transection_report,
@@ -3781,6 +3807,8 @@ def _nearest_exposed_segments(
         cached = segment_index_cache.query_result(query_key)
         if cached is not None:
             return cached
+    backend = active_backend()
+    projector = backend.projector(index) if backend is not None else None
     for offset in range(0, len(query), 2_048):
         chunk = query[offset:offset + 2_048]
         nearby = tree.query_ball_point(chunk, search_radius, workers=worker_threads())
@@ -3789,11 +3817,14 @@ def _nearest_exposed_segments(
             continue
         query_index = np.repeat(np.arange(len(chunk)), counts)
         segment_index = np.concatenate([np.asarray(row, int) for row in nearby if len(row)])
-        relative = chunk[query_index] - start[segment_index]
-        along = np.clip(np.einsum("ij,ij->i", relative, delta[segment_index]) /
-                        np.maximum(length_squared[segment_index], 1e-24), 0.0, 1.0)
-        residual = relative - along[:, None] * delta[segment_index]
-        distance = np.linalg.norm(residual, axis=1)
+        if projector is not None:
+            query_index, segment_index, distance = projector.contenders(chunk, query_index, segment_index)
+        else:
+            relative = chunk[query_index] - start[segment_index]
+            along = np.clip(np.einsum("ij,ij->i", relative, delta[segment_index]) /
+                            np.maximum(length_squared[segment_index], 1e-24), 0.0, 1.0)
+            residual = relative - along[:, None] * delta[segment_index]
+            distance = np.linalg.norm(residual, axis=1)
         order = np.lexsort((segment_labels[segment_index], distance, query_index))
         ordered_point = query_index[order]
         ordered_label = segment_labels[segment_index[order]]

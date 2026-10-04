@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     gui = subparsers.add_parser("gui", help="Open the desktop application.")
     gui.add_argument("--input", type=Path, help="Optional root file to prefill in the desktop application.")
     gui.add_argument("--output", type=Path, help="Optional output directory to prefill in the desktop application.")
+    gui.add_argument("--backend", choices=["cpu", "cuda"], default="cuda")
 
     editor = subparsers.add_parser(
         "editor",
@@ -44,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the full segmentation, skeletonization, and trait pipeline.")
     run.add_argument("--input", required=True, type=Path, help="Root-only point cloud or mesh exported from VG Studio.")
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
+    run.add_argument("--backend", choices=["cpu", "cuda"], default="cuda", help="GPU-version defaults to cuda and requires a working CuPy/CUDA runtime; --backend cpu selects the reference path.")
     run.add_argument("--input-mode", choices=INPUT_MODES, default="auto", help="auto prefers native faces, otherwise assumes surface points. Declare occupied_volume explicitly; no mesh is reconstructed.")
     run.add_argument("--nodule-aware", action="store_true", help="Detect nodule-like mesh bulges and measure them separately; default off.")
     run.add_argument("--nodule-review-file", type=Path, help="Reviewed nodule decisions exported from the editor; requires --nodule-aware.")
@@ -84,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
     if args.command == "gui":
+        import os
+        os.environ["SOYROOTBIO_BACKEND"] = args.backend
         from .desktop_gui import launch_gui
 
         return launch_gui(args.input, args.output)
@@ -112,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "run":
         config = PipelineConfig(
+            compute_backend=args.backend,
             input_path=args.input,
             output_dir=args.output,
             input_mode=args.input_mode,
