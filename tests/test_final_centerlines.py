@@ -6,6 +6,7 @@ from scipy.spatial import cKDTree
 
 from soyrootbio.centerline import _primary_fit_qc
 from soyrootbio.centerline import _supported_connector
+from soyrootbio.centerline import _retained_attachment_prefix
 from soyrootbio.centerline import refit_final_centerlines
 from soyrootbio.export import _lateral_skeleton_frame, write_rsml
 from soyrootbio.geometry import path_length, tangent_vectors
@@ -60,6 +61,106 @@ def irregular_tube(axis, angles, radius=0.08):
 
 def straight(start=0, end=2, count=61):
     return np.column_stack([np.linspace(start, end, count), np.zeros((count, 2))])
+
+
+def test_scoped_refit_reuses_exact_unchanged_body_and_rejects_stale_ownership():
+    axis = straight(0, 2)
+    points, faces = tube(axis)
+    labels = np.zeros(len(points), int)
+    first, report = refit_final_centerlines(points, labels, axis, [], d_bar=.025, triangles=faces,
+                                            primary_top_reference=np.array([0.,0.,2.]))
+    preserved = {'primary': {'points':first.copy(),'body_start_index':0,
+                            'vertices':np.flatnonzero(labels==0),'assessment':report['roots'][0]}}
+    second, again = refit_final_centerlines(points, labels, first, [], d_bar=.025, triangles=faces,
+        primary_top_reference=np.array([0.,0.,2.]),preserved_bodies=preserved)
+    np.testing.assert_array_equal(first, second)
+    assert again['roots'][0]['body_fit_reused']
+    labels[0] = -1
+    with pytest.raises(ValueError, match='ownership changed'):
+        refit_final_centerlines(points, labels, first, [], d_bar=.025, triangles=faces,
+            primary_top_reference=np.array([0.,0.,2.]),preserved_bodies=preserved)
+
+
+def test_basal_attachment_joins_early_supported_fit_without_discarding_body():
+    old = straight(0, 1, 101)
+    support, _ = tube(old, radius=.07)
+    body = straight(.2, 1, 81)
+    body[:11, 1] = np.linspace(.06, 0, 11)
+    retained = _retained_attachment_prefix(old, body, support, [old[20]],
+        np.array([[0.,0.,1.]]), np.array([0.,0.,-1.]), .01)
+    assert retained is not None
+    line, start, gap = retained
+    assert 0 < gap <= .03
+    np.testing.assert_array_equal(line[:21], old[:21])
+    np.testing.assert_array_equal(line[-60:], body[-60:])
+    assert line[start, 0] < .28
+    assert _supported_connector(line[start-1:start+1], support, support, .01)
+
+
+def test_basal_attachment_does_not_bridge_empty_space_to_later_fit():
+    old = straight(0, 1, 101)
+    body = straight(.2, 1, 81)
+    body[:11, 1] = np.linspace(.06, 0, 11)
+    support, _ = tube(body, radius=.005)
+    retained = _retained_attachment_prefix(old, body, support, [old[20]],
+        np.array([[0.,0.,1.]]), np.array([0.,0.,-1.]), .01)
+    assert retained is None
+
+
+@pytest.mark.parametrize('supported', [True, False])
+def test_recovered_thick_shaft_uses_radius_bounded_attachment_overlap(supported):
+    old = straight(0, 1, 101)
+    body = straight(.2, 1, 81)
+    body[:21, 1] = np.linspace(.12, 0, 21)
+    if not supported:
+        # No coincident old/new point in the bounded overlap, and no owned
+        # wall around the possible transverse join.
+        body[:26,1] = np.maximum(body[:26,1], .02)
+    support, _ = tube(old if supported else body, radius=.07 if supported else .005)
+    if not supported:
+        support = support[support[:,0] > .5]
+    args = (old, body, support, [old[20]], np.array([[0.,0.,1.]]), np.array([0.,0.,-1.]), .01)
+    assert _retained_attachment_prefix(*args) is None
+    retained = _retained_attachment_prefix(*args, measured_radius=.04)
+    assert (retained is not None) is supported
+    if retained:
+        line, start, gap = retained
+        assert gap <= .03 and line[start,0] < .44
+        np.testing.assert_array_equal(line[:21],old[:21])
+        np.testing.assert_array_equal(line[-50:],body[-50:])
+        assert _supported_connector(line[start-1:start+1],support,support,.01)
+
+
+def test_native_recovered_parent_recenters_child_origin_with_its_body():
+    axis=straight(0,2,201)
+    points,faces=tube(axis,radius=.06,sides=24)
+    labels=np.where(points[:,0]<=1.,1,2)
+    # This boundary is a shared native ring, not two adjacent cylinders.
+    points=np.vstack([points,axis[0],axis[-1]])
+    labels=np.r_[labels,1,2]
+    caps=[]
+    for j in range(24):
+        caps.extend([[len(points)-2,(j+1)%24,j],
+                     [len(points)-1,200*24+j,200*24+(j+1)%24]])
+    faces=np.vstack([faces,caps])
+    prior=straight(0,1,101);prior[:,1]=.05
+    parent=RootPath('parent',prior,score_components={'native_recovered_extension':1.})
+    child=RootPath('child',np.vstack([prior[-1],axis[101:]]),parent_id='parent',order=2,
+                   insertion_index=100,insertion_point=prior[-1].copy())
+    primary=np.array([[0.,.05,1.],[0.,.05,0.]])
+    parent.insertion_point=primary[-1].copy();parent.insertion_index=1
+    _,report=refit_final_centerlines(points,labels,primary,[parent,child],d_bar=.01,
+                                   triangles=faces,primary_top_reference=primary[0])
+    assert parent.centerline_assessment['fit_applied']
+    assert parent.centerline_assessment['fit_qc_passed']
+    assert np.max(np.abs(parent.points[5:-5,1]))<.01
+    # The terminal slab is coarser than an interior ring, but the insertion
+    # must move with the accepted body instead of staying on the old wall.
+    assert abs(child.insertion_point[1])<.03
+    np.testing.assert_array_equal(child.insertion_point,parent.points[child.insertion_index])
+    assert 'child' in parent.centerline_assessment['native_recentered_child_origins']
+    assert not parent.centerline_assessment.get('descendant_attachment_shift')
+    assert report['origins_above_primary_top']==0
 
 
 def test_final_support_replaces_offset_body_and_overextended_tip():

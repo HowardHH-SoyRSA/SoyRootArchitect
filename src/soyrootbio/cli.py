@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--soil-z", type=float, help="Manual horizontal soil-line Z used by the scored collar detector.")
     run.add_argument("--guide-file", type=Path, help="CSV/JSON/TXT XYZ points that the primary centerline must cross.")
     run.add_argument("--correction-file", type=Path, help="Edited root_hierarchy.json from an earlier run.")
+    run.add_argument("--surface-reference-file", type=Path, help="Reviewed scoped ownership manifest for this exact mesh; edited hierarchy and centerlines are not imported.")
     run.add_argument("--sample-points", type=int, default=0, help="Maximum finite source vertices used for analysis in every format; original geometry is preserved. 0 enables automatic runtime/memory preflight.")
     run.add_argument("--graph-k", type=int, default=14, help="Neighbor count for the local Dijkstra graph.")
     run.add_argument("--max-laterals", type=int, help="Optional cap on selected lateral roots.")
@@ -124,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             soil_z=args.soil_z,
             guide_file=args.guide_file,
             correction_file=args.correction_file,
+            surface_reference_file=args.surface_reference_file,
             sample_points=args.sample_points or None,
             graph_k=args.graph_k,
             lateral_max_paths=args.max_laterals,

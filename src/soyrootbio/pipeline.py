@@ -39,6 +39,7 @@ from .mesh_geometry import MeshGeometryContext
 from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
 from .primary_surface import reconcile_primary_surface_tracks
 from .fork_recovery import recover_unassigned_fork_arms
+from .recovered_children import recover_children_on_extensions
 from .junction_transections import trim_primary_junctions
 from .junction_tubes import reconcile_parent_owned_tubes
 from .surface_patches import (
@@ -49,6 +50,7 @@ from .surface_patches import (
 from .surface_patch_audit import audit_discrete_child_patches
 from .export import export_results
 from .centerline import refit_final_centerlines
+from .surface_reference import load_surface_reference, apply_surface_reference
 from .primary_guidance import (
     PRIMARY_GUIDANCE_FILENAME,
     PrimaryGuidance,
@@ -406,6 +408,7 @@ class PipelineConfig:
     input_mode: str = "auto"
     nodule_aware: bool = False
     nodule_review_file: Path | None = None
+    surface_reference_file: Path | None = None
 
 
 @dataclass
@@ -582,6 +585,10 @@ def _run_pipeline_impl(
         cloud.source_metadata.update(contract)
         LOGGER.info("Using %d points already loaded by the desktop GUI", len(cloud.points))
     checkpoint("load_geometry", "Point cloud ready", 0.12)
+    surface_reference = (
+        load_surface_reference(config.surface_reference_file, cloud.export_points, cloud.triangles)
+        if config.surface_reference_file is not None else None
+    )
     if resource_callback is not None:
         resource_callback({
             "full_vertex_count": len(cloud.export_points),
@@ -966,6 +973,19 @@ def _run_pipeline_impl(
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=full_competing_labels,
     )
+    # Earlier committed topology swaps/joins also postdate lateral tracing;
+    # the recovery pass includes their surviving parents from root provenance.
+    selected, full_root_labels, recovered_children_report = recover_children_on_extensions(
+        full_normalized, full_root_labels, primary.points, selected,
+        parent_ids={row["parent_id"] for row in fork_recovery_report["decisions"]
+                    if row["action"] == "accepted"},
+        d_bar=d_bar, mesh_context=mesh_context, excluded_mask=full_nonroot_mask,
+        analysis_to_mesh=cloud.analysis_indices, primary_top_reference=primary_top_reference,
+        gravity=np.asarray(config.gravity), max_root_order=config.max_root_order,
+        max_paths=config.lateral_max_paths, cooperate=cooperate,
+    )
+    for root in selected:
+        correction_input_fingerprints.setdefault(root.root_id, _polyline_fingerprint(root.points))
     full_root_labels, selected, primary_surface_report = reconcile_primary_surface_tracks(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
@@ -1199,6 +1219,44 @@ def _run_pipeline_impl(
         primary_contact_passes.append(primary_contact_report)
     if nodules is not None:
         full_root_labels[nodules.mask] = nodules.vertex_labels[nodules.mask]
+    surface_reference_report = {"status": "not_requested"}
+    surface_reference_audit = None
+    if surface_reference is not None:
+        reference_fit_priors = {"primary": {
+            "points": primary.points.copy(), "body_start_index": 0,
+            "vertices": np.flatnonzero(full_root_labels == 0),
+            "assessment": next(row for row in final_centerline_report["roots"] if row["root_id"] == "primary"),
+        }}
+        reference_fit_priors.update({root.root_id: {
+            "points": root.points.copy(), "body_start_index": root.body_start_index,
+            "vertices": np.flatnonzero(full_root_labels == label),
+            "assessment": dict(root.centerline_assessment),
+        } for label, root in enumerate(selected, 1)})
+        # Late, explicit constraints cannot seed competing automatic tracing
+        # changes elsewhere. Final audits below observe this exact snapshot.
+        full_root_labels, selected, surface_reference_report, surface_reference_audit = apply_surface_reference(
+            surface_reference, full_normalized, full_root_labels, primary.points, selected,
+            d_bar=d_bar, mesh_context=mesh_context, excluded_mask=full_nonroot_mask,
+            primary_top_reference=primary_top_reference, gravity=config.gravity,
+        )
+        for root in selected:
+            correction_input_fingerprints.setdefault(root.root_id, _polyline_fingerprint(root.points))
+        changed_reference_ids = set(surface_reference_report["affected_root_ids"])
+        current_reference_labels = {"primary": 0, **{root.root_id: label for label, root in enumerate(selected, 1)}}
+        preserved_reference_bodies = {
+            rid: prior for rid, prior in reference_fit_priors.items()
+            if rid in current_reference_labels and rid not in changed_reference_ids
+            and np.array_equal(prior["vertices"], np.flatnonzero(full_root_labels == current_reference_labels[rid]))
+        }
+        primary.points, final_centerline_report = refit_final_centerlines(
+            full_normalized, full_root_labels, primary.points, selected,
+            d_bar=d_bar, triangles=cloud.triangles, gravity=np.asarray(config.gravity, dtype=float),
+            primary_top_reference=primary_top_reference, cooperate=cooperate,
+            mesh_context=mesh_context,
+            nodule_labels=nodules.vertex_labels if nodules is not None else None,
+            preserved_bodies=preserved_reference_bodies,
+        )
+        surface_reference_report["preserved_body_root_ids"] = sorted(preserved_reference_bodies)
     final_primary_contact_audit = audit_higher_order_primary_contacts(
         full_normalized, full_root_labels, selected,
         triangles=cloud.triangles, d_bar=d_bar,
@@ -1334,6 +1392,10 @@ def _run_pipeline_impl(
             if np.isfinite(row.length) and row.length > 0
         }
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    if surface_reference_audit is not None:
+        np.savez_compressed(config.output_dir / "surface_reference_audit.npz", **surface_reference_audit)
+        (config.output_dir / "surface_reference_report.json").write_text(
+            json.dumps(surface_reference_report, indent=2), encoding="utf-8")
     if np.any(full_root_labels[full_above_base_mask] != -1):
         raise AssertionError("above-collar vertices must remain unassigned")
     ownership_ledger_metadata = _write_ownership_evidence_ledger(
@@ -1470,8 +1532,10 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "unassigned_fork_recovery": fork_recovery_report,
+        "recovered_descendants": recovered_children_report,
         "primary_surface_track_reconciliation": primary_surface_report,
         "final_centerline_fitting": final_centerline_report,
+        "surface_reference": surface_reference_report,
         "branch_facing_transection_trimming": transection_report,
         "parent_owned_tube_reconciliation": child_tube_report,
         "final_surface_cleanup": final_surface_cleanup_report,

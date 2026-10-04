@@ -1017,13 +1017,19 @@ def _terminal_continuation_evidence(
     mesh_excluded_mask: np.ndarray | None,
     mesh_tree: cKDTree,
     mesh_context: MeshGeometryContext | None = None,
+    require_growth_cap: bool = True,
 ) -> dict[str, object]:
-    """Require a single sustained tube beyond a capped parent endpoint."""
+    """Require a single sustained tube beyond a parent endpoint.
+
+    Existing child absorption requires a growth cap. A newly traced free
+    native component at a confirmed repaired tip may lack that tracing flag;
+    its caller can waive the flag while retaining all geometric checks.
+    """
 
     evidence: dict[str, object] = {"status": "rejected", "reason": ""}
     parent_points = np.asarray(parent.points, dtype=float)
     child_points = np.asarray(child.points, dtype=float)
-    if "tip_extension_limit" not in parent.qc_flags:
+    if require_growth_cap and "tip_extension_limit" not in parent.qc_flags:
         evidence["reason"] = "parent_did_not_reach_growth_cap"
         return evidence
     if child.insertion_index != len(parent_points) - 1:
@@ -1033,7 +1039,7 @@ def _terminal_continuation_evidence(
         evidence["reason"] = "centerline_tip_gap"
         return evidence
     child_length = float(child.length)
-    if child_length < 24.0 * spacing:
+    if child_length < (24.0 if require_growth_cap else 8.0) * spacing:
         evidence["reason"] = "continuation_not_sustained"
         return evidence
     support_count = float(child.score_components.get(
