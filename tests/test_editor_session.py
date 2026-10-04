@@ -24,6 +24,81 @@ SOURCE_FILES = (
 )
 
 
+def _add_nodule_candidate(bundle, vertices, label=-3):
+    from soyrootbio.nodules import geometry_digest
+    mesh = read_labeled_ply(bundle / "segmented_root_structure.ply")
+    obj = {"nodule_id": "nodule-001", "numeric_label": label, "status": "candidate",
+           "review_status": "automatic", "vertex_indices": vertices, "vertex_count": len(vertices),
+           "geometry_fingerprint": sha256(np.sort(vertices).astype('<i8').tobytes()).hexdigest(), "qc_flags": [], "evidence": {}}
+    (bundle / "nodules.json").write_text(json.dumps({"evidence": {"geometry_sha256": geometry_digest(mesh.positions)}, "objects": [obj]}))
+
+
+def test_nodule_review_undo_redo_reload_preserves_root_identity(editor_bundle, tmp_path):
+    _add_nodule_candidate(editor_bundle, [9, 10, 11, 12, 18])  # leaf root-b plus uncertain interface
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "nodule-session")
+    source_labels = session.mesh.root_labels.copy()
+    source_states = session.mesh.assignment_states.copy()
+    original_root_count = len(session.roots)
+    session.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "accepted"})
+    assert len(session.roots) == original_root_count - 1
+    assert session.public_state()["nodule_count"] == 1
+    assert np.all(session.mesh.root_labels[9:13] == -3)
+    with pytest.raises(EditorValidationError, match="nodule"):
+        session.apply_operation("assign_points", {"root_id": "root-a", "indices": [10]})
+    session.undo()
+    np.testing.assert_array_equal(session.mesh.root_labels, source_labels)
+    assert len(session.roots) == original_root_count
+    assert session.public_state()["nodule_count"] == 0
+    session.redo()
+    reloaded = EditorSession(editor_bundle, session_dir=tmp_path / "nodule-session")
+    np.testing.assert_array_equal(reloaded.mesh.root_labels, session.mesh.root_labels)
+    assert reloaded.public_state()["nodule_count"] == 1
+    exported = reloaded.export_materialised()
+    assert (exported / "nodule_traits.csv").is_file()
+    label_map = pd.read_csv(exported / "edited_root_label_map.csv")
+    assert label_map.loc[label_map.numeric_label == -3, "root_id"].tolist() == ["nodule-001"]
+    assert json.loads((exported / "nodule_review.json").read_text())["decisions"][0]["status"] == "accepted"
+    mesh = read_labeled_ply(exported / "edited_segmented_root_structure.ply")
+    np.testing.assert_array_equal(mesh.colors[9:13], np.tile([255,244,179], (4,1)))
+    reloaded.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "rejected"})
+    np.testing.assert_array_equal(reloaded.mesh.root_labels, source_labels)
+    np.testing.assert_array_equal(reloaded.mesh.assignment_states, source_states)
+    assert len(reloaded.roots) == original_root_count
+
+
+def test_nodule_review_preserves_frozen_collar_exclusion(editor_bundle, tmp_path):
+    _add_nodule_candidate(editor_bundle, [10, 11, 12])
+    excluded = np.zeros(19, bool); excluded[10] = True
+    np.savez(editor_bundle / "ownership_evidence_masks.npz", above_base_excluded=excluded)
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "collar-nodule")
+    labels = session.mesh.root_labels.copy()
+    with pytest.raises(ValueError, match="above-collar"):
+        session.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "accepted"})
+    np.testing.assert_array_equal(session.mesh.root_labels, labels)
+
+
+def test_partial_nodule_review_marks_retained_root_measurements_unavailable(editor_bundle, tmp_path):
+    _add_nodule_candidate(editor_bundle, [10, 11, 12])
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "partial-nodule")
+    prior = session.roots["root-b"].points.copy()
+    session.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "accepted"})
+    np.testing.assert_array_equal(session.roots["root-b"].points, prior)
+    assert session.roots["root-b"].traits["length"] is None
+    assert session.public_state()["nodule_requires_reanalysis"]
+    session.undo()
+    assert session.roots["root-b"].traits["length"] is not None
+
+
+def test_nodule_review_cannot_remove_parent_of_supported_descendant(editor_bundle, tmp_path):
+    _add_nodule_candidate(editor_bundle, [5, 6, 7, 8])  # root-a has root-c
+    session = EditorSession(editor_bundle, session_dir=tmp_path / "nodule-parent")
+    labels = session.mesh.root_labels.copy()
+    with pytest.raises(ValueError, match="supported branch"):
+        session.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "accepted"})
+    np.testing.assert_array_equal(session.mesh.root_labels, labels)
+    assert session.public_state()["nodule_count"] == 0
+
+
 def test_final_fit_gap_and_sparse_body_survive_editor_reload_and_edits(editor_bundle, tmp_path):
     hierarchy_path = editor_bundle / "root_hierarchy.json"
     hierarchy = json.loads(hierarchy_path.read_text())
@@ -1294,26 +1369,40 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     assert _file_digests(editor_bundle) == source_before
 
 
-def test_editor_rejects_overlong_child_atomically(editor_bundle: Path) -> None:
+def test_editor_accepts_overlong_child_with_warning_and_exact_history(editor_bundle: Path, tmp_path: Path) -> None:
     session = _new_session(editor_bundle, "overlong-child")
     before = _materialised_snapshot(session)
 
-    with pytest.raises(EditorValidationError, match="exceeds parent"):
-        session.apply_operation(
-            "redraw_root",
-            {
-                "root_id": "root-c",
-                "points": [
-                    [0.5, 0.0, 3.0],
-                    [0.5, 3.0, 3.0],
-                ],
-            },
-            operation_id="invalid-overlong-child",
-        )
-
+    labels_before = session.mesh.root_labels.copy()
+    source_before = _file_digests(editor_bundle)
+    session.apply_operation(
+        "redraw_root",
+        {"root_id": "root-c", "points": [[0.5, 0.0, 3.0], [0.5, 3.0, 3.0]]},
+        operation_id="overlong-child",
+    )
+    after = _materialised_snapshot(session)
+    child = session.roots["root-c"]
+    assert "child_longer_than_parent" in child.qc_flags
+    assert child.parent_id == "root-a"
+    assert child.traits["length"] == pytest.approx(3.0)
+    np.testing.assert_array_equal(session.mesh.root_labels, labels_before)
+    reloaded = EditorSession(editor_bundle, session_dir=session.session_dir)
+    assert _materialised_snapshot(reloaded) == after
+    export_dir = session.export_materialised(tmp_path / "overlong-export")
+    hierarchy = json.loads((export_dir / "edited_root_hierarchy.json").read_text())
+    exported_child = next(row for row in hierarchy["roots"] if row["root_id"] == "root-c")
+    assert "child_longer_than_parent" in exported_child["qc_flags"]
+    assert _file_digests(editor_bundle) == source_before
+    session.undo()
     assert _materialised_snapshot(session) == before
-    assert session.public_state()["operation_count"] == 0
-    assert not session.log_path.exists()
+    session.redo()
+    assert _materialised_snapshot(session) == after
+    session.apply_operation(
+        "redraw_root",
+        {"root_id": "root-c", "points": [[0.5, 0.0, 3.0], [0.5, 0.5, 3.0]]},
+        operation_id="resolve-length-warning",
+    )
+    assert "child_longer_than_parent" not in session.roots["root-c"].qc_flags
 
 
 def test_editor_rejects_new_higher_order_origin_above_primary_top_atomically(

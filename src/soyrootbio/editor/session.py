@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -20,16 +21,18 @@ from scipy.spatial import cKDTree
 
 from ..export import order_color, write_rsml
 from ..geometry import (
-    child_length_exceeds_parent,
     is_above_primary_top,
     path_length,
     primary_top_excess,
+    update_child_length_qc,
 )
 from ..hardware import HardwareInfo, detect_hardware
 from ..io import write_labeled_ply
 from ..traits import compute_traits
 from ..types import Normalization, RootPath
 from .ply import LabeledMesh, read_labeled_ply
+from .nodule_review import NoduleReviewMixin
+from ..nodules import NODULE_RGB
 
 
 PRIMARY_ID = "primary"
@@ -112,6 +115,7 @@ class _UndoRecord:
     changed_labels_before: np.ndarray
     changed_assignment_before: np.ndarray
     created_blobs: tuple[Path, ...] = ()
+    nodules_before: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -120,7 +124,7 @@ class _HistoryFrame:
     undo: _UndoRecord
 
 
-class EditorSession:
+class EditorSession(NoduleReviewMixin):
     """Materialised editable view of an immutable SoyRootBio output bundle."""
 
     def __init__(
@@ -141,6 +145,7 @@ class EditorSession:
         self._baseline_labels = self.mesh.root_labels.copy()
         self._baseline_assignment_states = self.mesh.assignment_states.copy()
         self._baseline_roots = self._load_roots()
+        self._load_nodules()
         self.roots = self._clone_roots(self._baseline_roots)
         (
             self.tip_vector_window_mesh_units,
@@ -216,6 +221,8 @@ class EditorSession:
                 "root_count": len(roots),
                 "point_patches": point_patches,
                 "point_patch_count": len(point_patches),
+                "nodule_count": sum(o["status"] == "accepted" for o in self.nodule_objects),
+                "nodule_requires_reanalysis": any(o.get("requires_reanalysis", False) for o in self.nodule_objects),
                 "can_undo": bool(self._history),
                 "can_redo": bool(self._redo),
                 "operation_count": len(self._history),
@@ -229,7 +236,7 @@ class EditorSession:
                     "delete_root",
                     "redraw_root",
                     "correct_root_order",
-                ],
+                ] + (["review_nodule"] if self.nodule_objects else []),
                 "hardware": self._hardware_public(),
             }
 
@@ -318,6 +325,7 @@ class EditorSession:
             if not self._history:
                 raise EditorValidationError("There is no operation to undo.")
             roots_before = self._clone_roots(self.roots)
+            nodules_before = deepcopy(self.nodule_objects)
             next_label_before = self._next_numeric_label
             sequence_before = self._sequence
             label_revision_before = self.label_revision
@@ -341,6 +349,7 @@ class EditorSession:
                     )
                 except Exception:
                     self.roots = roots_before
+                    self.nodule_objects = nodules_before
                     self._next_numeric_label = next_label_before
                     if len(frame.undo.changed_indices):
                         self.mesh.root_labels[
@@ -472,6 +481,11 @@ class EditorSession:
                         "color_rgb": ",".join(str(int(value)) for value in rgb),
                     }
                 )
+            for obj in self.nodule_objects:
+                if obj["status"] == "accepted":
+                    label_rows.append({"numeric_label": obj["numeric_label"], "root_id": obj["nodule_id"],
+                                       "parent_id": "", "root_order": "",
+                                       "color_rgb": ",".join(map(str, NODULE_RGB))})
             pd.DataFrame(label_rows).to_csv(
                 target / "edited_root_label_map.csv",
                 index=False,
@@ -488,6 +502,10 @@ class EditorSession:
                 orders[mask] = np.uint8(min(max(root.order, 0), 253))
                 assignment_states[mask] = 1
                 colors[mask] = np.round(order_color(root.order) * 255).astype(np.uint8)
+            nodule_mask = self.mesh.root_labels <= -3
+            colors[nodule_mask] = NODULE_RGB
+            assignment_states[nodule_mask] = 3
+            self._export_nodule_review(target)
             write_labeled_ply(
                 target / "edited_segmented_root_structure.ply",
                 self.mesh.positions,
@@ -537,6 +555,7 @@ class EditorSession:
     # ------------------------------------------------------------------
     def _execute(self, operation: Operation) -> _UndoRecord:
         roots_before = self._clone_roots(self.roots)
+        nodules_before = deepcopy(self.nodule_objects)
         next_label_before = self._next_numeric_label
         self._pending_index_chunks = []
         self._pending_old_label_chunks = []
@@ -553,6 +572,7 @@ class EditorSession:
                 "delete_root": self._delete_root,
                 "redraw_root": self._redraw_root,
                 "correct_root_order": self._correct_root_order,
+                "review_nodule": self._review_nodule,
             }
             action = dispatcher.get(operation.type)
             if action is None:
@@ -579,6 +599,7 @@ class EditorSession:
             self._recompute_traits()
         except Exception:
             self.roots = roots_before
+            self.nodule_objects = nodules_before
             self._next_numeric_label = next_label_before
             self._restore_pending_labels()
             self._remove_created_blobs(tuple(self._pending_created_blobs))
@@ -607,6 +628,7 @@ class EditorSession:
             changed_labels_before=labels,
             changed_assignment_before=assignments,
             created_blobs=tuple(self._pending_created_blobs),
+            nodules_before=nodules_before,
         )
 
     def _create_root(self, operation: Operation) -> None:
@@ -1169,6 +1191,7 @@ class EditorSession:
         mapped = np.full(len(labels), -1, dtype=np.int32)
         uncertain = labels == -2
         mapped[uncertain] = -2
+        mapped[labels <= -3] = labels[labels <= -3]
         nonnegative = labels >= 0
         in_range = nonnegative & (labels <= max_label)
         mapped[in_range] = lookup[labels[in_range]]
@@ -1254,23 +1277,7 @@ class EditorSession:
                 parent = self.roots[root.parent_id]
                 child_length = path_length(root.points)
                 parent_length = path_length(parent.points)
-                baseline_root = self._baseline_roots.get(root.root_id)
-                baseline_parent = self._baseline_roots.get(root.parent_id)
-                unchanged_fit = (
-                    bool(root.centerline_assessment)
-                    and baseline_root is not None and baseline_parent is not None
-                    and root.parent_id == baseline_root.parent_id
-                    and np.array_equal(root.points, baseline_root.points)
-                    and np.array_equal(parent.points, baseline_parent.points)
-                )
-                if child_length_exceeds_parent(child_length, parent_length) and not (
-                    unchanged_fit and "centerline_refit_child_longer_than_parent" in root.qc_flags
-                ):
-                    raise EditorValidationError(
-                        f"{root.root_id} has centreline length {child_length:.9g}, "
-                        f"which exceeds parent {parent.root_id} length "
-                        f"{parent_length:.9g}."
-                    )
+                update_child_length_qc(root.qc_flags, child_length, parent_length)
                 if (
                     root.insertion_index is None
                     or not 0 <= int(root.insertion_index) < len(parent.points)
@@ -1540,13 +1547,15 @@ class EditorSession:
         if not len(indices):
             return
         self._validate_vertex_indices(indices)
+        if not self._nodule_review_active and np.any(self.mesh.root_labels[indices] <= -3):
+            raise EditorValidationError("Review the nodule classification before assigning its surface to a root.")
         self._pending_index_chunks.append(indices.copy())
         self._pending_old_label_chunks.append(self.mesh.root_labels[indices].copy())
         self._pending_old_assignment_chunks.append(
             self.mesh.assignment_states[indices].copy()
         )
         self.mesh.root_labels[indices] = int(numeric_label)
-        self.mesh.assignment_states[indices] = 1 if numeric_label >= 0 else 0
+        self.mesh.assignment_states[indices] = 1 if numeric_label >= 0 else 3 if numeric_label <= -3 else 2 if numeric_label == -2 else 0
 
     def _restore_pending_labels(self) -> None:
         for indices, labels, states in reversed(
@@ -1563,6 +1572,8 @@ class EditorSession:
 
     def _restore(self, undo: _UndoRecord) -> None:
         self.roots = self._clone_roots(undo.roots_before)
+        self.nodule_objects = deepcopy(undo.nodules_before)
+        self._point_patch_revision = -1
         self._next_numeric_label = undo.next_numeric_label_before
         if len(undo.changed_indices):
             self.mesh.root_labels[undo.changed_indices] = undo.changed_labels_before
@@ -1735,7 +1746,10 @@ class EditorSession:
                     }
                 )
 
-        kind_order = {"uncertain": 0, "unassigned": 1}
+        nodule_rows, nodule_indices = self._nodule_patches()
+        summaries.extend(nodule_rows)
+        indices_by_id.update(nodule_indices)
+        kind_order = {"nodule": -2, "nodule_candidate": -1, "uncertain": 0, "unassigned": 1}
         summaries.sort(
             key=lambda patch: (
                 kind_order[str(patch["kind"])],
@@ -1946,6 +1960,8 @@ class EditorSession:
         ]
         if (self.output_dir / "metadata.json").is_file():
             relatives.append("metadata.json")
+        if (self.output_dir / "nodules.json").is_file():
+            relatives.append("nodules.json")
         for relative in relatives:
             path = self.output_dir / relative
             digest.update(relative.encode("utf-8"))

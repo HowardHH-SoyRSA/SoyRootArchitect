@@ -5,12 +5,14 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import time
+import threading
+import json
 
 import psutil
 import pytest
 
 from soyrootbio.batch import BatchEventType, BatchJobState, BatchScheduler, CooperativeToken, StepTimingHistory
-from soyrootbio.batch_process import ProcessSampleResult, _run_sample_process, run_pipeline_process
+from soyrootbio.batch_process import ProcessSampleResult, SampleProcessError, _run_sample_process, run_pipeline_process
 from soyrootbio.pipeline import PipelineConfig
 
 
@@ -32,6 +34,39 @@ def _probe_analyze(config, control, progress):
         progress('Working', min(0.9, 0.1 + tick / 1000))
         time.sleep(0.02)
     return ProcessSampleResult(config.output_dir, 123, os.getpid())
+
+
+def _failure_with_slow_cleanup(config, control, progress):
+    threading.Thread(target=time.sleep, args=(30,), daemon=False).start()
+    progress('Tracing order-1 lateral roots', .51)
+    raise MemoryError('original allocation failure')
+
+
+def test_received_failure_survives_worker_cleanup_timeout(tmp_path):
+    config = PipelineConfig(tmp_path / 'root.stl', tmp_path / 'out', worker_threads=1)
+    with pytest.raises(SampleProcessError, match='MemoryError.*original allocation failure') as caught:
+        _run_sample_process(config, CooperativeToken(), lambda *args: None,
+                            analyze=_failure_with_slow_cleanup, exit_grace_seconds=.1)
+    assert '_failure_with_slow_cleanup' in caught.value.remote_traceback
+    assert caught.value.resource_context['cleanup_issue'] == 'worker did not exit after reporting failure'
+    report = json.loads((config.output_dir / 'processing_resources.json').read_text())
+    assert report['peak_private_bytes'] > 0
+    assert report['terminal_state'] == 'failed'
+    assert report['last_reported_step'] == 'Tracing order-1 lateral roots'
+    assert not psutil.pid_exists(report['process_id'])
+
+
+def test_unavailable_system_telemetry_does_not_hide_sample_error(tmp_path, monkeypatch):
+    from soyrootbio import batch_process
+    def unavailable():
+        raise OSError('memory counters unavailable')
+    monkeypatch.setattr(batch_process, 'memory_snapshot', unavailable)
+    config = PipelineConfig(tmp_path / 'fail.ply', tmp_path / 'out', worker_threads=1)
+    config.output_dir.mkdir()
+    with pytest.raises(SampleProcessError, match='sample failure'):
+        _run_sample_process(config, CooperativeToken(), lambda *args: None, analyze=_probe_analyze)
+    report = json.loads((config.output_dir / 'processing_resources.json').read_text())
+    assert report['system_memory_unavailable']
 
 
 def _probe_runner(job, control, progress, *, grace=10.0):

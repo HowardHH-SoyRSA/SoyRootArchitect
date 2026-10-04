@@ -10,6 +10,8 @@ from .types import Normalization
 
 CHILD_PARENT_LENGTH_ABSOLUTE_TOLERANCE = 1e-12
 CHILD_PARENT_LENGTH_RELATIVE_TOLERANCE = 1e-9
+CHILD_PARENT_LENGTH_PENALTY_MAX = 0.05
+CHILD_PARENT_LENGTH_QC_FLAG = "child_longer_than_parent"
 DEFAULT_GRAVITY = np.array([0.0, 0.0, -1.0])
 
 
@@ -25,10 +27,19 @@ def normalize_unit_box(points: np.ndarray) -> tuple[np.ndarray, Normalization]:
     return (points - minimum) / scale, Normalization(minimum=minimum, scale=scale)
 
 
-def mean_nearest_neighbor_distance(points: np.ndarray) -> float:
+def mean_nearest_neighbor_distance(
+    points: np.ndarray,
+    *,
+    point_tree: cKDTree | None = None,
+) -> float:
+    if point_tree is not None and (
+        point_tree.n != len(points)
+        or not np.array_equal(point_tree.data, points)
+    ):
+        raise ValueError("point_tree must index the same ordered points")
     if len(points) < 2:
         return 0.0
-    tree = cKDTree(points)
+    tree = point_tree if point_tree is not None else cKDTree(points)
     distances, _ = tree.query(points, k=2, workers=worker_threads())
     return float(np.mean(distances[:, 1]))
 
@@ -53,6 +64,29 @@ def child_length_exceeds_parent(
         * max(abs(child), abs(parent)),
     )
     return child > parent + tolerance
+
+
+def child_parent_length_penalty(child_length: float, parent_length: float) -> float:
+    """Small, scale-independent review penalty, bounded by 0.05."""
+
+    if not child_length_exceeds_parent(child_length, parent_length):
+        return 0.0
+    child, parent = float(child_length), float(parent_length)
+    return CHILD_PARENT_LENGTH_PENALTY_MAX * float(
+        np.clip((child - parent) / max(child, 1e-12), 0.0, 1.0)
+    )
+
+
+def update_child_length_qc(flags: list[str], child_length: float, parent_length: float) -> bool:
+    """Refresh the length warning without changing geometry or hierarchy."""
+
+    flags[:] = [flag for flag in flags if flag != CHILD_PARENT_LENGTH_QC_FLAG]
+    overlong = child_length_exceeds_parent(child_length, parent_length)
+    if overlong:
+        flags.append(CHILD_PARENT_LENGTH_QC_FLAG)
+    else:
+        flags[:] = [flag for flag in flags if flag != "centerline_refit_child_longer_than_parent"]
+    return overlong
 
 
 def primary_top_excess(

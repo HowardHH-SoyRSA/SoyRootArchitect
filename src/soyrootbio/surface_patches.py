@@ -7,6 +7,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+from .mesh_geometry import MeshGeometryContext
 from .types import RootPath
 
 
@@ -19,6 +20,7 @@ def correct_surface_patches(
     d_bar: float,
     triangles: np.ndarray | None = None,
     excluded_mask: np.ndarray | None = None,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Minimize a symmetric component energy using observed mesh support.
 
@@ -92,18 +94,25 @@ def correct_surface_patches(
     if not len(faces):
         report.update(connectivity="no_mesh", status="skipped_no_mesh")
         return result, report
-    edges = np.unique(np.sort(np.vstack([
-        faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]],
-    ]), axis=1), axis=0)
+    if mesh_context is not None:
+        mesh_context.validate(source, faces)
+        edges, lengths = mesh_context.edges, mesh_context.edge_lengths
+    else:
+        edges = np.unique(np.sort(np.vstack([
+            faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]],
+        ]), axis=1), axis=0)
+        lengths = np.linalg.norm(source[edges[:, 0]] - source[edges[:, 1]], axis=1)
     # Even a malformed triangle spanning a scan gap must not provide a bridge.
-    lengths = np.linalg.norm(source[edges[:, 0]] - source[edges[:, 1]], axis=1)
     edges = edges[(edges[:, 0] != edges[:, 1]) & (lengths <= 4.0 * spacing)]
     assigned = (before >= 0) & ~excluded
     edges = edges[assigned[edges[:, 0]] & assigned[edges[:, 1]]]
-    same = edges[before[edges[:, 0]] == before[edges[:, 1]]]
-    graph = coo_matrix((np.ones(len(same)), (same[:, 0], same[:, 1])),
-                       shape=(len(source), len(source))).tocsr()
-    _, partition = connected_components(graph, directed=False)
+    if mesh_context is not None:
+        partition = mesh_context.ownership(before).components(edges, assigned)
+    else:
+        same = edges[before[edges[:, 0]] == before[edges[:, 1]]]
+        graph = coo_matrix((np.ones(len(same)), (same[:, 0], same[:, 1])),
+                           shape=(len(source), len(source))).tocsr()
+        _, partition = connected_components(graph, directed=False)
     ids = np.flatnonzero(assigned)
     if not len(ids):
         return result, report

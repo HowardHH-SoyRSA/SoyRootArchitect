@@ -32,6 +32,7 @@ from .endpoint_picker import (
 from .hardware import allocate_resources, detect_hardware, format_bytes
 from .pipeline import PipelineConfig
 from .batch_process import run_pipeline_process
+from .memory_budget import MemoryAdmission, estimate_input_memory
 from .primary_guidance import read_primary_guidance
 
 
@@ -54,6 +55,7 @@ class SampleEntry:
     guidance: PrimaryGuidance | None = None
     correction_file: Path | None = None
     custom_output: bool = False
+    nodule_review_file: Path | None = None
 
 
 class BioInsAlgoBatchApp:
@@ -78,6 +80,8 @@ class BioInsAlgoBatchApp:
         self.output_root_var = tk.StringVar(value=str(initial_output or ""))
         self.primary_method_var = tk.StringVar(value="Scored automatic")
         self.sample_cap_var = tk.StringVar(value="0")
+        self.input_mode_var = tk.StringVar(value="auto")
+        self.nodule_aware_var = tk.BooleanVar(value=False)
         self.display_points_var = tk.StringVar(value="30000")
         self.max_order_var = tk.StringVar(value="3")
         self.soil_z_var = tk.StringVar(value="")
@@ -135,6 +139,7 @@ class BioInsAlgoBatchApp:
         output_toolbar = ttk.Frame(outer)
         output_toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(output_toolbar, text="Load endpoints + guides…", command=self.load_selected_guidance).pack(side="left")
+        ttk.Button(output_toolbar, text="Load nodule review…", command=self.load_nodule_review).pack(side="left", padx=5)
         ttk.Label(output_toolbar, text="Output root:").pack(side="left", padx=(18, 4))
         ttk.Entry(output_toolbar, textvariable=self.output_root_var, width=38).pack(side="left", fill="x", expand=True)
         ttk.Button(output_toolbar, text="Browse", command=self.choose_output_root).pack(side="left", padx=(5, 0))
@@ -193,7 +198,11 @@ class BioInsAlgoBatchApp:
         row += 1
         row = self._setting_row(parent, row, "Primary detection", ttk.Combobox(parent, textvariable=self.primary_method_var, values=list(PRIMARY_METHODS), state="readonly"))
         row = self._setting_row(parent, row, "Analysis vertex cap", ttk.Entry(parent, textvariable=self.sample_cap_var))
-        ttk.Label(parent, text="0 = full mesh unless the 30-minute/memory preflight requires limited reduction", foreground="#5f6368", wraplength=330).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(parent, text="0 = automatic preflight for every format; original geometry is preserved", foreground="#5f6368", wraplength=330).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        row += 1
+        row = self._setting_row(parent, row, "Input mode", ttk.Combobox(parent, textvariable=self.input_mode_var, values=["auto", "surface_points", "triangle_mesh", "occupied_volume"], state="readonly"))
+        row = self._setting_row(parent, row, "Nodule-aware analysis", ttk.Checkbutton(parent, variable=self.nodule_aware_var, text="Detect and measure nodules separately"))
+        ttk.Label(parent, text="Default off. Accepted nodules: pale yellow-white. Ambiguous bulges remain for review.", foreground="#5f6368", wraplength=330).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         row = self._setting_row(parent, row, "Display points", ttk.Entry(parent, textvariable=self.display_points_var))
         row = self._setting_row(parent, row, "Maximum root order", ttk.Spinbox(parent, from_=1, to=12, textvariable=self.max_order_var))
@@ -288,6 +297,20 @@ class BioInsAlgoBatchApp:
             self.status_var.set(
                 f"Added {len(added)} sample(s). Select one and use Load endpoints + guides to reuse a previous selection."
             )
+
+    def load_nodule_review(self) -> None:
+        if self.scheduler is not None and not self.scheduler.all_done:
+            self.status_var.set("Wait for the active batch to finish before changing nodule review decisions.")
+            return
+        selected = self.tree.selection()
+        if len(selected) != 1:
+            self.status_var.set("Select one sample before loading its nodule review.")
+            return
+        filename = filedialog.askopenfilename(title="Load exported nodule_review.json", filetypes=[("Nodule review", "*.json")])
+        if filename:
+            self.entries[selected[0]].nodule_review_file = Path(filename)
+            self.nodule_aware_var.set(True)
+            self.status_var.set("Nodule review loaded. Start a new analysis to apply the reviewed classifications.")
 
     def _output_root_default(self) -> Path:
         text = self.output_root_var.get().strip()
@@ -474,11 +497,21 @@ class BioInsAlgoBatchApp:
             self.hardware_var.set(self._hardware_text())
             concurrency = self._optional_positive_int(self.concurrency_var.get())
             threads = self._optional_positive_int(self.threads_var.get())
+            # Reducing sample concurrency for RAM must not multiply transient
+            # cKDTree worker threads. Explicit user thread counts still apply.
+            if threads is None:
+                threads = min(2, max(1, self.hardware.logical_cpus - 1))
+            # Reducing sample concurrency for RAM must not multiply transient
+            # cKDTree worker threads. Explicit user thread counts still apply.
+            if threads is None:
+                threads = min(2, max(1, self.hardware.logical_cpus - 1))
             allocation = allocate_resources(
                 self.hardware,
                 sample_count=len(selected_items),
                 max_concurrent_samples=concurrency,
                 threads_per_sample=threads,
+                memory_per_sample_bytes=max(estimate_input_memory(entry.input_path)
+                                            for item, entry in self.entries.items() if item in selected_items),
             )
             output_root = self._output_root_default()
             self._refresh_default_outputs(output_root, items=selected_items)
@@ -495,6 +528,7 @@ class BioInsAlgoBatchApp:
                 max_concurrent_samples=allocation.max_concurrent_samples,
                 threads_per_sample=allocation.threads_per_sample,
                 timing_history=history,
+                memory_admission=MemoryAdmission(),
             )
             new_job_to_item: dict[str, str] = {}
             for item, entry, payload in prepared:
@@ -574,6 +608,9 @@ class BioInsAlgoBatchApp:
             correction_file=entry.correction_file,
             sample_points=self._sample_cap() or None,
             max_root_order=self._positive_int(self.max_order_var.get(), "Maximum root order", 1),
+            input_mode=self.input_mode_var.get(),
+            nodule_aware=self.nodule_aware_var.get(),
+            nodule_review_file=entry.nodule_review_file if self.nodule_aware_var.get() else None,
             runtime_limit_minutes=self._positive_float(self.runtime_limit_var.get(), "Runtime limit"),
             minimum_retained_fraction=self._percent_fraction(self.minimum_fraction_var.get()),
             tip_vector_window_mesh_units=self._positive_float(
@@ -613,7 +650,9 @@ class BioInsAlgoBatchApp:
                 if item is None or not self.tree.exists(item):
                     continue
                 snapshot = event.job
-                self.tree.set(item, "status", snapshot.state.value.title())
+                self.tree.set(item, "status", snapshot.step if snapshot.state in {
+                    BatchJobState.RUNNING, BatchJobState.QUEUED,
+                } else snapshot.state.value.title())
                 self.tree.set(item, "progress", f"{snapshot.progress_percent:.0f}%")
                 if event.kind == BatchEventType.FAILED:
                     self.tree.set(item, "status", "Failed")

@@ -2,6 +2,8 @@
 
 from dataclasses import asdict, dataclass
 from copy import deepcopy
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -23,16 +25,27 @@ from .attachment_constraint import (
 )
 from .final_surface_cleanup import cleanup_final_surface
 from .primary_contact import (
+    audit_higher_order_primary_contacts,
     mark_higher_order_primary_contact_qc,
     restrict_higher_order_primary_contacts,
 )
+from .ownership_ledger import (
+    ProvisionalEvidenceLedger,
+    ProvisionalTraceEvidenceLedger,
+    reconcile_provisional_attachment_interfaces,
+    reconcile_released_primary_contact_vertices,
+)
+from .mesh_geometry import MeshGeometryContext
 from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
+from .primary_surface import reconcile_primary_surface_tracks
+from .fork_recovery import recover_unassigned_fork_arms
 from .junction_transections import trim_primary_junctions
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
     _polyline_projection_distance_and_arc,
     _segment_radius_profile,
 )
+from .surface_patch_audit import audit_discrete_child_patches
 from .export import export_results
 from .centerline import refit_final_centerlines
 from .primary_guidance import (
@@ -41,14 +54,17 @@ from .primary_guidance import (
     write_primary_guidance,
 )
 from .geometry import (
+    CHILD_PARENT_LENGTH_PENALTY_MAX,
     is_above_primary_top,
     mean_nearest_neighbor_distance,
     normalize_unit_box,
 )
-from .io import load_root_geometry
+from .io import input_mode_contract, load_root_geometry
+from .point_evidence import assess_point_only_evidence
 from .lateral import (
     MAIN_TRACER_LOCAL_DENSITY_WEIGHT,
     MAIN_TRACER_MAX_TURN_DEGREES,
+    MAIN_TRACER_MAX_STEPS,
     MAIN_TRACER_NEW_DIRECTION_WEIGHT,
     MAIN_TRACER_OLD_DIRECTION_WEIGHT,
     MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT,
@@ -80,6 +96,7 @@ from .topology import (
     validate_root_tree,
 )
 from .traits import compute_traits
+from .nodules import detect_nodules, quantify_nodules, apply_nodule_review
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
 from .visualize import save_angle_front_views, save_overview_plot
@@ -88,6 +105,207 @@ from .visualize import save_angle_front_views, save_overview_plot
 LOGGER = logging.getLogger(__name__)
 MIN_PIPELINE_POINTS = 20
 ABOVE_BASE_TOLERANCE_NORMALIZED = 1e-9
+
+
+def _full_normalized_geometry(
+    cloud: PointCloudData,
+    normalized_analysis: np.ndarray,
+    normalization: Normalization,
+) -> np.ndarray:
+    """Share transformed coordinates only for an exact identity analysis map.
+
+    The source/export arrays and analysis-to-full mapping remain in ``cloud``;
+    this only avoids repeating the same float64 arithmetic and allocation.
+    """
+
+    export_points = cloud.export_points
+    indices = cloud.analysis_indices
+    identity_mapping = (
+        indices is None and export_points is cloud.points
+    ) or (
+        indices is not None
+        and len(indices) == len(export_points) == len(cloud.points)
+        and np.array_equal(indices, np.arange(len(indices), dtype=int))
+    )
+    if identity_mapping and (
+        export_points is cloud.points
+        or np.array_equal(export_points, cloud.points)
+    ):
+        return normalized_analysis
+    return normalization.transform_points(export_points)
+
+
+def _mark_final_primary_contact_qc(
+    roots: list[RootPath],
+    restriction_passes: list[dict],
+    final_audit: dict,
+) -> None:
+    """Tie repaired/unresolved flags to the labels actually being exported."""
+
+    repaired = {
+        str(row["root_id"])
+        for report in restriction_passes
+        for row in report.get("contacts", [])
+        if int(row.get("changed_vertex_count", 0)) > 0
+    }
+    unresolved = {
+        str(row["root_id"]) for row in final_audit.get("contacts", [])
+    }
+    contact_flags = {
+        "primary_contact_segmentation_error",
+        "primary_contact_repaired",
+        "primary_contact_unresolved",
+    }
+    for root in roots:
+        root.qc_flags = [flag for flag in root.qc_flags if flag not in contact_flags]
+        root_id = str(root.root_id)
+        if root_id in repaired or root_id in unresolved:
+            root.qc_flags.append("primary_contact_segmentation_error")
+            root.qc_flags.append(
+                "primary_contact_unresolved"
+                if root_id in unresolved else "primary_contact_repaired"
+            )
+
+
+def _write_ownership_evidence_ledger(
+    output_dir: Path,
+    trace_ledger: ProvisionalTraceEvidenceLedger,
+    ledgers: list[ProvisionalEvidenceLedger],
+    reports: list[dict],
+    above_base_mask: np.ndarray,
+) -> dict:
+    """Persist the sparse reason ledger and its exact protected/anchor arrays."""
+
+    if len(ledgers) != len(reports):
+        raise ValueError("each ownership generation needs one report")
+    archive = {
+        "above_base_excluded": np.asarray(above_base_mask, dtype=bool),
+        "protected_excluded": ledgers[0].excluded,
+        "trace_excluded": trace_ledger.excluded,
+        "trace_latest_anchor_owner": trace_ledger.latest_anchor_owner,
+    }
+    for checkpoint_index, (labels, anchor_owner) in enumerate(zip(
+        trace_ledger.label_snapshots, trace_ledger.anchor_snapshots, strict=True
+    )):
+        archive[f"trace_labels_checkpoint_{checkpoint_index}"] = labels
+        archive[f"trace_anchor_owner_checkpoint_{checkpoint_index}"] = anchor_owner
+    for checkpoint_index, evidence in trace_ledger.native_snapshots.items():
+        for name, values in evidence.items():
+            archive[f"trace_native_checkpoint_{checkpoint_index}_{name}"] = values
+    generations = []
+    for index, (ledger, report) in enumerate(zip(ledgers, reports, strict=True)):
+        anchor_owner = np.full(len(ledger.labels), -1, dtype=np.int32)
+        anchor_owner[ledger.exposed_body_anchors] = ledger.labels[
+            ledger.exposed_body_anchors
+        ]
+        archive[f"anchor_owner_pass_{index}_generation_{ledger.generation}"] = anchor_owner
+        summary = ledger.summary()
+        if index:
+            # Existing uncertainty was recorded in the first snapshot. Later
+            # generations store only new competitor/interface decisions.
+            summary["interfaces"] = [
+                row for row in summary["interfaces"]
+                if row["reason"] != "preexisting_uncertainty"
+            ]
+        generations.append({
+            "report": report,
+            "snapshot": summary,
+            "commits": ledger.history,
+        })
+    np.savez_compressed(output_dir / "ownership_evidence_masks.npz", **archive)
+    payload = {
+        "policy": "frozen-provisional-ownership-evidence-v1",
+        "generation_count": len(generations),
+        "trace": trace_ledger.payload(),
+        "masks_file": "ownership_evidence_masks.npz",
+        "generations": generations,
+    }
+    (output_dir / "ownership_evidence_ledger.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
+    return {
+        "policy": payload["policy"],
+        "generation_count": len(generations),
+        "trace_checkpoint_count": trace_ledger.generation,
+        "trace_interface_record_count": len(trace_ledger.interfaces),
+        "masks_file": payload["masks_file"],
+        "records_file": "ownership_evidence_ledger.json",
+        "released_vertex_count": int(sum(
+            report["released_vertex_count"] for report in reports
+        )),
+        "reassigned_vertex_count": int(sum(
+            report["reassigned_vertex_count"] for report in reports
+        )),
+        "unresolved_region_count": int(sum(
+            report["unresolved_region_count"] for report in reports
+        )),
+    }
+
+
+def _unmapped_native_attachment_evidence(
+    analysis_labels: np.ndarray,
+    mesh_labels_before: np.ndarray,
+    mesh_labels_restricted: np.ndarray,
+    mesh_excluded_mask: np.ndarray | None,
+    *,
+    generation: int,
+) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
+    """Archive a native release when no exact analysis vertex map exists.
+
+    The -1 mapping sentinel explicitly means that no analysis vertex can be
+    linked to the native release. Keep every analysis label and every released
+    native vertex unresolved; do not infer a map from nearby coordinates.
+    """
+    labels = np.asarray(analysis_labels, dtype=int)
+    before = np.asarray(mesh_labels_before, dtype=int)
+    restricted = np.asarray(mesh_labels_restricted, dtype=int)
+    if labels.ndim != 1 or before.ndim != 1 or restricted.shape != before.shape:
+        raise ValueError("analysis and native label arrays must be one-dimensional")
+    excluded = _coerce_exclusion_mask(mesh_excluded_mask, len(before))
+    changed = before != restricted
+    released = np.flatnonzero((before > 0) & (restricted == -2) & ~excluded)
+    if not np.array_equal(np.flatnonzero(changed), released):
+        raise ValueError("unmapped native restriction may only release unexcluded lateral owners")
+    reason = "unresolved_no_analysis_to_native_mesh_mapping"
+    evidence = {
+        "analysis_to_mesh": np.full(len(labels), -1, dtype=np.int64),
+        "excluded": excluded.copy(),
+        "exposed_body_anchors": np.zeros(len(before), dtype=bool),
+        "before_labels": before.copy(),
+        "restricted_labels": restricted.copy(),
+        "committed_labels": restricted.copy(),
+        "released_vertices": released.astype(np.int64, copy=True),
+        "source_owners": before[released].astype(np.int32, copy=True),
+        "final_owners": restricted[released].astype(np.int32, copy=True),
+    }
+    records = [
+        {
+            "mesh_vertex": int(vertex),
+            "source_owner": int(before[vertex]),
+            "final_owner": -2,
+            "owner_candidates": [],
+            "reason": reason,
+            "evidence_generation": int(generation),
+        }
+        for vertex in released
+    ]
+    report = {
+        "policy": "frozen-attachment-release-evidence-v1",
+        "status": reason,
+        "mapping_policy": "unavailable_minus_one_sentinel_no_analysis_reassignment",
+        "evidence_generation": int(generation),
+        "changed_mesh_vertex_count": int(len(released)),
+        "mapped_released_analysis_vertex_count": 0,
+        "mapped_supported_commit_count": 0,
+        "mapped_unresolved_interface_count": 0,
+        "native_released_vertex_records": records,
+        "native_frozen_snapshot_sha256": {
+            key: hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+            for key, value in evidence.items()
+        },
+    }
+    return labels.copy(), report, evidence
 
 
 class AnalysisCancelled(RuntimeError):
@@ -184,6 +402,9 @@ class PipelineConfig:
     attachment_longitudinal_radii: float = 5.0
     attachment_geodesic_diameter_radii: float = 6.0
     attachment_maximum_inverse_compactness: float = 6.0
+    input_mode: str = "auto"
+    nodule_aware: bool = False
+    nodule_review_file: Path | None = None
 
 
 @dataclass
@@ -279,6 +500,7 @@ def run_pipeline(
     progress_callback: Callable[[str, float], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
+    resource_callback: Callable[[dict], None] | None = None,
 ) -> PipelineResult:
     """Run one analysis with an isolated per-job SciPy worker limit."""
 
@@ -289,6 +511,7 @@ def run_pipeline(
             progress_callback=progress_callback,
             cancel_check=cancel_check,
             pause_check=pause_check,
+            resource_callback=resource_callback,
         )
 
 
@@ -299,6 +522,7 @@ def _run_pipeline_impl(
     progress_callback: Callable[[str, float], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
+    resource_callback: Callable[[dict], None] | None = None,
 ) -> PipelineResult:
     """Run the soybean root skeletonization and trait workflow.
 
@@ -346,11 +570,24 @@ def _run_pipeline_impl(
             random_seed=config.random_seed,
             runtime_limit_seconds=config.runtime_limit_minutes * 60.0,
             minimum_retained_fraction=config.minimum_retained_fraction,
+            input_mode=config.input_mode,
         )
     else:
         cloud = preloaded_cloud
+        contract = input_mode_contract(config.input_mode, has_triangles=cloud.triangles is not None and len(cloud.triangles) > 0)
+        loaded_mode = cloud.source_metadata.get("input_mode")
+        if loaded_mode is not None and loaded_mode != contract["input_mode"]:
+            raise ValueError("Preloaded geometry input mode differs from the pipeline input mode")
+        cloud.source_metadata.update(contract)
         LOGGER.info("Using %d points already loaded by the desktop GUI", len(cloud.points))
     checkpoint("load_geometry", "Point cloud ready", 0.12)
+    if resource_callback is not None:
+        resource_callback({
+            "full_vertex_count": len(cloud.export_points),
+            "analysis_vertex_count": len(cloud.points),
+            "triangle_count": 0 if cloud.triangles is None else len(cloud.triangles),
+            "original_vertex_count": len(cloud.original_points) if cloud.original_points is not None else len(cloud.export_points),
+        })
     if len(cloud.points) < MIN_PIPELINE_POINTS:
         raise ValueError(f"Too few points for skeletonization: found {len(cloud.points)}, need at least {MIN_PIPELINE_POINTS}")
     normalized, base_normalization = normalize_unit_box(cloud.points)
@@ -358,7 +595,18 @@ def _run_pipeline_impl(
     # to the source mesh coordinate system for every reported trait.  Physical
     # calibration is intentionally disabled until its contract is reinstated.
     normalization = Normalization(base_normalization.minimum, base_normalization.scale)
-    d_bar = mean_nearest_neighbor_distance(normalized)
+    # Analysis coordinates do not change during segmentation or tracing. Reuse
+    # their spatial index while allowing every mask/path-dependent result to be
+    # recomputed at its own semantic checkpoint.
+    full_normalized = _full_normalized_geometry(cloud, normalized, normalization)
+    shared_analysis = full_normalized is normalized
+    mesh_context = MeshGeometryContext.build(full_normalized, cloud.triangles)
+    full_normalized = mesh_context.points
+    if shared_analysis:
+        normalized = full_normalized
+    analysis_tree = mesh_context.point_tree if shared_analysis else cKDTree(normalized)
+    d_bar = mean_nearest_neighbor_distance(normalized, point_tree=analysis_tree)
+    segment_index_cache = _ExposedSegmentIndexCache()
     LOGGER.info("Loaded %d points; d_bar=%g", len(normalized), d_bar)
     checkpoint("normalization", "Detecting primary root", 0.20)
 
@@ -397,6 +645,7 @@ def _run_pipeline_impl(
         coarse_primary.points,
         d_bar=d_bar,
         cooperate=cooperate,
+        point_tree=analysis_tree,
     )
     primary_mask[above_base_mask] = False
     refined_primary_points = refine_primary_centerline(
@@ -417,6 +666,7 @@ def _run_pipeline_impl(
         d_bar=d_bar,
         complete_cross_section=True,
         cooperate=cooperate,
+        point_tree=analysis_tree,
     )
     primary_mask[above_base_mask] = False
     refined_primary_points = refine_primary_centerline(
@@ -443,9 +693,8 @@ def _run_pipeline_impl(
         len(above_base_mask),
     )
     LOGGER.info("Primary segmentation assigned %d/%d points", int(primary_mask.sum()), len(primary_mask))
-    checkpoint("primary_segmentation", "Segmented and refined primary root", 0.46)
+    checkpoint("primary_segmentation", "Tracing lateral roots", 0.46)
 
-    full_normalized = normalization.transform_points(cloud.export_points)
     full_above_base_mask = _selected_base_exclusion_mask(
         full_normalized,
         selected_base,
@@ -453,6 +702,33 @@ def _run_pipeline_impl(
         gravity=np.asarray(config.gravity, dtype=float),
         collar_neighborhood_radius=base_collar_neighborhood_radius,
         tolerance=base_tolerance,
+    )
+    nodules = None
+    full_nonroot_mask = full_above_base_mask
+    analysis_nonroot_mask = above_base_mask
+    if config.nodule_review_file is not None and not config.nodule_aware:
+        raise ValueError("Nodule review decisions require nodule-aware analysis")
+    if config.nodule_aware:
+        _report_progress(progress_callback, "Detecting nodule-like bulges", 0.46)
+        nodules = detect_nodules(
+            cloud.export_points, cloud.triangles,
+            primary_path=normalization.inverse_points(primary.points),
+            excluded_mask=full_above_base_mask, cooperate=cooperate,
+        )
+        if config.nodule_review_file is not None:
+            apply_nodule_review(nodules, config.nodule_review_file, cloud.export_points, full_above_base_mask)
+        full_nonroot_mask = full_above_base_mask | nodules.mask
+        if cloud.analysis_indices is not None:
+            analysis_nodules = nodules.mask[cloud.analysis_indices]
+        elif len(normalized) == len(full_normalized):
+            analysis_nodules = nodules.mask
+        else:
+            raise ValueError("Nodule-aware analysis needs the source-to-analysis vertex mapping")
+        analysis_nonroot_mask = above_base_mask | analysis_nodules
+        primary_mask = primary_mask & ~analysis_nodules
+        LOGGER.info("Nodule detection: %d accepted, %d candidates", nodules.public()["accepted_count"], nodules.public()["candidate_count"])
+    trace_evidence_ledger = ProvisionalTraceEvidenceLedger(
+        normalized, above_base_mask,
     )
     attachment_constraint_report: dict[str, object] = {"per_order": []}
     lateral_origin_report: dict[str, object] = {}
@@ -463,17 +739,23 @@ def _run_pipeline_impl(
         d_bar,
         max_root_order=config.max_root_order,
         max_paths=config.lateral_max_paths,
-        excluded_mask=above_base_mask,
+        excluded_mask=analysis_nonroot_mask,
         cooperate=cooperate,
         gravity=np.asarray(config.gravity, dtype=float),
         primary_top_reference=primary_top_reference,
         origin_report=lateral_origin_report,
         mesh_points=full_normalized,
         mesh_triangles=cloud.triangles,
-        mesh_excluded_mask=full_above_base_mask,
+        mesh_excluded_mask=full_nonroot_mask,
         analysis_to_mesh=cloud.analysis_indices,
         attachment_report=attachment_constraint_report,
         attachment_bounds=attachment_bounds,
+        point_tree=analysis_tree,
+        segment_index_cache=segment_index_cache,
+        evidence_ledger=trace_evidence_ledger,
+        mesh_context=mesh_context,
+        progress_callback=lambda label, fraction: _report_progress(
+            progress_callback, label, 0.46 + 0.23 * fraction),
     )
     checkpoint("lateral_tracing", "Repairing root topology", 0.70)
     if lateral_start_count == 0:
@@ -483,11 +765,16 @@ def _run_pipeline_impl(
         selected,
         d_bar=d_bar,
         primary_surface_points=normalized[
-            np.asarray(primary_mask, dtype=bool) & ~above_base_mask
+            np.asarray(primary_mask, dtype=bool) & ~analysis_nonroot_mask
         ],
         gravity=np.asarray(config.gravity, dtype=float),
         primary_top_reference=primary_top_reference,
         attachment_evidence=attachment_constraint_report,
+        support_points=normalized,
+        mesh_points=full_normalized,
+        mesh_triangles=cloud.triangles,
+        mesh_excluded_mask=full_nonroot_mask,
+        mesh_context=mesh_context,
     )
     correction_input_fingerprints = {
         "primary": _polyline_fingerprint(primary.points),
@@ -513,13 +800,15 @@ def _run_pipeline_impl(
     if cloud.triangles is not None and len(cloud.triangles):
         topology_mesh_labels = _assign_full_root_labels(
             full_normalized, primary.points, selected, d_bar=d_bar,
-            excluded_mask=full_above_base_mask,
+            excluded_mask=full_nonroot_mask,
+            segment_index_cache=segment_index_cache,
         )
         attachment_constraint_report["after_topology_repair"] = assess_attachment_footprints(
             full_normalized, topology_mesh_labels, primary.points, selected,
             triangles=cloud.triangles, d_bar=d_bar,
-            excluded_mask=full_above_base_mask,
+            excluded_mask=full_nonroot_mask,
             bounds=attachment_bounds,
+            mesh_context=mesh_context,
         )
     checkpoint("topology_repair", "Assigning root vertices", 0.76)
     segmented_primary_mask = np.asarray(primary_mask, dtype=bool).copy()
@@ -528,8 +817,9 @@ def _run_pipeline_impl(
         selected,
         segmented_primary_mask,
         d_bar,
-        excluded_mask=above_base_mask,
+        excluded_mask=analysis_nonroot_mask,
         return_competing_labels=True,
+        segment_index_cache=segment_index_cache,
     )
     analysis_root_labels = _analysis_root_labels(
         segmented_primary_mask,
@@ -560,9 +850,30 @@ def _run_pipeline_impl(
         primary.points,
         selected,
         d_bar=d_bar,
-        excluded_mask=full_above_base_mask,
+        excluded_mask=full_nonroot_mask,
         return_competing_labels=True,
+        segment_index_cache=segment_index_cache,
     )
+    selected, fork_recovery_report = recover_unassigned_fork_arms(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, mesh_context=mesh_context, excluded_mask=full_nonroot_mask,
+        analysis_points=normalized, analysis_to_mesh=cloud.analysis_indices,
+        primary_top_reference=primary_top_reference, gravity=np.asarray(config.gravity),
+    )
+    if fork_recovery_report["accepted_count"]:
+        for root in selected:
+            correction_input_fingerprints.setdefault(root.root_id, _polyline_fingerprint(root.points))
+        lateral_labels, analysis_competing_labels = _assign_lateral_points(
+            normalized, selected, segmented_primary_mask, d_bar,
+            excluded_mask=analysis_nonroot_mask, return_competing_labels=True,
+            segment_index_cache=segment_index_cache,
+        )
+        analysis_root_labels = _analysis_root_labels(segmented_primary_mask, lateral_labels)
+        full_root_labels, full_competing_labels = _assign_full_root_labels(
+            full_normalized, primary.points, selected, d_bar=d_bar,
+            excluded_mask=full_nonroot_mask, return_competing_labels=True,
+            segment_index_cache=segment_index_cache,
+        )
     (
         internal_o1_contact_changed_ids,
         internal_o1_contact_decisions,
@@ -598,8 +909,9 @@ def _run_pipeline_impl(
             selected,
             segmented_primary_mask,
             d_bar,
-            excluded_mask=above_base_mask,
+            excluded_mask=analysis_nonroot_mask,
             return_competing_labels=True,
+            segment_index_cache=segment_index_cache,
         )
         analysis_root_labels = _analysis_root_labels(
             segmented_primary_mask,
@@ -629,8 +941,9 @@ def _run_pipeline_impl(
             primary.points,
             selected,
             d_bar=d_bar,
-            excluded_mask=full_above_base_mask,
+            excluded_mask=full_nonroot_mask,
             return_competing_labels=True,
+            segment_index_cache=segment_index_cache,
         )
     analysis_to_full: np.ndarray | None = None
     if cloud.analysis_indices is not None and len(cloud.analysis_indices) == len(normalized):
@@ -641,7 +954,7 @@ def _run_pipeline_impl(
         # entries are harmless for non-uncertain labels and are ignored below.
         for analysis_index, pair in analysis_competing_labels.items():
             full_competing_labels[int(analysis_to_full[int(analysis_index)])] = pair
-    full_root_labels[full_above_base_mask] = -1
+    full_root_labels[full_nonroot_mask] = -1
     full_root_labels, full_junction_report = _resolve_parent_owned_junctions(
         full_normalized,
         full_root_labels,
@@ -652,26 +965,46 @@ def _run_pipeline_impl(
         ambiguity_margin=max(0.75 * d_bar, 0.001),
         competing_labels=full_competing_labels,
     )
+    full_root_labels, selected, primary_surface_report = reconcile_primary_surface_tracks(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
+        mesh_context=mesh_context,
+    )
+    mapping = primary_surface_report["label_mapping"]
+    full_competing_labels = {
+        index: tuple(mapping.get(label, label) for label in pair)
+        for index, pair in full_competing_labels.items()
+    }
     full_root_labels, collar_report = analyze_joint_collar(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
-        excluded_mask=full_above_base_mask,
+        excluded_mask=full_nonroot_mask,
+        mesh_context=mesh_context,
     )
     # The joint crown decision owns this domain. Later component correction
     # must not erase supported emergence surfaces or re-open sibling ties.
-    patch_excluded = full_above_base_mask.copy()
+    patch_excluded = full_nonroot_mask.copy()
     patch_excluded[np.asarray(collar_report["neighborhood_vertex_indices"], dtype=int)] = True
     full_root_labels, surface_patch_report = _correct_surface_patches(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=patch_excluded,
+        mesh_context=mesh_context,
     )
     # A branch-facing protrusion can be part of the main primary component.
     # Split that local exterior after atomic patch correction, before fitting.
+    # A measured compressed wall must not become a protrusion merely because
+    # the branch-facing trimmer approximates the parent with circular radii.
+    confirmed_primary_wall = np.zeros(len(full_normalized), dtype=bool)
+    confirmed_primary_wall[np.asarray(
+        primary_surface_report["confirmed_primary_vertex_indices"], dtype=int,
+    )] = True
     full_root_labels, transection_report = trim_primary_junctions(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
-        excluded_mask=full_above_base_mask,
+        excluded_mask=full_nonroot_mask,
+        protected_primary_mask=confirmed_primary_wall,
+        mesh_context=mesh_context,
     )
     # Resolve remaining unsupported islands and bounded holes against local,
     # mesh-connected exposed-body support before centerlines see final labels.
@@ -680,23 +1013,47 @@ def _run_pipeline_impl(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=patch_excluded,
+        mesh_context=mesh_context,
     )
     # Resolve non-parent contact before final attachment QC and centerline
     # fitting, so both use the corrected full-resolution labels.
+    pre_contact_labels = full_root_labels.copy()
+    # Native higher-order/primary contact is independent evidence that can
+    # correct an earlier joint-collar label. The immutable barrier here is
+    # only the actual above-collar exclusion; the broader collar neighborhood
+    # remains protected in patch and island cleanup stages.
+    contact_excluded = full_nonroot_mask
     full_root_labels, primary_contact_report = restrict_higher_order_primary_contacts(
         full_normalized, full_root_labels, selected,
         triangles=cloud.triangles, d_bar=d_bar,
-        excluded_mask=patch_excluded,
+        excluded_mask=contact_excluded,
+        mesh_context=mesh_context,
     )
+    full_root_labels, initial_ownership_ledger, initial_ledger_report = (
+        reconcile_released_primary_contact_vertices(
+            full_normalized, pre_contact_labels, full_root_labels,
+            primary.points, selected,
+            triangles=cloud.triangles, d_bar=d_bar,
+            excluded_mask=contact_excluded,
+            competitor_labels=full_competing_labels,
+            generation=0,
+            mesh_context=mesh_context,
+        )
+    )
+    ownership_ledgers = [initial_ownership_ledger]
+    ownership_ledger_reports = [initial_ledger_report]
+    primary_contact_passes = [primary_contact_report]
     final_attachment = assess_attachment_footprints(
         full_normalized, full_root_labels, primary.points, selected,
         triangles=cloud.triangles, d_bar=d_bar,
-        excluded_mask=full_above_base_mask,
+        excluded_mask=full_nonroot_mask,
         bounds=attachment_bounds,
+        mesh_context=mesh_context,
     )
     full_root_labels, final_attachment_restriction = restrict_rejected_contacts(
         full_root_labels, final_attachment, selected, full_normalized,
         triangles=cloud.triangles, d_bar=d_bar,
+        mesh_context=mesh_context,
     )
     attachment_constraint_report["after_ownership_cleanup"] = final_attachment
     attachment_constraint_report["final_contact_restriction"] = final_attachment_restriction
@@ -752,23 +1109,28 @@ def _run_pipeline_impl(
             gravity=np.asarray(config.gravity, dtype=float),
             primary_top_reference=primary_top_reference,
             cooperate=cooperate,
+            mesh_context=mesh_context,
+            nodule_labels=nodules.vertex_labels if nodules is not None else None,
         )
         frozen_labels = full_root_labels.copy()
         attachment_assessment = assess_attachment_footprints(
             full_normalized, frozen_labels, primary.points, selected,
             triangles=cloud.triangles, d_bar=d_bar,
-            excluded_mask=full_above_base_mask,
+            excluded_mask=full_nonroot_mask,
             bounds=attachment_bounds,
+            mesh_context=mesh_context,
         )
         attachment_proposal, attachment_restriction = restrict_rejected_contacts(
             frozen_labels, attachment_assessment, selected, full_normalized,
             triangles=cloud.triangles, d_bar=d_bar,
+            mesh_context=mesh_context,
         )
         parent_proposal, parent_contact_report = reconcile_parent_contacts(
             full_normalized, frozen_labels, primary.points, selected,
             triangles=cloud.triangles, d_bar=d_bar,
             cleanup_report=final_surface_cleanup_report,
             excluded_mask=patch_excluded,
+            mesh_context=mesh_context,
         )
         proposal = _merge_final_contact_proposals(
             frozen_labels, parent_proposal, parent_contact_report,
@@ -801,20 +1163,82 @@ def _run_pipeline_impl(
                 attachment_restriction["changed_by_root"] = {}
             break
         full_root_labels = proposal
+        pre_contact_labels = full_root_labels.copy()
         full_root_labels, primary_contact_report = restrict_higher_order_primary_contacts(
             full_normalized, full_root_labels, selected,
             triangles=cloud.triangles, d_bar=d_bar,
-            excluded_mask=patch_excluded,
+            excluded_mask=contact_excluded,
+            mesh_context=mesh_context,
         )
+        full_root_labels, contact_ledger, contact_ledger_report = (
+            reconcile_released_primary_contact_vertices(
+                full_normalized, pre_contact_labels, full_root_labels,
+                primary.points, selected,
+                triangles=cloud.triangles, d_bar=d_bar,
+                excluded_mask=contact_excluded,
+                generation=pass_index + 1,
+                mesh_context=mesh_context,
+            )
+        )
+        ownership_ledgers.append(contact_ledger)
+        ownership_ledger_reports.append(contact_ledger_report)
+        primary_contact_passes.append(primary_contact_report)
+    if nodules is not None:
+        full_root_labels[nodules.mask] = nodules.vertex_labels[nodules.mask]
+    final_primary_contact_audit = audit_higher_order_primary_contacts(
+        full_normalized, full_root_labels, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        mesh_context=mesh_context,
+        nonroot_labels=tuple(int(o["numeric_label"]) for o in nodules.objects if o["status"] == "accepted") if nodules is not None else (),
+    )
+    final_surface_patch_audit = audit_discrete_child_patches(
+        full_normalized, full_root_labels, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        excluded_mask=full_nonroot_mask,
+        mesh_context=mesh_context,
+        nonroot_labels=tuple(int(o["numeric_label"]) for o in nodules.objects if o["status"] == "accepted") if nodules is not None else (),
+    )
+    unresolved_patch_roots = {
+        str(row["root_id"]) for row in final_surface_patch_audit["patches"]
+    }
+    for root in selected:
+        if str(root.root_id) in unresolved_patch_roots:
+            root.qc_flags = list(dict.fromkeys([
+                *root.qc_flags, "discrete_child_patch_unresolved",
+            ]))
+    final_topology_errors = validate_root_tree(
+        selected, primary_path=primary.points,
+        primary_top_reference=primary_top_reference,
+        gravity=np.asarray(config.gravity, dtype=float),
+    )
+    if final_topology_errors:
+        raise RuntimeError(
+            "Final fitted root topology validation failed: "
+            + "; ".join(final_topology_errors)
+        )
+    primary_contact_report = {
+        **primary_contact_report,
+        "status": (
+            final_primary_contact_audit["status"]
+            if final_primary_contact_audit["status"] != "clear"
+            else "repaired_or_clear"
+        ),
+        "requires_correction": bool(final_primary_contact_audit["requires_correction"]),
+        "restriction_passes": primary_contact_passes,
+        "final_native_audit": final_primary_contact_audit,
+    }
     attachment_constraint_report["after_centerline_reconciliation"] = assess_attachment_footprints(
         full_normalized, full_root_labels, primary.points, selected,
         triangles=cloud.triangles, d_bar=d_bar,
-        excluded_mask=full_above_base_mask,
+        excluded_mask=full_nonroot_mask,
         bounds=attachment_bounds,
+        mesh_context=mesh_context,
     )
     attachment_constraint_report["postfit_reconciliation_passes"] = postfit_attachment_passes
     mark_final_attachment_qc(selected, attachment_constraint_report["after_centerline_reconciliation"])
-    mark_higher_order_primary_contact_qc(selected, primary_contact_report)
+    _mark_final_primary_contact_qc(
+        selected, primary_contact_passes, final_primary_contact_audit,
+    )
     mark_parent_contact_qc(selected, parent_contact_passes[-1])
     if cleaned_analysis_labels is not None:
         cleaned_analysis_labels = full_root_labels[analysis_to_full] if analysis_to_full is not None else full_root_labels
@@ -828,7 +1252,49 @@ def _run_pipeline_impl(
     ]))
     for assessment in final_centerline_report["roots"]:
         assessment["correction_input_geometry_fingerprint"] = correction_input_fingerprints[assessment["root_id"]]
+    point_evidence = (
+        {"status": "not_applicable_native_mesh", "mesh_generated": False}
+        if cloud.source_metadata["native_mesh_support"] else
+        assess_point_only_evidence(
+            full_normalized, full_root_labels, primary.points, selected,
+            input_mode=cloud.source_metadata["input_mode"],
+            excluded_mask=full_nonroot_mask, cooperate=cooperate,
+        )
+    )
+    if not cloud.source_metadata["native_mesh_support"]:
+        possible_contact_ids = {
+            root_id for row in point_evidence["contacts"]
+            if row["higher_order_primary_pair"] or not row["expected_parent_pair"]
+            for root_id in row["root_ids"]
+        }
+        possible_patch_ids = {
+            row["root_id"] for row in point_evidence["roots"]
+            if row["discrete_patch_candidate_count"] > 0
+        }
+        for root in [primary, *selected]:
+            flags = ["native_mesh_constraints_unresolved"]
+            if root.root_id in possible_contact_ids:
+                flags.append("point_contact_possible")
+            if root.root_id in possible_patch_ids:
+                flags.append("point_surface_patch_possible")
+            root.qc_flags = list(dict.fromkeys([*root.qc_flags, *flags]))
+    stl_indexing = cloud.source_metadata.get("stl_indexing", {})
+    if stl_indexing.get("status") == "unresolved_stl_connectivity":
+        # No contact observed on disconnected facets is not proof of compliance.
+        for root in [primary, *selected]:
+            root.qc_flags = list(dict.fromkeys([*root.qc_flags, "stl_connectivity_unresolved"]))
+    if cloud.source_metadata["input_mode"] == "occupied_volume":
+        for root in [primary, *selected]:
+            root.qc_flags = list(dict.fromkeys([*root.qc_flags, "occupied_volume_measurement_uncalibrated"]))
     checkpoint("final_centerline_fitting", "Computing root traits", 0.84)
+    if nodules is not None:
+        quantify_nodules(
+            nodules, cloud.export_points, cloud.triangles, full_root_labels,
+            {0: {"root_id": "primary", "order": 0, "points": normalization.inverse_points(primary.points)},
+             **{i: {"root_id": root.root_id, "order": root.order, "points": normalization.inverse_points(root.points)}
+                for i, root in enumerate(selected, 1)}},
+            normalization.inverse_points(primary_top_reference[None, :])[0], config.gravity,
+        )
     traits = compute_traits(
         primary.points,
         selected,
@@ -848,13 +1314,29 @@ def _run_pipeline_impl(
         tip_vector_window=config.tip_vector_window_mesh_units,
     )
     checkpoint("trait_measurement", "Rendering validation figures", 0.87)
+    if nodules is not None:
+        nodules.evidence["measured_root_lengths"] = {
+            str(row.root_id): float(row.length) for row in traits.itertuples()
+            if np.isfinite(row.length) and row.length > 0
+        }
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    save_overview_plot(config.output_dir / "overview.png", normalized, primary_mask, lateral_labels, primary.points, selected)
+    if np.any(full_root_labels[full_above_base_mask] != -1):
+        raise AssertionError("above-collar vertices must remain unassigned")
+    ownership_ledger_metadata = _write_ownership_evidence_ledger(
+        config.output_dir, trace_evidence_ledger,
+        ownership_ledgers, ownership_ledger_reports,
+        full_above_base_mask,
+    )
+    display_labels = lateral_labels
+    if nodules is not None:
+        display_labels = lateral_labels.copy()
+        display_labels[analysis_nodules] = -2  # display-only sentinel, separate from root labels
+    save_overview_plot(config.output_dir / "overview.png", normalized, primary_mask, display_labels, primary.points, selected)
     save_angle_front_views(
         config.output_dir,
         normalized,
         primary_mask,
-        lateral_labels,
+        display_labels,
         primary.points,
         selected,
         traits,
@@ -881,12 +1363,14 @@ def _run_pipeline_impl(
         "physical_unit_conversion_applied": False,
         "gravity_vector": list(config.gravity),
         "source_geometry": cloud.source_metadata,
+        "point_only_evidence": point_evidence,
         "lateral_start_count": lateral_start_count,
         "candidate_lateral_count": candidate_count,
         "selected_lateral_count": len(selected),
         "selected_order_counts": order_counts,
         "lateral_origin_constraint": lateral_origin_report,
         "lateral_tracing_policy": {
+            "main_tracer_max_steps": MAIN_TRACER_MAX_STEPS,
             "hypotheses_per_parameter_variant": 2,
             "fork_hypothesis_promotion": False,
             "fork_hypothesis_resolution": (
@@ -897,6 +1381,9 @@ def _run_pipeline_impl(
             "fork_hypothesis_common_prefix_preserved": True,
             "post_fork_suffix_dominance_review": True,
             "fork_resurvey_policy": "deterministic_bounded_work_queue",
+            "terminal_continuation_resolution": (
+                "capped_parent_tip_native_mesh_radius_and_windowed_direction"
+            ),
             "tip_seed_guard_supported_departure_exception": True,
             "surface_aware_order1_seeding": True,
             "surface_contact_distance_d_bar": 2.5,
@@ -945,23 +1432,31 @@ def _run_pipeline_impl(
                 "pre-junction full-resolution root labels"
             ),
             "ancestor_inward_terminal_rejection": True,
-            "child_length_may_not_exceed_parent": True,
-            "child_length_control_stage": "topology_repair_before_final_support_fitting",
+            "child_length_may_not_exceed_parent": False,
+            "child_length_review_stage": "topology_junction_resurvey_and_final_support_QC",
+            "overlong_child_reexamination_penalty_max": CHILD_PARENT_LENGTH_PENALTY_MAX,
+            "overlong_child_reexamination_penalty_formula": "0.05 * max(0, 1 - parent_length / child_length)",
+            "junction_review_score_weights": {
+                "direction_continuity": 0.55,
+                "fork_evidence": 0.35,
+                "sustained_continuation_length": 0.10,
+            },
             "post_fit_length_violation_action": "QC_flag_preserve_final_ownership_and_hierarchy",
             "overlong_child_alternative_parent_resurvey": True,
             "overlong_child_action": (
-                "at a supported internal fork, resurvey the overlong "
-                "child arm as the alternative parent continuation and retain "
-                "both arms only when the resulting parent and child satisfy "
-                "the same length control; otherwise remove the violating "
-                "automatic child and its descendant subtree; reject manual "
-                "hierarchy edits"
+                "warn and re-examine the junction; apply a small bounded "
+                "length penalty to supported hypotheses; change hierarchy "
+                "only with independent evidence of a better continuation; "
+                "retain unresolved children and descendants with QC; "
+                "allow otherwise valid manual edits"
             ),
         },
         "internal_o1_contact_changed_root_ids": sorted(
             internal_o1_contact_changed_ids
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
+        "unassigned_fork_recovery": fork_recovery_report,
+        "primary_surface_track_reconciliation": primary_surface_report,
         "final_centerline_fitting": final_centerline_report,
         "branch_facing_transection_trimming": transection_report,
         "final_surface_cleanup": final_surface_cleanup_report,
@@ -974,6 +1469,23 @@ def _run_pipeline_impl(
         },
         "attachment_constraint": attachment_constraint_report,
         "higher_order_primary_contact": primary_contact_report,
+        "final_surface_patch_audit": final_surface_patch_audit,
+        "final_compliance_audit": {
+            "policy": "final-export-snapshot-constraints-v1",
+            "source_connectivity_status": stl_indexing.get("status", "as_supplied"),
+            "source_connectivity_unresolved_vertex_count": stl_indexing.get("unresolved_full_vertex_count", 0),
+            "geometry_sha256": final_primary_contact_audit["geometry_sha256"],
+            "labels_sha256": final_primary_contact_audit["label_sha256"],
+            "primary_top_reference_normalized": primary_top_reference.tolist(),
+            "above_collar_assigned_vertex_count": int(np.count_nonzero(
+                full_root_labels[full_above_base_mask] >= 0
+            )),
+            "origin_or_hierarchy_error_count": len(final_topology_errors),
+            "higher_order_primary_contact_status": final_primary_contact_audit["status"],
+            "discrete_child_patch_status": final_surface_patch_audit["status"],
+            "overlong_child_review_count": len(topology_report.overlong_child_details),
+        },
+        "ownership_evidence_ledger": ownership_ledger_metadata,
         "primary_detection_method": _primary_method(config),
         "primary_guidance_file": (
             PRIMARY_GUIDANCE_FILENAME if manual_guidance is not None else None
@@ -1015,6 +1527,14 @@ def _run_pipeline_impl(
                 if "manual_correction" in path.qc_flags
             ],
         }
+    if cloud.geometry_mapping:
+        np.savez_compressed(config.output_dir / "input_geometry_mapping.npz", **cloud.geometry_mapping)
+    np.savez_compressed(
+        config.output_dir / "original_input_geometry.npz",
+        points=cloud.original_points if cloud.original_points is not None else cloud.export_points,
+        triangles=(cloud.original_triangles if cloud.original_triangles is not None else
+                   cloud.triangles if cloud.triangles is not None else np.empty((0, 3), dtype=np.int64)),
+    )
     export_results(
         config.output_dir,
         cloud.points,
@@ -1029,6 +1549,7 @@ def _run_pipeline_impl(
         triangles=cloud.triangles,
         full_root_labels=full_root_labels,
         topology_report=topology_report,
+        nodules=nodules,
     )
     checkpoint("export", "Finalizing metadata", 0.98)
     timings["total"] = float(time.perf_counter() - pipeline_started)
@@ -1096,6 +1617,11 @@ def _trace_lateral_orders(
     analysis_to_mesh: np.ndarray | None = None,
     attachment_report: dict[str, object] | None = None,
     attachment_bounds: AttachmentBounds = AttachmentBounds(),
+    point_tree: cKDTree | None = None,
+    segment_index_cache: _ExposedSegmentIndexCache | None = None,
+    evidence_ledger: ProvisionalTraceEvidenceLedger | None = None,
+    mesh_context: MeshGeometryContext | None = None,
+    progress_callback: Callable[[str, float], None] | None = None,
 ) -> tuple[list[RootPath], int, int, dict[int, int]]:
     """Trace lateral roots iteratively from parent skeletons.
 
@@ -1153,7 +1679,12 @@ def _trace_lateral_orders(
     occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded
     parent_paths: list[tuple[str, np.ndarray]] = [("primary", primary_path)]
     labels = np.zeros(len(points), dtype=int)
-    extension_tree = cKDTree(points)
+    if point_tree is not None and (
+        point_tree.n != len(points)
+        or not np.array_equal(point_tree.data, points)
+    ):
+        raise ValueError("point_tree must index the same ordered analysis points")
+    extension_tree = point_tree if point_tree is not None else cKDTree(points)
     primary_tree = cKDTree(primary_path)
     parent_tree_cache: dict[str, cKDTree] = {"primary": primary_tree}
     total_starts = 0
@@ -1182,6 +1713,12 @@ def _trace_lateral_orders(
     )
 
     for order in range(1, max(1, int(max_root_order)) + 1):
+        def tracing_progress(parent_index=0, fraction=0.0):
+            if progress_callback is not None:
+                position = (parent_index + 0.9 * fraction) / max(1, len(parent_paths))
+                progress_callback(f"Tracing order-{order} lateral roots",
+                                  (order - 1 + position) / max(1, max_root_order))
+        tracing_progress()
         if cooperate is not None:
             cooperate()
         if max_paths is not None and len(selected_all) >= max_paths:
@@ -1217,7 +1754,8 @@ def _trace_lateral_orders(
         per_order_origin = origin_constraint["per_order"]
         assert isinstance(per_order_origin, list)
         per_order_origin.append(order_origin_row)
-        for parent_id, parent_path in parent_paths:
+        for parent_index, (parent_id, parent_path) in enumerate(parent_paths):
+            tracing_progress(parent_index)
             if cooperate is not None:
                 cooperate()
             closest_fraction = 0.03 if order == 1 else 0.01
@@ -1329,6 +1867,8 @@ def _trace_lateral_orders(
                 cooperate=cooperate,
                 point_tree=extension_tree,
                 parent_tree=parent_tree,
+                progress_callback=lambda completed, total: tracing_progress(
+                    parent_index, completed / max(1, total)),
             )
             order_candidate_count += len(candidates)
             evaluated_groups: dict[int | str, list[tuple[RootPath, bool]]] = {}
@@ -1435,6 +1975,11 @@ def _trace_lateral_orders(
                 connectors,
                 d_bar=d_bar,
             )
+            # The merge prepends geometry to an established parent. Any tree
+            # or radius profile keyed only by its ID now describes stale path
+            # coordinates and cannot guide child backtracing or later orders.
+            parent_tree_cache.pop(parent_id, None)
+            parent_radius_cache.pop(parent_id, None)
             order_parent_tracking_rejections += len(connectors)
         selected = ordinary_selected
         sequence_base = len(selected_all)
@@ -1445,12 +1990,16 @@ def _trace_lateral_orders(
             )
         refined: list[RootPath] = []
         for path in selected:
-            path.parent_points = (
-                path.parent_points
-                if path.parent_points is not None
-                else primary_path
-            )
             path.parent_id = path.parent_id or "primary"
+            parent = selected_parent_by_id.get(str(path.parent_id))
+            path.parent_points = (
+                parent.points if parent is not None else
+                path.parent_points if path.parent_points is not None else
+                primary_path
+            )
+            if str(path.parent_id) not in parent_tree_cache:
+                if parent is not None:
+                    parent_tree_cache[str(path.parent_id)] = cKDTree(parent.points)
             traced_paths = backtrace_to_primary(
                 [path],
                 path.parent_points,
@@ -1491,13 +2040,23 @@ def _trace_lateral_orders(
         refined = eligible_refined
         if not refined:
             break
-        provisional_labels = _assign_lateral_points(
+        provisional_labels, provisional_competitors = _assign_lateral_points(
             points,
             selected_all + refined,
             primary_mask,
             d_bar,
             excluded_mask=excluded,
+            segment_index_cache=segment_index_cache,
+            return_competing_labels=True,
         )
+        if evidence_ledger is not None:
+            evidence_ledger.capture(
+                _analysis_root_labels(primary_mask, provisional_labels),
+                selected_all + refined,
+                stage="before_tip_continuation", root_order=order,
+                d_bar=d_bar, competitor_labels=provisional_competitors,
+                primary_path=primary_path,
+            )
         continuation_blocked = (
             np.asarray(primary_mask, dtype=bool)
             | excluded
@@ -1576,31 +2135,45 @@ def _trace_lateral_orders(
         for path in refined:
             parent_tree_cache[str(path.root_id)] = cKDTree(path.points)
         order_counts[order] = sum(int(path.order) == order for path in selected_all)
-        labels = _assign_lateral_points(
+        labels, order_competitors = _assign_lateral_points(
             points,
             selected_all,
             primary_mask,
             d_bar,
             excluded_mask=excluded,
+            segment_index_cache=segment_index_cache,
+            return_competing_labels=True,
         )
+        released_interfaces: dict[int, tuple[int, ...]] = {}
+        released_reasons: dict[int, str] = {}
+        released_origins: dict[int, int] = {}
+        supported_commits: list[dict] = []
+        native_reconciliation: dict | None = None
+        native_evidence: dict[str, np.ndarray] | None = None
         if mesh_points is not None and mesh_triangles is not None and len(mesh_triangles):
             frozen_mesh_labels = _assign_full_root_labels(
                 mesh_points, primary_path, selected_all, d_bar=d_bar,
                 excluded_mask=mesh_excluded_mask,
+                segment_index_cache=segment_index_cache,
             )
             assessment = assess_attachment_footprints(
                 mesh_points, frozen_mesh_labels, primary_path, selected_all,
                 triangles=mesh_triangles, d_bar=d_bar,
                 excluded_mask=mesh_excluded_mask,
                 bounds=attachment_bounds,
+                mesh_context=mesh_context,
             )
             restricted_mesh_labels, restriction = restrict_rejected_contacts(
                 frozen_mesh_labels, assessment, selected_all, mesh_points,
                 triangles=mesh_triangles, d_bar=d_bar,
+                mesh_context=mesh_context,
             )
-            # Release only matching sampled proximal interface labels.  The
-            # mesh-native guard preserves every retained child component;
-            # starts at the rejected junction itself are deferred above.
+            # Reconsider only matching sampled proximal interfaces. The
+            # restriction first preserves every retained child component and
+            # descendant contact; a released region may then pass to a lateral
+            # parent or same-parent/order peer only through an independent
+            # native connection and exposed-body geometry check. Starts at a
+            # rejected junction itself are deferred above.
             interface_analysis = 0
             mapping = None
             if analysis_to_mesh is not None:
@@ -1608,18 +2181,68 @@ def _trace_lateral_orders(
             elif len(points) == len(mesh_points) and np.array_equal(points, mesh_points):
                 mapping = np.arange(len(points), dtype=int)
             if mapping is not None:
-                if len(mapping) == len(points) and np.all((mapping >= 0) & (mapping < len(mesh_points))):
-                    affected = (frozen_mesh_labels[mapping] > 0) & (restricted_mesh_labels[mapping] == -2)
-                    affected &= labels == frozen_mesh_labels[mapping]
-                    interface_analysis = int(affected.sum())
-                    labels[affected] = -2
+                if len(mapping) != len(points) or np.any((mapping < 0) | (mapping >= len(mesh_points))):
+                    raise ValueError("analysis-to-mesh mapping must cover ordered analysis vertices")
+                if int(restriction["changed_vertex_count"]):
+                    (
+                        labels, released_interfaces, released_reasons,
+                        released_origins, supported_commits, native_reconciliation,
+                        native_evidence,
+                    ) = reconcile_provisional_attachment_interfaces(
+                        points, labels, mapping,
+                        mesh_points, frozen_mesh_labels, restricted_mesh_labels,
+                        primary_path, selected_all,
+                        triangles=mesh_triangles, d_bar=d_bar,
+                        analysis_excluded_mask=excluded,
+                        mesh_excluded_mask=_coerce_exclusion_mask(
+                            mesh_excluded_mask, len(mesh_points)
+                        ),
+                        generation=(evidence_ledger.generation if evidence_ledger is not None
+                                    else 2 * int(order) - 1),
+                        mesh_context=mesh_context,
+                    )
+                    interface_analysis = int(native_reconciliation[
+                        "mapped_released_analysis_vertex_count"])
+            elif int(restriction["changed_vertex_count"]):
+                labels, native_reconciliation, native_evidence = (
+                    _unmapped_native_attachment_evidence(
+                        labels, frozen_mesh_labels, restricted_mesh_labels,
+                        mesh_excluded_mask,
+                        generation=(evidence_ledger.generation if evidence_ledger is not None
+                                    else 2 * int(order) - 1),
+                    )
+                )
+                if (native_reconciliation["changed_mesh_vertex_count"] !=
+                        int(restriction["changed_vertex_count"])):
+                    raise ValueError("native restriction count differs from released vertices")
             if attachment_report is not None:
                 per_order = attachment_report.setdefault("per_order", [])
                 assert isinstance(per_order, list)
                 per_order.append({"root_order": int(order), "assessment": assessment,
                                   "contact_restriction": restriction,
+                                  "provisional_ownership_reconciliation": native_reconciliation,
                                   "proximal_interface_analysis_vertex_count": interface_analysis,
                                   "deferred_rejected_footprint_start_count": blocked_attachment_starts})
+        if evidence_ledger is not None:
+            evidence_ledger.capture(
+                _analysis_root_labels(primary_mask, labels), selected_all,
+                stage="after_order_assignment_and_attachment", root_order=order,
+                d_bar=d_bar, competitor_labels=order_competitors,
+                released_interfaces=released_interfaces,
+                released_interface_reasons=released_reasons,
+                released_interface_origins=released_origins,
+                supported_commits=supported_commits,
+                native_evidence=native_evidence,
+                native_reconciliation=(None if native_reconciliation is None else {
+                    key: native_reconciliation[key] for key in (
+                        "policy", "status", "mapping_policy", "changed_mesh_vertex_count",
+                        "mapped_released_analysis_vertex_count",
+                        "mapped_supported_commit_count", "mapped_unresolved_interface_count",
+                        "native_released_vertex_records", "native_frozen_snapshot_sha256",
+                    ) if key in native_reconciliation
+                }),
+                primary_path=primary_path,
+            )
         occupied_mask = np.asarray(primary_mask, dtype=bool) | excluded | (labels > 0)
         parent_paths = [
             (path.root_id, path.points)
@@ -2256,6 +2879,7 @@ def _assign_lateral_points(
     *,
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
+    segment_index_cache: _ExposedSegmentIndexCache | None = None,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     labels = np.zeros(len(points), dtype=int)
     if not paths:
@@ -2264,15 +2888,21 @@ def _assign_lateral_points(
     non_primary = np.flatnonzero(~np.asarray(primary_mask, dtype=bool) & ~excluded)
     if len(non_primary) == 0:
         return (labels, {}) if return_competing_labels else labels
-    exposed = [(idx, np.asarray(path.points, float)[max(0, int(path.body_start_index)):])
-               for idx, path in enumerate(paths, start=1)]
-    exposed = [(idx, body) for idx, body in exposed if len(body)]
+    exposed_with_starts = []
+    for idx, path in enumerate(paths, start=1):
+        start = max(0, int(path.body_start_index))
+        body = np.asarray(path.points, float)[start:]
+        if len(body):
+            exposed_with_starts.append((idx, body, start))
+    exposed = [(idx, body) for idx, body, _ in exposed_with_starts]
     if not exposed:
         return (labels, {}) if return_competing_labels else labels
     radius = max(4.0 * d_bar, 0.006)
     nearest_distance, nearest_labels, competing_distance, second_labels = _nearest_exposed_segments(
         points[non_primary], exposed, d_bar=d_bar, radius=radius,
         margin=max(0.75 * d_bar, 0.001),
+        segment_index_cache=segment_index_cache,
+        body_start_indices=[start for _, _, start in exposed_with_starts],
     )
     assigned = nearest_distance <= radius
     labels[non_primary[assigned]] = nearest_labels[assigned]
@@ -2903,6 +3533,7 @@ def _point_assignment_summary(
     gravity_direction /= max(float(np.linalg.norm(gravity_direction)), 1e-12)
     return {
         "total_vertex_count": int(len(labels)),
+        **({"nodule_vertex_count": int(np.count_nonzero(labels <= -3))} if np.any(labels <= -3) else {}),
         "primary_assigned_vertex_count": int(np.count_nonzero(labels == 0)),
         "lateral_assigned_vertex_count": int(np.count_nonzero(labels > 0)),
         "base_point_source_coordinates": np.asarray(base_point_source, dtype=float),
@@ -2937,16 +3568,191 @@ def _point_assignment_summary(
     }
 
 
+@dataclass(frozen=True)
+class _ExposedSegmentIndex:
+    start: np.ndarray
+    delta: np.ndarray
+    length_squared: np.ndarray
+    segment_labels: np.ndarray
+    half_length: float
+    tree: cKDTree
+
+
+class _ExposedSegmentIndexCache:
+    """Bounded reuse of the path-only midpoint index across assignments.
+
+    The key contains the exact float64 bytes of each exposed path, its label and
+    body start, in order. A changed path or label therefore cannot reuse an old
+    tree. Exact query evidence additionally includes the ordered query geometry
+    and search radius; masks and assignment policies are applied afterwards.
+    """
+
+    def __init__(self, max_entries: int = 4, max_query_bytes: int = 32 * 1024**2,
+                 max_subdivision_bytes: int = 16 * 1024**2) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        self.max_entries = int(max_entries)
+        self._entries: dict[tuple[object, ...], _ExposedSegmentIndex | None] = {}
+        self._recent: list[tuple[object, ...]] = []
+        self.max_query_bytes = max(0, int(max_query_bytes))
+        self._queries: OrderedDict[tuple, tuple[np.ndarray, ...]] = OrderedDict()
+        self._query_bytes = 0
+        self.max_subdivision_bytes = max(0, int(max_subdivision_bytes))
+        self._subdivisions: OrderedDict[tuple, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+        self._subdivision_bytes = 0
+
+    def get_or_build(
+        self,
+        paths: list[tuple[int, np.ndarray]],
+        d_bar: float,
+        body_start_indices: list[int] | tuple[int, ...] | None = None,
+    ) -> _ExposedSegmentIndex | None:
+        if body_start_indices is None:
+            body_start_indices = [0] * len(paths)
+        if len(body_start_indices) != len(paths):
+            raise ValueError("body_start_indices must match paths")
+        path_keys = []
+        for (label, path), body_start in zip(paths, body_start_indices, strict=True):
+            line = np.asarray(path, dtype=float)
+            path_keys.append((
+                int(label),
+                int(body_start),
+                line.shape,
+                hashlib.sha256(np.ascontiguousarray(line).tobytes()).digest(),
+            ))
+        key: tuple[object, ...] = (
+            "subdivided-midpoint-v1", float(d_bar).hex(), tuple(path_keys)
+        )
+        if key in self._entries:
+            self._recent.remove(key)
+            self._recent.append(key)
+            return self._entries[key]
+        subdivisions = []
+        for (_, line), path_key in zip(paths, path_keys, strict=True):
+            # Label identity belongs to the assembled competition index. An
+            # unchanged body's geometry can retain its subdivision even when
+            # a sibling moves or ownership labels are renumbered.
+            piece_key = (key[0], key[1], path_key[1:])
+            if piece_key in self._subdivisions:
+                self._subdivisions.move_to_end(piece_key)
+                pieces = self._subdivisions[piece_key]
+            else:
+                pieces = _subdivide_exposed_path(line, d_bar)
+                size = sum(array.nbytes for array in pieces)
+                if size <= self.max_subdivision_bytes:
+                    while self._subdivisions and (
+                        self._subdivision_bytes + size > self.max_subdivision_bytes
+                        or len(self._subdivisions) >= 512
+                    ):
+                        _, removed = self._subdivisions.popitem(last=False)
+                        self._subdivision_bytes -= sum(array.nbytes for array in removed)
+                    self._subdivisions[piece_key] = pieces
+                    self._subdivision_bytes += size
+            subdivisions.append(pieces)
+        index = _build_exposed_segment_index(paths, d_bar, subdivisions=subdivisions)
+        self._entries[key] = index
+        self._recent.append(key)
+        if len(self._recent) > self.max_entries:
+            evicted = self._entries.pop(self._recent.pop(0))
+            # Do not leave query entries attached to an evicted/recycled id.
+            for query_key in list(self._queries):
+                if query_key[0] == id(evicted):
+                    self._query_bytes -= sum(array.nbytes for array in self._queries.pop(query_key))
+        return index
+
+    def query_key(self, index: _ExposedSegmentIndex, points: np.ndarray, radius: float) -> tuple:
+        return (id(index), points.shape,
+                hashlib.sha256(np.ascontiguousarray(points).tobytes()).digest(),
+                float(radius).hex())
+
+    def query_result(self, key: tuple) -> tuple[np.ndarray, ...] | None:
+        result = self._queries.get(key)
+        if result is not None:
+            self._queries.move_to_end(key)
+            return tuple(array.copy() for array in result)
+        return None
+
+    def store_query(self, key: tuple, result: tuple[np.ndarray, ...]) -> None:
+        size = sum(array.nbytes for array in result)
+        if size > self.max_query_bytes:
+            return
+        if key in self._queries:
+            self._query_bytes -= sum(array.nbytes for array in self._queries.pop(key))
+        while self._queries and self._query_bytes + size > self.max_query_bytes:
+            _, removed = self._queries.popitem(last=False)
+            self._query_bytes -= sum(array.nbytes for array in removed)
+        snapshot = tuple(array.copy() for array in result)
+        for array in snapshot:
+            array.setflags(write=False)
+        self._queries[key] = snapshot
+        self._query_bytes += size
+
+
+def _subdivide_exposed_path(path: np.ndarray, d_bar: float) -> tuple[np.ndarray, np.ndarray]:
+    """Use the original piece boundaries, without changing path geometry."""
+    max_piece = max(2.0 * d_bar, 0.001)
+    starts: list[np.ndarray] = []
+    ends: list[np.ndarray] = []
+    line = np.asarray(path, float)
+    if len(line) == 1:
+        starts.append(line[0])
+        ends.append(line[0])
+    elif len(line) > 1:
+        for begin, end in zip(line[:-1], line[1:]):
+            pieces = max(1, int(np.ceil(np.linalg.norm(end - begin) / max_piece)))
+            fraction = np.arange(pieces + 1, dtype=float) / pieces
+            bounds = begin + fraction[:, None] * (end - begin)
+            starts.extend(bounds[:-1])
+            ends.extend(bounds[1:])
+    start = np.asarray(starts, float).reshape(-1, 3)
+    end = np.asarray(ends, float).reshape(-1, 3)
+    start.setflags(write=False)
+    end.setflags(write=False)
+    return start, end
+
+
+def _build_exposed_segment_index(
+    paths: list[tuple[int, np.ndarray]], d_bar: float,
+    subdivisions: list[tuple[np.ndarray, np.ndarray]] | None = None,
+) -> _ExposedSegmentIndex | None:
+    """Assemble the midpoint tree using exact, optionally cached pieces."""
+    if subdivisions is None:
+        subdivisions = [_subdivide_exposed_path(path, d_bar) for _, path in paths]
+    starts, ends, labels = [], [], []
+    for (label, _), (start, end) in zip(paths, subdivisions, strict=True):
+        if not len(start):
+            continue
+        starts.append(start)
+        ends.append(end)
+        labels.append(np.full(len(start), label, dtype=int))
+    if not starts:
+        return None
+    start = np.concatenate(starts)
+    end = np.concatenate(ends)
+    segment_labels = np.concatenate(labels)
+    delta = end - start
+    length_squared = np.einsum("ij,ij->i", delta, delta)
+    half_length = float(np.sqrt(length_squared.max())) / 2.0
+    tree = cKDTree((start + end) / 2.0)
+    for array in (start, delta, length_squared, segment_labels, tree.data):
+        array.setflags(write=False)
+    return _ExposedSegmentIndex(
+        start, delta, length_squared, segment_labels, half_length, tree
+    )
+
+
 def _nearest_exposed_segments(
     points: np.ndarray, paths: list[tuple[int, np.ndarray]], *,
     d_bar: float, radius: float, margin: float,
+    segment_index_cache: _ExposedSegmentIndexCache | None = None,
+    body_start_indices: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Find the closest two distinct roots by exact eligible-segment distance.
 
-    Subdivide only for spatial indexing. Every indexed piece remains on an
-    existing centerline segment. A midpoint can be at most half a piece length
-    farther from a point than that piece, so the search radius includes that
-    bound and cannot omit an owner or competitor inside the ambiguity margin.
+    A midpoint can be at most half a subdivided piece length farther from a
+    point than that piece, so the search radius includes that bound. Only the
+    geometry index and exact query evidence can be reused only for unchanged
+    geometry and eligible segment sets. Assignment masks remain independent.
     """
     query = np.asarray(points, float)
     nearest = np.full(len(query), np.inf)
@@ -2955,36 +3761,26 @@ def _nearest_exposed_segments(
     competitor = np.full(len(query), -1, int)
     if not len(query) or not paths:
         return nearest, owner, competitor_distance, competitor
-    max_piece = max(2.0 * d_bar, 0.001)
-    starts: list[np.ndarray] = []
-    ends: list[np.ndarray] = []
-    labels: list[int] = []
-    for label, path in paths:
-        line = np.asarray(path, float)
-        if not len(line):
-            continue
-        if len(line) == 1:
-            starts.append(line[0])
-            ends.append(line[0])
-            labels.append(label)
-            continue
-        for begin, end in zip(line[:-1], line[1:]):
-            pieces = max(1, int(np.ceil(np.linalg.norm(end - begin) / max_piece)))
-            fraction = np.arange(pieces + 1, dtype=float) / pieces
-            bounds = begin + fraction[:, None] * (end - begin)
-            starts.extend(bounds[:-1])
-            ends.extend(bounds[1:])
-            labels.extend([label] * pieces)
-    if not starts:
+    index = (
+        segment_index_cache.get_or_build(paths, d_bar, body_start_indices)
+        if segment_index_cache is not None
+        else _build_exposed_segment_index(paths, d_bar)
+    )
+    if index is None:
         return nearest, owner, competitor_distance, competitor
-    start = np.asarray(starts)
-    end = np.asarray(ends)
-    segment_labels = np.asarray(labels, int)
-    delta = end - start
-    length_squared = np.einsum("ij,ij->i", delta, delta)
-    half_length = float(np.sqrt(length_squared.max())) / 2.0
-    tree = cKDTree((start + end) / 2.0)
+    start = index.start
+    delta = index.delta
+    length_squared = index.length_squared
+    segment_labels = index.segment_labels
+    tree = index.tree
+    half_length = index.half_length
     search_radius = radius + margin + half_length + 1e-12
+    query_key = None
+    if segment_index_cache is not None and segment_index_cache.max_query_bytes:
+        query_key = segment_index_cache.query_key(index, query, search_radius)
+        cached = segment_index_cache.query_result(query_key)
+        if cached is not None:
+            return cached
     for offset in range(0, len(query), 2_048):
         chunk = query[offset:offset + 2_048]
         nearby = tree.query_ball_point(chunk, search_radius, workers=worker_threads())
@@ -3012,7 +3808,10 @@ def _nearest_exposed_segments(
             other_first = np.r_[True, other_point[1:] != other_point[:-1]]
             competitor_distance[offset + other_point[other_first]] = ordered_distance[different][other_first]
             competitor[offset + other_point[other_first]] = ordered_label[different][other_first]
-    return nearest, owner, competitor_distance, competitor
+    result = (nearest, owner, competitor_distance, competitor)
+    if query_key is not None:
+        segment_index_cache.store_query(query_key, result)
+    return result
 
 
 def _assign_full_root_labels(
@@ -3023,16 +3822,23 @@ def _assign_full_root_labels(
     d_bar: float,
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
+    segment_index_cache: _ExposedSegmentIndexCache | None = None,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
-    exposed = [(0, np.asarray(primary_path, dtype=float))]
-    exposed.extend((label, np.asarray(path.points, dtype=float)[max(0, int(path.body_start_index)):])
-                   for label, path in enumerate(lateral_paths, start=1))
-    exposed = [(label, body) for label, body in exposed if len(body)]
+    exposed_with_starts = [(0, np.asarray(primary_path, dtype=float), 0)]
+    for label, path in enumerate(lateral_paths, start=1):
+        start = max(0, int(path.body_start_index))
+        body = np.asarray(path.points, dtype=float)[start:]
+        if len(body):
+            exposed_with_starts.append((label, body, start))
+    exposed_with_starts = [row for row in exposed_with_starts if len(row[1])]
+    exposed = [(label, body) for label, body, _ in exposed_with_starts]
     labels = np.full(len(points), -1, dtype=int)
     radius = max(5.0 * d_bar, 0.008)
     nearest_distance, nearest, competitor_distance, second = _nearest_exposed_segments(
         points, exposed, d_bar=d_bar, radius=radius,
         margin=max(0.75 * d_bar, 0.001),
+        segment_index_cache=segment_index_cache,
+        body_start_indices=[start for _, _, start in exposed_with_starts],
     )
     excluded = _coerce_exclusion_mask(excluded_mask, len(points))
     assigned = (nearest_distance <= radius) & ~excluded

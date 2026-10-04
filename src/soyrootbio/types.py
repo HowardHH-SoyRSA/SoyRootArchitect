@@ -29,12 +29,14 @@ class Normalization:
 
 @dataclass
 class PointCloudData:
-    """Geometry used for analysis plus an optional full-resolution mesh.
+    """Analysis geometry, full-resolution usable geometry, and original arrays.
 
     ``points`` is the analysis cloud.  When adaptive point reduction is used,
-    ``full_points`` and ``triangles`` preserve the source mesh for labelled
-    exports and final surface measurements.  ``analysis_indices`` maps analysis
-    points back to vertices in ``full_points`` when they are a vertex subset.
+    ``full_points`` and ``triangles`` preserve finite source geometry for labelled
+    exports and final surface measurements. ``analysis_indices`` maps analysis
+    points to ``full_points``. ``original_points``/``original_triangles`` retain
+    the decoded source arrays before non-finite coordinate exclusion or STL
+    indexing. ``geometry_mapping`` makes supported STL seam indexing reversible.
     """
 
     points: np.ndarray
@@ -44,6 +46,10 @@ class PointCloudData:
     triangles: np.ndarray | None = None
     analysis_indices: np.ndarray | None = None
     source_metadata: dict[str, Any] = field(default_factory=dict)
+    original_points: np.ndarray | None = None
+    original_triangles: np.ndarray | None = None
+    # STL provenance: source/full/analysis indices, including unresolved seams.
+    geometry_mapping: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def export_points(self) -> np.ndarray:
@@ -131,7 +137,12 @@ class TopologyReport:
     fork_resurvey_iterations: int = 0
     fork_resurvey_cycle_states: int = 0
     fork_resurvey_decisions: list[dict[str, Any]] = field(default_factory=list)
+    terminal_continuation_joins: int = 0
+    terminal_continuation_decisions: list[dict[str, Any]] = field(default_factory=list)
+    displaced_tip_continuation_decisions: list[dict[str, Any]] = field(default_factory=list)
     unresolved_long_arm_details: list[dict[str, Any]] = field(default_factory=list)
+    overlong_children_warned: int = 0
+    # Legacy output fields remain zero: length alone never removes roots.
     overlong_children_removed: int = 0
     overlong_descendants_removed: int = 0
     overlong_child_details: list[dict[str, Any]] = field(default_factory=list)

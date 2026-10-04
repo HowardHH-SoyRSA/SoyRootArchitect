@@ -161,7 +161,7 @@ def test_polyline_vertex_count_edit_is_accepted_and_invalidates_automatic_confid
     assert "junction_branch_separation" not in edited.score_components
 
 
-def test_correction_rejects_child_longer_than_its_parent(tmp_path: Path) -> None:
+def test_correction_accepts_child_longer_than_its_parent_with_warning(tmp_path: Path) -> None:
     primary, roots = _hierarchy()
     correction = _write_payload(
         tmp_path / "overlong-child.json",
@@ -180,12 +180,12 @@ def test_correction_rejects_child_longer_than_its_parent(tmp_path: Path) -> None
         },
     )
 
-    with pytest.raises(ValueError, match="exceeds parent"):
-        apply_hierarchy_corrections(
-            primary,
-            copy.deepcopy(roots),
-            correction,
-        )
+    corrected = apply_hierarchy_corrections(primary, copy.deepcopy(roots), correction)
+    assert len(corrected) == len(roots)
+    child = next(root for root in corrected if root.root_id == "root-o2-004")
+    assert child.parent_id == "root-o1-007"
+    assert "child_longer_than_parent" in child.qc_flags
+    np.testing.assert_allclose(child.points[-1], [0.2, 0.8, 0.75])
 
 
 def test_correction_rejects_origin_above_primary_top_at_any_order(

@@ -9,13 +9,36 @@ The project prioritizes the measurement objectives in this repository over exact
 - Reads STL and PLY meshes while preserving their vertices and faces. OBJ meshes and XYZ/CSV point clouds are also supported.
 - Uses a ranked automatic primary-root detector by default, with manual endpoints, a soil-line constraint, and optional guide sections as overrides.
 - Represents the primary as order 0, its children as order 1, and recursively assigns every descendant `parent order + 1`.
-- Enforces non-increasing centreline length during topology repair: an automatic child longer than its parent is removed with its dependent subtree, and equivalent manual edits are rejected atomically. Any newly measured violation after final-support fitting is flagged for review without deleting final assigned support.
+- A child longer than its parent receives a QC warning and triggers junction re-examination. Both continuations are compared using direction (55%), fork evidence (35%), and sustained continuation length (10%), with a slight overlength penalty `0.05 * max(0, 1 - parent_length / child_length)`, capped at 0.05 across the affected hierarchy edges. A swap requires an independent improvement in direction or fork evidence as well as a better penalized score. Length alone never removes a child or its descendants or rejects an otherwise valid manual edit; ambiguous branches and any excess measured after final fitting remain available with explicit QC.
 - Produces an oriented centreline tree, stable root IDs, insertion locations, confidence values, and QC flags.
 - Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
 - Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
 - Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and reusable primary guidance, elapsed run time/progress, hardware-aware concurrency, pause/resume, and cancellation.
 - Provides a local, GPU-accelerated 3D result viewer and graph editor with per-root inspection, nine topology/geometry tools, durable undo/redo, and non-destructive materialisation.
-- Keeps the full mesh by default. Automatic analysis reduction is allowed only when the runtime/memory preflight crosses the configured limit; the default runtime limit is 30 minutes.
+- Preserves original geometry separately and applies the same analysis cap/runtime preflight to every input format; the default runtime threshold is 30 minutes.
+
+## Input representation and evidence
+
+Choose `--input-mode` in the CLI or **Input mode** in the batch GUI:
+
+| Mode | Required representation | Available evidence |
+| --- | --- | --- |
+| `triangle_mesh` | Supplied vertices and native triangle faces | Native mesh contact, attachment footprints, and connected surface patches. This is the preferred mode when native faces are available. Open/nonmanifold meshes can still leave checks unresolved. |
+| `surface_points` | Points sampling a root's outer surface | Bounded mutual-neighbor, local PCA tangent-plane, proximity-contact and inferred-component diagnostics. Native contact/patch compliance stays `unresolved_no_mesh`. |
+| `occupied_volume` | Points distributed through occupied root volume | Bounded point neighborhoods and local PCA axial evidence. Native contact/patch compliance stays unresolved; the existing surface radius/frustum estimator is flagged as uncalibrated for this representation. |
+| `auto` (default) | Either representation | Uses `triangle_mesh` when supplied faces exist; otherwise assumes `surface_points` and records that assumption. Filled-volume data must be declared explicitly. |
+
+Representation is independent of filename: a PLY can contain a native mesh or only vertices. Selecting `triangle_mesh` for a point-only file fails clearly. Selecting a point-only mode for a file with faces also fails, preserving the stronger native evidence. No reconstruction, synthetic faces, surface bridges, or ownership repair is performed to obtain a passing status.
+
+Point-only evidence is exported under `point_only_evidence` in `metadata.json`. It uses local nearest-distinct-point spacing at both endpoints, mutual k-neighbors, same-owner PCA frames, and excluded/negative-label barriers. It reports proximity separately from tangent compatibility, frame availability, and inferred multi-point components. These are diagnostic candidates, not proof of biological contact or detached surface patches. No observed contact does not certify compliance. The reproducible synthetic benchmark is `scripts/benchmark_point_evidence.py`; its fixtures and limitations are documented in [the benchmark report](docs/benchmarks/point_evidence/README.md).
+
+`--sample-points N` has one meaning for CSV/XYZ/TXT/PTS, vertex-only PLY/PCD and mesh formats: use at most **N finite source vertices** for analysis. N must be at least 10 (the pipeline needs at least 20). Sampling retains coordinate extrema and uses a seeded, sorted subset without replacement; it never creates new points or changes faces. An explicit cap takes precedence over the automatic retained-fraction floor. `0` or omission runs the same runtime/memory preflight for every format and retains all finite points unless reduction is indicated. The runtime estimate is a mesh-calibrated heuristic, not a guaranteed deadline for point-only inputs.
+
+`full_points` and native `triangles` remain available for full-resolution ownership and export; reduction affects only the analysis subset and `analysis_indices` maps it to the full array. Finite source order, duplicate coordinates, unused vertices and supplied faces are preserved, with the explicit STL indexing exception below. Invalid coordinates and incident faces are excluded from usable geometry with counts in source metadata. `original_input_geometry.npz` stores the original decoded coordinate/face arrays before those operations, including invalid coordinates; the source file remains untouched. This archive preserves geometry arrays, not every format-specific attribute such as colours or normals.
+
+STL facet records often repeat each geometric position about six times. STL analysis now counts each exact finite position once, so duplicated facet vertices cannot inflate density or collapse point spacing. Full-resolution STL indexing merges only exact-coordinate seams supported by a single closed, consistently oriented manifold fan. Open boundaries, touching separate fans, overlapping facets and nonmanifold/degenerate seams remain separate with `stl_connectivity_unresolved` QC. No tolerance welding, new faces, decimation or surface bridges are used. `input_geometry_mapping.npz` stores `original_to_full` (-1 for excluded invalid vertices), `full_to_original`, `original_face_to_full` (-1 for excluded faces), `analysis_to_full`, and `unresolved_full_vertex_indices`. `source_geometry.stl_indexing` and `final_compliance_audit` record unresolved connectivity. The analysis cap and retained-fraction floor operate on distinct positions for STL; the original decoded arrays remain available unchanged.
+
+Initial lateral candidate growth and subsequent tip extension each have a **300-step budget**. Support, turning, ownership and topology conditions can stop a trace earlier. Tip extension is a separate phase, so 300 is not a cap on total final root nodes or a physical root-length limit. Both limits are recorded in `lateral_tracing_policy` metadata.
 
 ## Installation
 
@@ -76,7 +99,9 @@ Runs with manual endpoints automatically save `primary_guidance.json` in the out
 
 If a sample fails, its output directory contains `processing_error.log` with the failure time, input/output paths, exception, traceback, and non-sensitive pipeline configuration. Cancelled jobs are not reported as processing failures. GUI batch clustering avoids nested HDBSCAN worker pools, so sample-level concurrency remains within the scheduler's resource allocation.
 
-The displayed memory summary distinguishes currently available RAM from installed RAM, and automatic concurrency is budgeted against the available value with a reserve for the desktop. Manual concurrency/thread overrides are honored and can intentionally oversubscribe the machine. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
+The displayed memory summary distinguishes currently available RAM from installed RAM. Automatic concurrency uses geometry-sized memory estimates. Before spawning each sample, the batch also checks live physical RAM and Windows commit headroom, reserves future growth of admitted samples, and keeps a 2 GiB desktop reserve. Estimates include geometry, native audits and candidate storage, and are updated from decoded counts and observed worker memory; they are planning heuristics, not guaranteed bounds. Manual concurrency is an upper limit, subject to the same memory admission checks. Jobs waiting for capacity remain queued and can be paused or cancelled. A sample whose estimate exceeds total capacity fails clearly before launch instead of silently reducing scientific evidence. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
+
+Automatic batch thread allocation uses at most two worker threads per sample, so reducing concurrency for RAM does not multiply transient spatial-query threads. Explicit thread counts remain available. Lateral tracing reports progress within each root order. Batch workers write `processing_resources.json` with decoded geometry counts, estimated and peak private memory, peak working set, system commit observations and shutdown diagnostics. A received worker exception and traceback take precedence over a later cleanup timeout; both are retained in failure diagnostics. Resource logs are diagnostic and do not certify biological compliance.
 
 Each active batch sample runs in its own spawned Python process, so independent analyses can use separate CPU cores. The GUI supervises these processes and receives progress and compact result summaries; geometry arrays stay in the sample process. Each process exits after its sample to release memory. The existing concurrency/RAM allocation and manual overrides still apply. Worker threads per sample controls supported spatial searches and caps supported native numerical thread pools within that process.
 
@@ -136,7 +161,7 @@ The editor deliberately binds only to `localhost`/loopback addresses. Its mutati
 
 ## Command-line use
 
-The scored automatic detector and full-mesh analysis are the defaults:
+The scored automatic detector and automatic input-mode detection are the defaults:
 
 ```powershell
 soyrootbio run `
@@ -179,7 +204,7 @@ soyrootbio run `
   --correction-file "D:\results\sample\root_hierarchy.json"
 ```
 
-In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, a child centreline longer than its parent, or inconsistent topology are rejected. Root order is recalculated from the corrected parent links.
+In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, or inconsistent topology are rejected. An overlong child is retained with a QC warning for junction review. Root order is recalculated from the corrected parent links.
 
 The primary row is immutable in a correction file; change the primary with endpoints, soil line, or guide sections instead. Lateral root IDs are treated as immutable provenance keys while corrections are applied: deleting a root does not renumber the survivors or reuse the deleted ID. Unknown/stale IDs, duplicate IDs, and stale geometry fingerprints are rejected. If a lateral's parent or polyline is actually changed, its automatic attachment confidence is set to `0` and the QC flags `manual_correction`, `attachment_confidence_invalidated`, and `low_confidence` are added pending review.
 
@@ -356,7 +381,7 @@ Each lateral records `body_start_index` and `centerline_assessment` in the hiera
 
 ## Resolution, runtime, and reduction policy
 
-Mesh loading uses the original mesh vertices rather than unconditional uniform resampling. With `--sample-points 0` (the default), all vertices are analysed unless a pilot calculation projects that full analysis will exceed the configured runtime or available-memory policy. If automatic reduction is required, the retained fraction cannot fall below `--minimum-retained-fraction` (25% by default). An explicit positive `--sample-points` value is a user-requested cap and can reduce earlier.
+Every supported input format uses source vertices rather than unconditional resampling. With `--sample-points 0` (the default), all finite vertices are analysed unless the shared pilot projects that full analysis will exceed the configured runtime or available-memory policy. If automatic reduction is required, the retained fraction cannot fall below `--minimum-retained-fraction` (25% by default). An explicit positive `--sample-points` value is a user-requested cap and can reduce earlier. Native faces remain at full resolution, and the original decoded geometry is stored in `original_input_geometry.npz`.
 
 Even when the analysis vertices are reduced, the original full vertices/faces are preserved for geometric audit and export, and labels are mapped back to them. Always inspect these metadata fields before comparing samples:
 
@@ -377,6 +402,8 @@ A final full-resolution suite ran all six PLY samples without reduction or a lat
 The automated suite covers synthetic end-to-end export, above-base assignment exclusion, directional angles, primary candidate ranking, higher-order junction ground truth, hierarchy invariants and corrections, editor history/replay and source immutability, RSML nesting, XLSX/CSV contracts, labelled PLY properties, 600-dpi figures, metadata, scheduling, and hardware allocation. A production-path smoke test also completed two real samples concurrently through `BatchScheduler` with four threads per sample and verified both complete export bundles. Measurement-quality validation still requires expert annotation or manual measurements for each genotype, age, scan protocol, and reconstruction workflow.
 
 ## Known limitations
+
+Optional **Nodule-aware analysis** is available in the batch GUI and with `--nodule-aware`; it defaults to **off**. Accepted nodule-like bulges use pale yellow-white `#FFF4B3`, are excluded from root counts and traits, and have separate size and spatial-distribution exports plus undoable review in the bundled editor. See [Nodule-aware analysis](docs/nodule-aware-analysis.md) for operation, output formats and measurement limits.
 
 - Inputs should contain reconstructed root tissue only. Soil, pot, shoot, labels, and reconstruction artefacts can be mistaken for roots.
 - Root touching/merging and gaps can create ambiguous topology; use confidence/QC and the editable hierarchy.

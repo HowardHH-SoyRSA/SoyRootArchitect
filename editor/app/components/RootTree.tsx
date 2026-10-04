@@ -8,6 +8,7 @@ import {
 } from "../lib/rootColors";
 import type { PointPatchRecord, RootRecord } from "../types";
 import { formatMetric } from "./EditorChrome";
+import { useEditorStore } from "../store";
 
 export function RootTree({
   roots,
@@ -25,6 +26,8 @@ export function RootTree({
   onSelectPatch: (patchId: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const showNodules = useEditorStore((s) => s.showNodules);
+  const setShowNodules = useEditorStore((s) => s.setShowNodules);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const normalizedQuery = query.trim().toLowerCase();
   const rows = useMemo(
@@ -140,6 +143,11 @@ export function RootTree({
           })}
         </div>
 
+        {pointPatches.some((p) => p.nodule) ? <>
+          <label className="patch-section-heading"><input type="checkbox" checked={showNodules} onChange={(e) => setShowNodules(e.target.checked)} /> Show nodules</label>
+          <PatchSection title="Accepted nodules" patches={visiblePatches.filter((p) => p.kind === "nodule")} color={rgbToCss(ROOT_EXPORT_COLORS.nodule)} selectedPatchId={selectedPatchId} onSelect={onSelectPatch} />
+          <PatchSection title="Nodule review" patches={visiblePatches.filter((p) => p.kind === "nodule_candidate")} color={rgbToCss(ROOT_EXPORT_COLORS.uncertain)} selectedPatchId={selectedPatchId} onSelect={onSelectPatch} />
+        </> : null}
         <PatchSection
           title="Uncertain patches"
           patches={uncertainPatches}

@@ -241,6 +241,10 @@ export function RootEditor() {
     async (hit: MeshHit) => {
       if (!serverState || busy) return;
       if (tool === "select" || tool === "order") {
+        if (hit.numericLabel <= -3) {
+          const nodule = serverState.point_patches.find((p) => p.numeric_label === hit.numericLabel);
+          if (nodule) { selectPatchAndFocus(nodule.patch_id); return; }
+        }
         setSelectedRootId(hit.rootId);
         return;
       }
@@ -591,7 +595,7 @@ export function RootEditor() {
 
       <section className={`workspace ${leftCollapsed ? "left-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""}`}>
         <aside className="panel tree-panel" aria-label="Root hierarchy">
-          <PanelHeader eyebrow="STRUCTURE" title={`${serverState.root_count} roots · ${serverState.point_patch_count} patches`} side="left" collapsed={leftCollapsed} onCollapse={() => setLeftCollapsed((value) => !value)} />
+          <PanelHeader eyebrow="STRUCTURE" title={`${serverState.root_count} roots${serverState.nodule_count ? ` · ${serverState.nodule_count} nodules` : ""} · ${serverState.point_patch_count - serverState.point_patches.filter((p) => p.nodule).length} patches`} side="left" collapsed={leftCollapsed} onCollapse={() => setLeftCollapsed((value) => !value)} />
           <RootColorLegend collapsed={leftCollapsed} />
           {!leftCollapsed ? (
             <RootTree
@@ -644,6 +648,7 @@ export function RootEditor() {
               busy={busy}
               onBrushRadius={setBrushRadius}
               onApplyOrder={(order) => void applyOrder(order)}
+              onReviewNodule={(id, status) => void runOperation("review_nodule", { nodule_id: id, status }, "Nodule review saved; measurements updated.")}
               onSelect={selectAndFocus}
             />
           ) : null}

@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from .pipeline import PipelineConfig, run_pipeline
+from .io import INPUT_MODES
 from .synthetic import write_synthetic_dataset
 
 
@@ -43,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the full segmentation, skeletonization, and trait pipeline.")
     run.add_argument("--input", required=True, type=Path, help="Root-only point cloud or mesh exported from VG Studio.")
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
+    run.add_argument("--input-mode", choices=INPUT_MODES, default="auto", help="auto prefers native faces, otherwise assumes surface points. Declare occupied_volume explicitly; no mesh is reconstructed.")
+    run.add_argument("--nodule-aware", action="store_true", help="Detect nodule-like mesh bulges and measure them separately; default off.")
+    run.add_argument("--nodule-review-file", type=Path, help="Reviewed nodule decisions exported from the editor; requires --nodule-aware.")
     run.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "Z"), help="Primary-root endpoint in original coordinates.")
     run.add_argument("--end", nargs=3, type=float, metavar=("X", "Y", "Z"), help="Primary-root endpoint in original coordinates.")
     run.add_argument("--endpoint-file", type=Path, help="CSV/JSON/TXT file containing start and end endpoint coordinates.")
@@ -50,12 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--soil-z", type=float, help="Manual horizontal soil-line Z used by the scored collar detector.")
     run.add_argument("--guide-file", type=Path, help="CSV/JSON/TXT XYZ points that the primary centerline must cross.")
     run.add_argument("--correction-file", type=Path, help="Edited root_hierarchy.json from an earlier run.")
-    run.add_argument("--sample-points", type=int, default=0, help="Optional analysis vertex cap; 0 keeps the full mesh unless the 30-minute/memory preflight requires reduction.")
+    run.add_argument("--sample-points", type=int, default=0, help="Maximum finite source vertices used for analysis in every format; original geometry is preserved. 0 enables automatic runtime/memory preflight.")
     run.add_argument("--graph-k", type=int, default=14, help="Neighbor count for the local Dijkstra graph.")
     run.add_argument("--max-laterals", type=int, help="Optional cap on selected lateral roots.")
     run.add_argument("--max-root-order", type=int, default=3, help="Trace laterals recursively up to this root order.")
     run.add_argument("--runtime-limit-minutes", type=float, default=30.0, help="Projected runtime threshold before limited analysis reduction is allowed.")
-    run.add_argument("--minimum-retained-fraction", type=float, default=0.25, help="Smallest automatic fraction of mesh vertices to retain (0-1).")
+    run.add_argument("--minimum-retained-fraction", type=float, default=0.25, help="Smallest automatic fraction of source points to retain (0-1); explicit caps take precedence.")
     run.add_argument(
         "--tip-window-mesh-units",
         type=float,
@@ -110,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         config = PipelineConfig(
             input_path=args.input,
             output_dir=args.output,
+            input_mode=args.input_mode,
+            nodule_aware=args.nodule_aware,
+            nodule_review_file=args.nodule_review_file,
             start=tuple(args.start) if args.start else None,
             end=tuple(args.end) if args.end else None,
             endpoint_file=args.endpoint_file,

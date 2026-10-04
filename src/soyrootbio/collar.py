@@ -13,6 +13,7 @@ from scipy.sparse.csgraph import connected_components, dijkstra
 
 from .surface_patches import _polyline_projection_distance_and_arc as project
 from .surface_patches import _segment_radius_profile
+from .mesh_geometry import MeshGeometryContext
 from .types import RootPath
 
 
@@ -38,7 +39,8 @@ def _profile(points, path, density, fallback):
 
 
 def analyze_joint_collar(points, labels, primary_path, lateral_paths: list[RootPath], *,
-                         d_bar, triangles=None, excluded_mask=None):
+                         d_bar, triangles=None, excluded_mask=None,
+                         mesh_context: MeshGeometryContext | None = None):
     """Return labels and an auditable simultaneous multi-root collar decision.
 
     Every score/anchor uses the input labels. All roots compete in one matrix;
@@ -171,8 +173,12 @@ def analyze_joint_collar(points, labels, primary_path, lateral_paths: list[RootP
     faces = np.empty((0, 3), int) if triangles is None else np.asarray(triangles, int)
     if faces.ndim != 2 or faces.shape[1] != 3 or (len(faces) and (faces.min() < 0 or faces.max() >= len(p))):
         raise ValueError("triangles must reference mesh vertices")
-    edges = np.unique(np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1), axis=0)
-    edge_length = np.linalg.norm(p[edges[:, 0]]-p[edges[:, 1]], axis=1)
+    if mesh_context is not None:
+        mesh_context.validate(p, faces)
+        edges, edge_length = mesh_context.edges, mesh_context.edge_lengths
+    else:
+        edges = np.unique(np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1), axis=0)
+        edge_length = np.linalg.norm(p[edges[:, 0]]-p[edges[:, 1]], axis=1)
     edges = edges[edge_length <= 4*np.maximum(density[edges[:, 0]], density[edges[:, 1]])]
     local = np.full(len(p), -1, int)
     local[ix] = np.arange(len(ix))

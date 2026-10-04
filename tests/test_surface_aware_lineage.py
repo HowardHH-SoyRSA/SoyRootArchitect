@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
+import pytest
+
+from soyrootbio.geometry import child_parent_length_penalty
 
 import soyrootbio.lateral as lateral_module
 from soyrootbio.lateral import (
@@ -14,7 +19,7 @@ from soyrootbio.topology import (
     _join_contacted_sibling_continuations,
     _merge_parallel_parent_duplicates,
     _merge_same_insertion_primary_duplicates,
-    _prune_overlong_child_subtrees,
+    _warn_overlong_children,
     _reconcile_overlong_forks,
     _reparent_same_insertion_divergences,
     _swap_internal_contact_suffixes,
@@ -974,6 +979,8 @@ def test_supported_overlong_child_becomes_order1_continuation() -> None:
     )
     long_arm.insertion_index = 8
     long_arm.score_components["novel_density_support"] = 240.0
+    long_arm.score_components["fork_hypothesis_evidence_score"] = 1.0
+    parent.fork_hypothesis_group = long_arm.fork_hypothesis_group = "observed-junction"
 
     long_descendant = _root(
         "long-descendant",
@@ -1039,7 +1046,83 @@ def test_overlong_child_without_supported_internal_fork_is_not_reconciled() -> N
     np.testing.assert_allclose(terminal_child.points[-1], [10.0, 24.0, 0.0])
 
 
-def test_overlong_pruning_preserves_geometry_and_rejection_evidence() -> None:
+def test_overlong_child_does_not_override_supported_existing_direction() -> None:
+    parent = _root("parent", [[float(x), 0.0, 0.0] for x in range(11)], order=1, parent_id="primary")
+    parent.score_components["surface_aware_seed"] = 1.0
+    child = _root(
+        "child", [[8.0, float(y), 0.0] for y in range(25)],
+        order=2, parent_id="parent",
+    )
+    child.insertion_index = 8
+    child.score_components["novel_density_support"] = 240.0
+    before = [parent.points.copy(), child.points.copy()]
+    decisions = []
+    _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]), [parent, child],
+        d_bar=0.05, decision_log=decisions,
+    )
+    assert decisions[0]["trigger"] == "child_longer_than_parent_warning"
+    assert decisions[0]["reason"] == "windowed_curvature_supports_existing_suffix"
+    for root, points in zip((parent, child), before):
+        np.testing.assert_array_equal(root.points, points)
+    assert "child_longer_than_parent" in child.qc_flags
+
+
+@pytest.mark.parametrize("legacy_length_score", [False, True])
+def test_length_prior_alone_cannot_resolve_symmetric_supported_fork(legacy_length_score: bool) -> None:
+    # Both arms turn 45 degrees; only their lengths distinguish the hypotheses.
+    diagonal = np.sqrt(0.5)
+    parent_points = [[float(x), 0.0, 0.0] for x in range(9)]
+    parent_points += [[8.0 + diagonal * t, diagonal * t, 0.0] for t in range(1, 5)]
+    parent = _root("parent", parent_points, order=1, parent_id="primary")
+    parent.score_components["surface_aware_seed"] = 1.0
+    child = _root(
+        "child", [[8.0 + diagonal * t, -diagonal * t, 0.0] for t in range(25)],
+        order=2, parent_id="parent",
+    )
+    child.insertion_index = 8
+    child.score_components["novel_density_support"] = 240.0
+    if legacy_length_score:
+        # Legacy composite scores contain 25% extent; that is not independent
+        # fork evidence. All other evidence is equal between the two arms.
+        for root, index, extent in ((parent, 0.0, 4.0), (child, 1.0, 24.0)):
+            root.score_components.update({
+                "fork_hypothesis_index": index,
+                "fork_selected_supported_extent": 4.0,
+                "fork_alternate_supported_extent": 24.0,
+                "fork_hypothesis_evidence_score": 0.45 + 0.25 * extent / 24.0,
+            })
+    before = [parent.points.copy(), child.points.copy()]
+    decisions = []
+    reconciled, _ = _reconcile_overlong_forks(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]), [parent, child],
+        d_bar=0.05, decision_log=decisions,
+    )
+    assert reconciled == []
+    row = decisions[0]
+    assert row["reason"] == "existing_continuation_not_worse"
+    assert row["independent_evidence_gain"] == pytest.approx(0.0, abs=1e-12)
+    assert row["review_score_gain"] > 0.02
+    for root, points in zip((parent, child), before):
+        np.testing.assert_array_equal(root.points, points)
+
+
+def test_length_penalty_is_bounded_scale_independent_and_refreshes_warning() -> None:
+    assert child_parent_length_penalty(10.0, 10.0) == 0.0
+    assert child_parent_length_penalty(10.0 + 1e-10, 10.0) == 0.0
+    penalty = child_parent_length_penalty(12.0, 10.0)
+    assert 0.0 < penalty < 0.05
+    for scale in (0.001, 1.0, 1000.0):
+        assert child_parent_length_penalty(12.0 * scale, 10.0 * scale) == pytest.approx(penalty)
+    assert child_parent_length_penalty(1e6, 0.0) == pytest.approx(0.05)
+    root = _root("child", [[0.0, 0.0, 0.0], [0.0, 0.0, 12.0]], order=1, parent_id="primary")
+    assert len(_warn_overlong_children(np.array([[0., 0., 0.], [0., 0., 10.]]), [root])) == 1
+    root.points[-1, 2] = 8.0
+    assert _warn_overlong_children(np.array([[0., 0., 0.], [0., 0., 10.]]), [root]) == []
+    assert "child_longer_than_parent" not in root.qc_flags
+
+
+def test_overlong_warning_preserves_child_descendants_and_rejection_evidence() -> None:
     overlong = _root(
         "overlong",
         [[0.0, 0.0, 0.0], [0.0, 0.0, 25.0]],
@@ -1049,23 +1132,35 @@ def test_overlong_pruning_preserves_geometry_and_rejection_evidence() -> None:
     rejection = {
         "candidate_arm_id": "overlong",
         "action": "rejected",
-        "reason": "alternative_parent_length_control",
+        "reason": "insufficient_connected_support",
     }
 
-    retained, details, descendants = _prune_overlong_child_subtrees(
+    descendant = _root(
+        "descendant", [[0.0, 0.0, 20.0], [1.0, 0.0, 20.0]],
+        order=2, parent_id="overlong",
+    )
+    paths = [overlong, descendant]
+    geometry_before = [path.points.copy() for path in paths]
+    details = _warn_overlong_children(
         np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]]),
-        [overlong],
+        paths,
         fork_decisions=[rejection],
     )
 
-    assert retained == []
-    assert descendants == 0
+    assert paths == [overlong, descendant]
+    for path, points in zip(paths, geometry_before):
+        np.testing.assert_array_equal(path.points, points)
+    assert descendant.parent_id == "overlong"
+    assert "child_longer_than_parent" in overlong.qc_flags
+    assert "child_longer_than_parent" not in descendant.qc_flags
     assert len(details) == 1
     assert details[0]["preserved_polyline_normalized"] == (
         overlong.points.tolist()
     )
     assert details[0]["reconciliation_rejections"] == [rejection]
     assert len(details[0]["geometry_sha256"]) == 64
+    assert details[0]["action"] == "retained_for_junction_review"
+    assert 0.0 < details[0]["length_penalty"] <= 0.05
 
 
 def test_overlong_child_below_twice_parent_length_resurveys_alternative_parent() -> None:
@@ -1085,11 +1180,16 @@ def test_overlong_child_below_twice_parent_length_resurveys_alternative_parent()
     )
     alternative.insertion_index = 8
     alternative.score_components["novel_density_support"] = 120.0
+    alternative.score_components["fork_hypothesis_evidence_score"] = 1.0
+    parent_snapshot = parent.points.copy()
+    parent.fork_hypothesis_group = alternative.fork_hypothesis_group = "observed-junction"
+    decisions: list[dict[str, object]] = []
 
     reconciled, reassigned = _reconcile_overlong_forks(
         np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
         [parent, alternative],
         d_bar=0.05,
+        decision_log=decisions,
     )
 
     assert reassigned == set()
@@ -1101,6 +1201,14 @@ def test_overlong_child_below_twice_parent_length_resurveys_alternative_parent()
     np.testing.assert_allclose(
         alternative.points,
         [[8.0, 0.0, 0.0], [9.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+    )
+    accepted = next(row for row in decisions if row["action"] == "accepted")
+    assert accepted["proposal_generation"] == accepted["resurvey_iteration"]
+    assert accepted["parent_geometry_sha256"] == hashlib.sha256(
+        parent_snapshot.astype("<f8").tobytes()
+    ).hexdigest()
+    assert {"parent", "alternative"}.issubset(
+        accepted["reevaluation_requested_root_ids"]
     )
 
 
@@ -1121,6 +1229,8 @@ def test_alternative_parent_accepts_substantial_retained_child_arm() -> None:
     )
     alternative.insertion_index = 6
     alternative.score_components["novel_density_support"] = 120.0
+    alternative.score_components["fork_hypothesis_evidence_score"] = 1.0
+    parent.fork_hypothesis_group = alternative.fork_hypothesis_group = "observed-junction"
 
     reconciled, _ = _reconcile_overlong_forks(
         np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
@@ -1134,7 +1244,7 @@ def test_alternative_parent_accepts_substantial_retained_child_arm() -> None:
     assert reconciled[0].short_child_parent_ratio_after == 4.0 / 18.0
 
 
-def test_alternative_parent_that_violates_primary_length_is_not_used() -> None:
+def test_supported_alternative_parent_exceeding_primary_length_uses_soft_penalty() -> None:
     parent = _root(
         "parent",
         [[float(x), 0.0, 0.0] for x in range(11)],
@@ -1151,6 +1261,9 @@ def test_alternative_parent_that_violates_primary_length_is_not_used() -> None:
     )
     alternative.insertion_index = 8
     alternative.score_components["novel_density_support"] = 120.0
+    alternative.score_components["fork_hypothesis_evidence_score"] = 1.0
+    decisions = []
+    parent.fork_hypothesis_group = alternative.fork_hypothesis_group = "observed-junction"
 
     reconciled, reassigned = _reconcile_overlong_forks(
         np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 15.0]]),
@@ -1158,10 +1271,16 @@ def test_alternative_parent_that_violates_primary_length_is_not_used() -> None:
         d_bar=0.05,
     )
 
-    assert reconciled == []
+    assert len(reconciled) == 1
     assert reassigned == set()
-    np.testing.assert_allclose(parent.points[-1], [10.0, 0.0, 0.0])
-    np.testing.assert_allclose(alternative.points[-1], [8.0, 12.0, 0.0])
+    np.testing.assert_allclose(parent.points[-1], [8.0, 12.0, 0.0])
+    assert parent.score_components["alternative_length_penalty"] == pytest.approx(0.0125)
+    assert parent.score_components["alternative_review_score"] < parent.score_components["alternative_evidence_score"]
+    details = _warn_overlong_children(
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 15.0]]), [parent, alternative],
+    )
+    assert len(details) == 1
+    assert details[0]["root_id"] == "parent"
 
 
 def test_overlong_later_order_child_resurveys_against_revised_parent() -> None:
@@ -1189,6 +1308,8 @@ def test_overlong_later_order_child_resurveys_against_revised_parent() -> None:
     )
     third_order.insertion_index = 6
     third_order.score_components["novel_density_support"] = 120.0
+    third_order.score_components["fork_hypothesis_evidence_score"] = 1.0
+    second_order.fork_hypothesis_group = third_order.fork_hypothesis_group = "observed-junction"
 
     reconciled, _ = _reconcile_overlong_forks(
         np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]),
@@ -1269,6 +1390,9 @@ def test_fork_work_queue_revisits_parent_after_descendant_swap() -> None:
     assert stats["iterations"] > 3
     assert stats["cycle_states"] == 0
     assert [row["action"] for row in decisions].count("accepted") == 2
+    accepted = [row for row in decisions if row["action"] == "accepted"]
+    assert accepted[0]["proposal_generation"] < accepted[1]["proposal_generation"]
+    assert "first-order" in accepted[0]["reevaluation_requested_root_ids"]
     np.testing.assert_allclose(first_order.points[-1], [33.0, 0.0, 0.0])
 
 

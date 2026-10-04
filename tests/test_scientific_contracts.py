@@ -289,7 +289,7 @@ def test_hierarchy_repair_enforces_recursive_orders_and_validation_metadata():
     assert report.low_confidence_roots == sum(root.confidence < 0.55 for root in repaired)
 
 
-def test_hierarchy_repair_removes_overlong_child_and_its_descendants():
+def test_hierarchy_repair_warns_and_retains_overlong_child_and_its_descendants():
     primary = np.array(
         [
             [0.0, 0.0, 2.0],
@@ -364,11 +364,17 @@ def test_hierarchy_repair_removes_overlong_child_and_its_descendants():
         d_bar=0.005,
     )
 
-    assert len(repaired) == 2
-    assert all(root.order == 1 for root in repaired)
+    assert len(repaired) == 5
+    assert sorted(root.order for root in repaired) == [1, 1, 1, 2, 3]
+    assert dependent_descendant.parent_id == overlong_child.root_id
+    np.testing.assert_allclose(overlong_child.points[-1], [0.4, 0.7, 1.5])
+    np.testing.assert_allclose(dependent_descendant.points[-1], [0.4, 0.7, 1.4])
     assert validate_root_tree(repaired, primary_path=primary) == []
-    assert report.overlong_children_removed == 2
-    assert report.overlong_descendants_removed == 1
+    assert report.overlong_children_removed == 0
+    assert report.overlong_descendants_removed == 0
+    assert report.overlong_children_warned == 2
+    assert sum("child_longer_than_parent" in root.qc_flags for root in repaired) == 2
+    assert sum("retained for junction review" in warning for warning in report.warnings) == 2
     assert len(report.overlong_child_details) == 2
     assert any(
         detail["parent_id"] == "primary"
@@ -379,7 +385,7 @@ def test_hierarchy_repair_removes_overlong_child_and_its_descendants():
         assert detail["child_parent_length_ratio"] > 1.0
 
 
-def test_hierarchy_repair_reconciles_supported_order1_fork_before_pruning():
+def test_hierarchy_repair_reconciles_supported_order1_fork_before_warning():
     primary = np.array(
         [
             [0.0, 0.0, 100.0],
@@ -410,8 +416,9 @@ def test_hierarchy_repair_reconciles_supported_order1_fork_before_pruning():
         score=20.0,
         order=2,
         parent_id="candidate-parent",
-        score_components={"novel_density_support": 240.0},
+        score_components={"novel_density_support": 240.0, "fork_hypothesis_evidence_score": 1.0},
     )
+    parent.fork_hypothesis_group = long_arm.fork_hypothesis_group = "observed-junction"
 
     repaired, report = repair_root_hierarchy(
         primary,

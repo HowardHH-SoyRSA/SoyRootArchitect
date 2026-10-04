@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 import uuid
 
 from .hardware import HardwareInfo, ResourceAllocation, allocate_resources
+from .memory_budget import MemoryAdmission, estimate_input_memory
 
 
 ERROR_LOG_FILENAME = "processing_error.log"
@@ -388,6 +389,10 @@ class BatchJob:
     error: str | None = None
     error_log_path: Path | None = None
     result: Any = None
+    memory_estimate_bytes: int = 0
+    memory_current_bytes: int = 0
+    memory_peak_bytes: int = 0
+    _memory_admission: MemoryAdmission | None = field(default=None, repr=False)
     submitted_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -624,6 +629,7 @@ class BatchScheduler:
         threads_per_sample: int = 1,
         timing_history: StepTimingHistory | None = None,
         thread_name_prefix: str = "soyroot-batch",
+        memory_admission: MemoryAdmission | None = None,
     ) -> None:
         if max_concurrent_samples < 1:
             raise ValueError("max_concurrent_samples must be at least 1")
@@ -634,6 +640,7 @@ class BatchScheduler:
         self.threads_per_sample = threads_per_sample
         self.timing_history = timing_history or StepTimingHistory()
         self.thread_name_prefix = thread_name_prefix
+        self.memory_admission = memory_admission
         self._jobs: dict[str, BatchJob] = {}
         self._output_owners: dict[Path, str] = {}
         self._futures: dict[str, Future[Any]] = {}
@@ -922,6 +929,48 @@ class BatchScheduler:
             self._futures[job.job_id] = self._executor.submit(self._execute, job)
 
     def _execute(self, job: BatchJob) -> None:
+        admission = self.memory_admission
+        try:
+            if admission is not None:
+                job.memory_estimate_bytes = estimate_input_memory(job.input_path)
+                job._memory_admission = admission
+                while True:
+                    job.control.checkpoint()
+                    if admission.try_acquire(job.job_id, job.memory_estimate_bytes):
+                        break
+                    with job._lock:
+                        waiting_changed = False
+                        if not job.control.paused:
+                            waiting_changed = job.step != "Waiting for available memory"
+                            job.step = "Waiting for available memory"
+                            job.eta_seconds = None
+                    if waiting_changed:
+                        self._emit(BatchEventType.PROGRESS, job)
+                    time.sleep(0.25)
+            self._execute_admitted(job)
+        except BatchCancelled:
+            self._finish_cancelled(job)
+        except Exception as exc:
+            # Admission can reject a sample too large even for serial execution.
+            if job.control.cancelled:
+                self._finish_cancelled(job)
+                return
+            with job._lock:
+                job.state = BatchJobState.FAILED
+                job.step = "Failed before starting"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.finished_at = time.time()
+                job.error_log_path = write_processing_error_log(
+                    output_dir=job.output_dir, input_path=job.input_path,
+                    exception=exc, config=job.payload,
+                    context={"memory_estimate_bytes": job.memory_estimate_bytes},
+                )
+            self._emit(BatchEventType.FAILED, job)
+        finally:
+            if admission is not None:
+                admission.release(job.job_id)
+
+    def _execute_admitted(self, job: BatchJob) -> None:
         control = job._control
         try:
             control.checkpoint()
@@ -1001,6 +1050,9 @@ class BatchScheduler:
                     "last_reported_step": job.step,
                     "progress_fraction": job.progress,
                     "threads_per_sample": job.threads_per_sample,
+                    "memory_estimate_bytes": job.memory_estimate_bytes,
+                    "memory_peak_private_bytes": job.memory_peak_bytes,
+                    "resources": getattr(exc, "resource_context", {}),
                 }
                 cancelled = (
                     isinstance(exc, BatchCancelled)

@@ -114,7 +114,7 @@ def compute_traits(
             "gravity_dz": float(gravity[2]),
         }
     )
-    primary_unmeasurable = any(flag in (primary_qc_flags or []) for flag in ("centerline_no_support", "centerline_insufficient_support"))
+    primary_unmeasurable = any(flag in (primary_qc_flags or []) for flag in ("centerline_no_support", "centerline_insufficient_support", "centerline_nodule_obscured"))
     records[0]["centerline_fit_status"] = (primary_centerline_assessment or {}).get("status", "insufficient_support" if primary_unmeasurable else "not_assessed")
     if primary_unmeasurable:
         _mark_unmeasurable(records[0])
@@ -272,7 +272,7 @@ def compute_traits(
             record["exposed_body_length"] = np.nan
             record["volume"] = np.nan
             record["volume_method"] = "unmeasurable_retained_prior_path"
-        if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support"}:
+        if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support", "nodule_obscured"}:
             _mark_unmeasurable(record)
         records.append(record)
 
@@ -497,6 +497,11 @@ def _partition_mesh_surface_areas(
     v1 = vertices[triangles[:, 1]]
     v2 = vertices[triangles[:, 2]]
     areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+    if np.any(labels <= -3):
+        # Partition interface faces once across roots and nonroot objects.
+        # This matches the separately exported nodule surface measurements.
+        vertex_area = np.bincount(triangles.ravel(), weights=np.repeat(areas / 3, 3), minlength=len(vertices))
+        return {int(label): float(vertex_area[labels == label].sum()) for label in np.unique(labels) if label >= 0}
     result: dict[int, float] = {}
     for label in np.unique(face_labels):
         if label >= 0:
@@ -527,6 +532,14 @@ def _system_summary(
         else float(traits["volume"].sum())
     )
     labels = None if full_root_labels is None else np.asarray(full_root_labels, dtype=int)
+    contains_nodules = labels is not None and bool(np.any(labels <= -3))
+    if contains_nodules:
+        # Source-mesh totals include nodules and cannot be presented as root
+        # totals after semantic separation. Retain the source in metadata only.
+        whole_area = float(traits["surface_area"].sum(min_count=1))
+        whole_volume = float(traits["volume"].sum(min_count=1))
+        exact_surface_available = False
+        exact_volume_available = False
     assigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels >= 0))
     uncertain_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -2))
     unassigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -1))
@@ -534,6 +547,10 @@ def _system_summary(
     unavailable_volume_count = int(traits["volume"].isna().sum())
     return {
         "root_count_total": int(len(traits)),
+        **({"nodule_vertex_fraction": float(np.mean(labels <= -3)),
+            "nodule_excluded_from_root_totals": True,
+            "source_surface_area_including_nodules": mesh_area,
+            "source_volume_including_nodules": mesh_volume} if contains_nodules else {}),
         "lateral_root_count_total": int(len(laterals)),
         "maximum_root_order": int(laterals["root_order"].max()) if len(laterals) else 0,
         "length_unit": "mesh_unit",

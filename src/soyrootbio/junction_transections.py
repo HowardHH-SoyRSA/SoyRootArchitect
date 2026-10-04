@@ -7,6 +7,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from .centerline import _support_edges
+from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 from .surface_patches import _polyline_projection_distance_and_arc as project
 from .surface_patches import _segment_radius_profile
 from .types import RootPath
@@ -20,16 +21,33 @@ def _frame(path, arc, stations, tangent_span):
     return centers, tangent
 
 
+def _connected_exterior(vertices, child_vertices, parent_edges, child_edges, contact_edges):
+    """Use a compact native domain containing only the proposed exterior/body."""
+    domain = np.union1d(vertices, child_vertices)
+    parent = parent_edges[np.isin(parent_edges, vertices).all(axis=1)]
+    contact = contact_edges[np.isin(contact_edges, vertices).any(axis=1)]
+    local = np.searchsorted(domain, np.vstack((parent, child_edges, contact)))
+    graph = coo_matrix((np.ones(len(local)), (local[:, 0], local[:, 1])),
+                       shape=(len(domain), len(domain))).tocsr()
+    _, component = connected_components(graph, directed=False)
+    return np.isin(component[np.searchsorted(domain, vertices)],
+                   np.unique(component[np.searchsorted(domain, child_vertices)]))
+
+
 def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
                            primary_path: np.ndarray, roots: list[RootPath], *,
                            d_bar: float, triangles: np.ndarray | None,
-                           excluded_mask: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+                           excluded_mask: np.ndarray | None = None,
+                           protected_primary_mask: np.ndarray | None = None,
+                           mesh_context: MeshGeometryContext | None = None) -> tuple[np.ndarray, dict]:
     """Compare two parent flanks in the contacted child's facing sector.
 
     Proposals use frozen labels and geometry. A primary component can be split
     only outside its interpolated parent envelope, with an observed mesh path
     to the contacted O1. The insertion and centerlines themselves are untouched.
     Missing/invalid two-sided parent support is reported, never invented.
+    Independently confirmed primary-wall vertices remain primary anchors;
+    their transverse evidence outranks the circular flank approximation.
     """
     p, before, parent = np.asarray(points, float), np.asarray(labels, int), np.asarray(primary_path, float)
     spacing = float(d_bar)
@@ -44,6 +62,10 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
     excluded = np.zeros(len(p), bool) if excluded_mask is None else np.asarray(excluded_mask, bool)
     if excluded.shape != before.shape:
         raise ValueError("excluded_mask must match labels")
+    protected = (np.zeros(len(p), bool) if protected_primary_mask is None
+                 else np.asarray(protected_primary_mask, bool))
+    if protected.shape != before.shape:
+        raise ValueError("protected_primary_mask must match labels")
     result = before.copy()
     report = dict(policy="branch-facing-transection-trimming-v1",
         coordinate_system="input coordinates",
@@ -54,13 +76,22 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
         maximum_flank_radius_ratio=1.6, parent_wall_margin="0.25*d_bar",
         mesh_policy="observed triangle edges; no point-cloud bridging",
         connector_policy="surface-axis reference only; never edit insertion or geometry",
-        tie_margin=0.15, transferred_vertex_count=0, ambiguous_vertices=0, junctions=[])
+        tie_margin=0.15, transferred_vertex_count=0, ambiguous_vertices=0,
+        protected_primary_vertex_count=int(np.count_nonzero(protected & (before == 0))), junctions=[])
     if len(parent) < 2 or triangles is None or not len(triangles):
         report['status'] = 'insufficient_parent_or_mesh'
         return result, report
-    edges = _support_edges(p, triangles, spacing)
+    if mesh_context is not None:
+        mesh_context.validate(p, triangles)
+        edges = mesh_context.support_edges(spacing)
+    else:
+        edges = _support_edges(p, triangles, spacing)
     edges = edges[~excluded[edges].any(axis=1)]
-    pi = np.flatnonzero((before == 0) & ~excluded)
+    edges.setflags(write=False)
+    ownership = (mesh_context.ownership(before) if mesh_context is not None
+                 else OwnershipGeometryGeneration(before, p))
+    pi = ownership.vertices(0)
+    pi = pi[~excluded[pi]]
     if len(pi) < 8:
         report['status'] = 'insufficient_primary_support'
         return result, report
@@ -69,7 +100,7 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
     radial_stations, radii = _segment_radius_profile(parent_points, parent, spacing)
     parcarc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(parent, axis=0), axis=1))]
     tree = cKDTree(parent_points)
-    lookup = np.full(len(p), -1, int); lookup[pi] = np.arange(len(pi))
+    parent_edges = ownership.edges(0, edges)
     # Contact evidence belongs to surface labels, not guessed insertion nodes.
     crossing = edges[(before[edges[:, 0]] == 0) ^ (before[edges[:, 1]] == 0)]
     at_start = before[crossing[:, 0]] == 0
@@ -92,7 +123,7 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
         body = path[root.body_start_index:]
         if len(body) < 2:
             row['status'] = 'no_measurable_child_or_mesh_contact'; continue
-        ci = lookup[contacts[label]]
+        ci = np.searchsorted(pi, contacts[label])
         cd, ca = project(parent_points[ci], body)
         # The earliest observed body contact identifies emergence; distal
         # contacts with the same root do not define additional emergence sites.
@@ -178,7 +209,9 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
         facing /= np.maximum(np.linalg.norm(facing,axis=1)[:,None],1e-12)
         cosine = np.einsum('ij,ij->i',radial_vector,facing)/np.maximum(radial,1e-12)
         wall = np.interp(pa[local],[sa,sb],[ra,rb])
-        child_support = p[(before==label)&~excluded]
+        child_vertices = ownership.vertices(label)
+        child_vertices = child_vertices[~excluded[child_vertices]]
+        child_support = p[child_vertices]
         sd,ss = project(child_support,body)
         basal = sd[ss<=max(6*h,12*spacing)]
         rc = max(spacing,float(np.median(basal)) if len(basal)>=3 else spacing)
@@ -190,15 +223,14 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
         eligible = ((radial > wall+.25*spacing) & (cosine>=.5)
                     & (fit_distance<=1.75*rc+2*spacing)
                     & (body_arc<=max(6*h,12*spacing)))
+        row['confirmed_primary_wall_conflict_count'] = int(np.count_nonzero(eligible & protected[pi[local]]))
+        eligible &= ~protected[pi[local]]
         candidates = pi[local[eligible]]
         # Strict surface contact: a candidate reaches the contacted O1 using
         # only other exterior candidates and its original child-owned surface.
-        allowed = (before==label)&~excluded
-        allowed[candidates] = True
-        e = edges[allowed[edges].all(axis=1)]
-        g = coo_matrix((np.ones(len(e)),(e[:,0],e[:,1])),shape=(len(p),len(p))).tocsr()
-        _,cc = connected_components(g,directed=False)
-        connected = np.isin(cc[candidates],np.unique(cc[(before==label)&~excluded]))
+        connected = _connected_exterior(candidates, child_vertices, parent_edges,
+                                         ownership.edges(label, edges),
+                                         ownership.boundary_edges(0, label, edges))
         candidates = candidates[connected]
         score = (radial[eligible]/(wall[eligible]+spacing)-fit_distance[eligible]/(rc+spacing))[connected]
         row.update(status='detected',candidate_vertices=len(candidates),child_radius=rc)
@@ -213,18 +245,22 @@ def trim_primary_junctions(points: np.ndarray, labels: np.ndarray,
     winner[contested]=0; report['ambiguous_vertices']=int(contested.sum())
     for label,vertices,_,row in claims:
         vertices=vertices[winner[vertices]==label]
-        allowed=(before==label)&~excluded;allowed[vertices]=True
-        e=edges[allowed[edges].all(axis=1)]
-        g=coo_matrix((np.ones(len(e)),(e[:,0],e[:,1])),shape=(len(p),len(p))).tocsr()
-        _,cc=connected_components(g,directed=False)
-        vertices=vertices[np.isin(cc[vertices],np.unique(cc[(before==label)&~excluded]))]
+        child_vertices = ownership.vertices(label)
+        child_vertices = child_vertices[~excluded[child_vertices]]
+        connected = _connected_exterior(vertices, child_vertices, parent_edges,
+                                         ownership.edges(label, edges),
+                                         ownership.boundary_edges(0, label, edges))
+        vertices=vertices[connected]
         result[vertices]=label
         row['transferred_vertex_count']=int(len(vertices))
     # Connectivity preservation is checked against the actual source mesh.
     # The shorter-edge graph above is only a conservative transfer path; its
     # optional edge filter must not manufacture a new parent disconnection.
-    faces = np.asarray(triangles, int)
-    mesh_edges = np.unique(np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1), axis=0)
+    if mesh_context is not None:
+        mesh_edges = mesh_context.edges
+    else:
+        faces = np.asarray(triangles, int)
+        mesh_edges = np.unique(np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1), axis=0)
     _preserve_parent_components(p, before, result, mesh_edges, parent, spacing, report)
     for row in report['junctions']:
         row['transferred_vertex_count'] = int(np.sum((before == 0) & (result == row['label'])))

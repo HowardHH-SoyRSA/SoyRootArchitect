@@ -10,6 +10,144 @@ import soyrootbio.pipeline as pipeline_module
 from soyrootbio.pipeline import PipelineConfig, run_pipeline
 from soyrootbio.primary_guidance import read_primary_guidance
 from soyrootbio.synthetic import write_synthetic_dataset
+from soyrootbio.io import write_labeled_ply
+from soyrootbio.io import write_labeled_ply
+
+
+def test_stl_bundle_exports_reversible_mapping_and_unresolved_seam_qc(tmp_path):
+    from soyrootbio.io import require_open3d, load_root_geometry
+    from soyrootbio.editor.ply import read_labeled_ply
+    o3d = require_open3d()
+    theta = np.arange(12) * 2 * np.pi / 12
+    z = np.linspace(0, 2, 25)
+    points = np.column_stack([np.tile(.08 * np.cos(theta), len(z)),
+                              np.tile(.08 * np.sin(theta), len(z)),
+                              np.repeat(z, len(theta))])
+    faces = []
+    for row in range(len(z) - 1):
+        for col in range(12):
+            a, b = row * 12 + col, row * 12 + (col + 1) % 12
+            faces.extend([[a, b, a + 12], [b, b + 12, a + 12]])
+    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(points),
+                                     o3d.utility.Vector3iVector(np.asarray(faces)))
+    mesh.compute_triangle_normals()
+    source, output = tmp_path / 'open-tube.stl', tmp_path / 'result'
+    assert o3d.io.write_triangle_mesh(str(source), mesh)
+    original = load_root_geometry(source)
+    progress, resources = [], []
+    result = run_pipeline(PipelineConfig(source, output, start=(0, 0, 2), end=(0, 0, 0),
+                                         max_root_order=1, worker_threads=1),
+                          progress_callback=lambda step, fraction: progress.append((step, fraction)),
+                          resource_callback=resources.append)
+    metadata = json.loads((output / 'metadata.json').read_text())
+    labelled = read_labeled_ply(output / 'segmented_root_structure.ply')
+    with np.load(output / 'input_geometry_mapping.npz') as mapping, np.load(output / 'original_input_geometry.npz') as raw:
+        np.testing.assert_array_equal(raw['points'], original.original_points)
+        np.testing.assert_array_equal(raw['triangles'], original.original_triangles)
+        np.testing.assert_array_equal(labelled.positions[mapping['original_to_full']], raw['points'])
+        np.testing.assert_array_equal(labelled.positions[labelled.triangles], raw['points'][raw['triangles']])
+        np.testing.assert_array_equal(labelled.positions[mapping['analysis_to_full']], original.points)
+    assert np.all(result.full_root_labels[result.full_above_base_mask] == -1)
+    assert metadata['final_compliance_audit']['source_connectivity_status'] == 'unresolved_stl_connectivity'
+    assert result.traits['qc_flags'].str.contains('stl_connectivity_unresolved').all()
+    assert resources[0]['analysis_vertex_count'] == len(original.points)
+    assert 'input_geometry_mapping.npz' in metadata['outputs']
+    assert any(step == 'Tracing order-1 lateral roots' for step, _ in progress)
+    assert np.all(np.diff([fraction for _, fraction in progress]) >= 0)
+
+
+@pytest.mark.parametrize("input_mode", ["surface_points", "occupied_volume"])
+def test_capped_point_pipeline_preserves_full_exports_and_representation_qc(tmp_path, input_mode):
+    source, endpoints = write_synthetic_dataset(
+        tmp_path / "root.csv", primary_points=150, lateral_points=60,
+        lateral_count=2, noise=0.001, seed=29,
+    )
+    original = pipeline_module.load_root_geometry(source)
+    output = tmp_path / "output"
+    result = run_pipeline(PipelineConfig(
+        source, output, endpoint_file=endpoints, sample_points=120,
+        max_root_order=1, input_mode=input_mode,
+    ))
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert result.point_count == 120
+    assert len(result.full_root_labels) == len(original.points)
+    assert metadata["full_resolution_point_count"] == len(original.points)
+    assert metadata["source_geometry"]["input_mode"] == input_mode
+    assert metadata["source_geometry"]["analysis_cap"] == 120
+    assert metadata["point_only_evidence"]["native_patch_compliance"] == "unresolved_no_mesh"
+    assert np.all(result.full_root_labels[result.full_above_base_mask] == -1)
+    with np.load(output / "original_input_geometry.npz") as archive:
+        np.testing.assert_array_equal(archive["points"], original.points)
+    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    np.testing.assert_array_equal(labelled.points, original.points)
+    assert "original_input_geometry.npz" in metadata["outputs"]
+    assert result.traits["qc_flags"].str.contains("native_mesh_constraints_unresolved").all()
+    if input_mode == "occupied_volume":
+        assert result.traits["qc_flags"].str.contains("occupied_volume_measurement_uncalibrated").all()
+
+
+def test_capped_native_mesh_keeps_faces_and_uses_native_checks(tmp_path):
+    theta = np.arange(16) * 2 * np.pi / 16
+    z = np.linspace(0, 2, 40)
+    points = np.column_stack([np.tile(.08 * np.cos(theta), len(z)),
+                              np.tile(.08 * np.sin(theta), len(z)),
+                              np.repeat(z, len(theta))])
+    faces = []
+    for row in range(len(z) - 1):
+        for column in range(len(theta)):
+            a = row * 16 + column
+            b = row * 16 + (column + 1) % 16
+            faces.extend([[a, b, a + 16], [b, b + 16, a + 16]])
+    faces = np.asarray(faces)
+    source, output = tmp_path / "tube.ply", tmp_path / "output"
+    write_labeled_ply(source, points, triangles=faces)
+    result = run_pipeline(PipelineConfig(
+        source, output, start=(0, 0, 2), end=(0, 0, 0),
+        sample_points=120, max_root_order=1, input_mode="triangle_mesh",
+    ))
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert result.point_count == 120
+    assert metadata["point_only_evidence"]["status"] == "not_applicable_native_mesh"
+    assert metadata["higher_order_primary_contact"]["status"] != "unresolved_no_mesh"
+    assert metadata["source_geometry"]["native_mesh_support"] is True
+    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    np.testing.assert_array_equal(labelled.full_points, points)
+    np.testing.assert_array_equal(labelled.triangles, faces)
+    with np.load(output / "original_input_geometry.npz") as archive:
+        np.testing.assert_array_equal(archive["points"], points)
+        np.testing.assert_array_equal(archive["triangles"], faces)
+
+
+def test_capped_native_mesh_keeps_faces_and_uses_native_checks(tmp_path):
+    theta = np.arange(16) * 2 * np.pi / 16
+    z = np.linspace(0, 2, 40)
+    points = np.column_stack([np.tile(.08 * np.cos(theta), len(z)),
+                              np.tile(.08 * np.sin(theta), len(z)),
+                              np.repeat(z, len(theta))])
+    faces = []
+    for row in range(len(z) - 1):
+        for column in range(len(theta)):
+            a = row * 16 + column
+            b = row * 16 + (column + 1) % 16
+            faces.extend([[a, b, a + 16], [b, b + 16, a + 16]])
+    faces = np.asarray(faces)
+    source, output = tmp_path / "tube.ply", tmp_path / "output"
+    write_labeled_ply(source, points, triangles=faces)
+    result = run_pipeline(PipelineConfig(
+        source, output, start=(0, 0, 2), end=(0, 0, 0),
+        sample_points=120, max_root_order=1, input_mode="triangle_mesh",
+    ))
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert result.point_count == 120
+    assert metadata["point_only_evidence"]["status"] == "not_applicable_native_mesh"
+    assert metadata["higher_order_primary_contact"]["status"] != "unresolved_no_mesh"
+    assert metadata["source_geometry"]["native_mesh_support"] is True
+    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    np.testing.assert_array_equal(labelled.full_points, points)
+    np.testing.assert_array_equal(labelled.triangles, faces)
+    with np.load(output / "original_input_geometry.npz") as archive:
+        np.testing.assert_array_equal(archive["points"], points)
+        np.testing.assert_array_equal(archive["triangles"], faces)
 
 
 def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
@@ -53,6 +191,12 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert collar == metadata["joint_root_collar"]
     assert collar["policy"] == "joint-root-collar-v1"
     assert metadata["higher_order_primary_contact"]["status"] == "unresolved_no_mesh"
+    assert metadata["source_geometry"]["input_mode"] == "surface_points"
+    assert metadata["point_only_evidence"]["native_contact_compliance"] == "unresolved_no_mesh"
+    assert metadata["point_only_evidence"]["changed_vertex_count"] == 0
+    original = np.load(output_dir / "original_input_geometry.npz")
+    np.testing.assert_array_equal(original["points"], pipeline_module.load_root_geometry(points_path).full_points)
+    assert original["triangles"].shape == (0, 3)
     guidance = read_primary_guidance(output_dir / "primary_guidance.json", expected_input=points_path)
     start, end = pipeline_module.read_endpoint_file(endpoint_path)
     np.testing.assert_array_equal(guidance.start, start)
@@ -72,6 +216,7 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert {"confidence", "qc_flags"}.issubset(lateral_skeletons.columns)
     assert {"tortuosity", "mean_diameter", "tip_gravity_angle_deg", "tip_start_gravity_angle_deg", "tip_primary_angle_deg"}.issubset(traits.columns)
     assert set(traits["length_unit"]) == {"mesh_unit"}
+    assert traits["qc_flags"].str.contains("native_mesh_constraints_unresolved").all()
     assert not any("mm" in column.lower() for column in traits.columns)
     length_by_id = traits.set_index("root_id")["length"].to_dict()
     for row in traits.itertuples(index=False):
@@ -100,8 +245,11 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert "centerline_region" in lateral_skeletons.columns
     assert metadata["lateral_tracing_policy"][
         "child_length_may_not_exceed_parent"
-    ] is True
+    ] is False
     tracing_policy = metadata["lateral_tracing_policy"]
+    assert tracing_policy["overlong_child_reexamination_penalty_max"] == pytest.approx(0.05)
+    assert tracing_policy["main_tracer_max_steps"] == 300
+    assert tracing_policy["tip_extension_max_steps"] == 300
     assert tracing_policy[
         "main_tracer_step_score_turn_alignment_weight"
     ] == pytest.approx(0.57)
@@ -120,8 +268,9 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert tracing_policy["main_tracer_new_direction_weight"] == pytest.approx(
         0.25
     )
-    assert metadata["topology_report"]["overlong_children_removed"] >= 0
-    assert metadata["topology_report"]["overlong_descendants_removed"] >= 0
+    assert metadata["topology_report"]["overlong_children_removed"] == 0
+    assert metadata["topology_report"]["overlong_descendants_removed"] == 0
+    assert metadata["topology_report"]["overlong_children_warned"] >= 0
     assert metadata["topology_report"]["origins_above_primary_top_removed"] >= 0
     assert metadata["topology_report"][
         "descendants_of_above_top_roots_removed"
@@ -313,6 +462,8 @@ def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
     )
 
     assert events == [
+        "analysis_assignment",  # frozen pre-continuation evidence
+        "analysis_assignment",  # post-order support for the next order
         "analysis_assignment",
         "full_assignment",
         "internal_contact_swap",

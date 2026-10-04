@@ -5,6 +5,7 @@
 .Python
 .pytest_cache/
 .pytest-runs/
+validation_runs/
 .pytest-tmp-editor-tests/
 .tmp_editor_*/
 .mypy_cache/

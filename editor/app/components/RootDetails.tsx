@@ -19,6 +19,7 @@ export function RootDetails({
   onBrushRadius,
   onApplyOrder,
   onSelect,
+  onReviewNodule,
 }: {
   root: RootRecord | null;
   patch: PointPatchRecord | null;
@@ -29,9 +30,10 @@ export function RootDetails({
   onBrushRadius: (radius: number) => void;
   onApplyOrder: (order: number) => void;
   onSelect: (rootId: string) => void;
+  onReviewNodule?: (id: string, status: "accepted" | "rejected" | "candidate") => void;
 }) {
   if (patch) {
-    return <PointPatchDetails patch={patch} editTarget={root} />;
+    return <PointPatchDetails patch={patch} editTarget={root} busy={busy} onReviewNodule={onReviewNodule} />;
   }
   if (!root) {
     return (
@@ -191,12 +193,16 @@ export function RootDetails({
 function PointPatchDetails({
   patch,
   editTarget,
+  busy,
+  onReviewNodule,
 }: {
   patch: PointPatchRecord;
   editTarget: RootRecord | null;
+  busy: boolean;
+  onReviewNodule?: (id: string, status: "accepted" | "rejected" | "candidate") => void;
 }) {
   const color = rgbToCss(
-    patch.kind === "uncertain"
+    patch.nodule ? ROOT_EXPORT_COLORS.nodule : patch.kind === "uncertain"
       ? ROOT_EXPORT_COLORS.uncertain
       : ROOT_EXPORT_COLORS.unassigned,
   );
@@ -231,6 +237,28 @@ function PointPatchDetails({
         ) : null}
       </section>
 
+      {patch.nodule ? <section className="metric-section">
+        <span className="section-label">NODULE MEASUREMENTS</span>
+        <p>{patch.nodule.status} · {patch.nodule.review_status} · nodule-like morphology</p>
+        <div className="metric-grid">
+          <Metric label="Major size" value={patch.nodule.principal_dimensions[0]} unit="mesh units" />
+          <Metric label="Middle size" value={patch.nodule.principal_dimensions[1]} unit="mesh units" />
+          <Metric label="Minor size" value={patch.nodule.principal_dimensions[2]} unit="mesh units" />
+          <Metric label="Surface area" value={patch.nodule.surface_area} unit="units²" />
+          <Metric label="Volume" value={patch.nodule.volume} unit="units³" />
+          <Metric label="Depth below collar" value={patch.nodule.depth_below_primary_top} unit="mesh units" />
+          <Metric label="Along supporting root" value={patch.nodule.distance_along_supporting_root} unit="mesh units" />
+        </div>
+        <p>Supporting root: {patch.nodule.supporting_root_id ?? "Unresolved"}</p>
+        <p>Volume: {patch.nodule.volume_method.replaceAll("_", " ")}</p>
+        {patch.nodule.qc_flags.length ? <p>Review: {patch.nodule.qc_flags.join(", ").replaceAll("_", " ")}</p> : null}
+        {onReviewNodule ? <div className="tool-options">
+          <button type="button" className="small-apply" disabled={busy || patch.nodule.status === "accepted"} onClick={() => onReviewNodule(patch.patch_id, "accepted")}>Accept as nodule</button>
+          <button type="button" className="small-apply" disabled={busy || patch.nodule.status === "rejected"} onClick={() => onReviewNodule(patch.patch_id, "rejected")}>Keep as root</button>
+          <button type="button" className="small-apply" disabled={busy || patch.nodule.status === "candidate"} onClick={() => onReviewNodule(patch.patch_id, "candidate")}>Mark unresolved</button>
+        </div> : null}
+        {patch.nodule.requires_reanalysis ? <p role="status">Root tracing is required for this region. Export edits, then load the nodule review in the analysis window and run again.</p> : null}
+      </section> : null}
       <section className="metric-section">
         <span className="section-label">PATCH LOCATION</span>
         <Coordinate label="Centroid" color={color} value={patch.centroid} />

@@ -59,6 +59,8 @@ def _app(tmp_path: Path) -> BioInsAlgoBatchApp:
         "status_var": "", "soil_z_var": "", "sample_cap_var": "0",
         "max_order_var": "3", "runtime_limit_var": "30",
         "minimum_fraction_var": "25", "tip_window_var": "2.0",
+        "input_mode_var": "auto",
+        "nodule_aware_var": False,
     }.items():
         setattr(app, name, Variable(value))
     return app
@@ -87,6 +89,28 @@ def test_start_batch_dispatches_module_level_process_runner(tmp_path, monkeypatc
     assert app.scheduler.runner is batch_gui.run_pipeline_process
     assert app.scheduler.threads_per_sample == 1
     assert 'sample process' in app.status_var.get()
+    app.scheduler.shutdown(cancel_pending=True)
+
+
+def test_automatic_threads_remain_bounded_when_memory_limits_sample_concurrency(tmp_path, monkeypatch):
+    from soyrootbio.hardware import GIB, HardwareInfo
+    app = _app(tmp_path)
+    _add_sample(app, tmp_path)
+    app.concurrency_var = Variable('Auto')
+    app.threads_var = Variable('Auto')
+    app.hardware_var = Variable()
+    app.job_to_item = {}
+    monkeypatch.setattr(batch_gui, 'detect_hardware', lambda: HardwareInfo(
+        logical_cpus=16, physical_cpus=8, total_memory_bytes=32 * GIB,
+        available_memory_bytes=6 * GIB))
+    monkeypatch.setattr(batch_gui.BatchScheduler, 'start', lambda self: None)
+    errors = []
+    monkeypatch.setattr(batch_gui.messagebox, 'showerror', lambda *args: errors.append(args))
+    app.start_batch()
+    assert not errors
+    assert app.scheduler.max_concurrent_samples == 1
+    assert app.scheduler.threads_per_sample == 2
+    assert app.scheduler.memory_admission is not None
     app.scheduler.shutdown(cancel_pending=True)
 
 

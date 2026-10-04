@@ -14,16 +14,20 @@ from scipy.spatial import cKDTree
 
 from .geometry import (
     child_length_exceeds_parent,
+    child_parent_length_penalty,
     path_length,
     primary_top_excess,
     tangent_vectors,
+    update_child_length_qc,
     vector_angle_degrees,
 )
 from .lateral import estimate_parent_radius_profile
+from .mesh_geometry import MeshGeometryContext
 from .types import Normalization, RootPath, TopologyReport
 
 
 PRIMARY_ID = "primary"
+FORK_RESURVEY_MIN_EVIDENCE_GAIN = 0.02
 
 
 @dataclass
@@ -694,84 +698,49 @@ def _reject_nonfinite_json(token: str):
     raise ValueError(f"Hierarchy correction contains non-finite JSON constant: {token}")
 
 
-def _prune_overlong_child_subtrees(
+def _warn_overlong_children(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
     *,
     fork_decisions: list[dict[str, object]] | None = None,
-) -> tuple[list[RootPath], list[dict[str, object]], int]:
-    """Remove overlong subtrees after preserving geometry and rejection evidence."""
+) -> list[dict[str, object]]:
+    """Record review evidence and retain every root and descendant."""
 
-    children: dict[str, list[RootPath]] = defaultdict(list)
-    for path in lateral_paths:
-        children[str(path.parent_id)].append(path)
-
-    removed_ids: set[str] = set()
-    violations: list[dict[str, object]] = []
-    queue: deque[tuple[str, float, bool]] = deque(
-        [(PRIMARY_ID, path_length(np.asarray(primary_path, dtype=float)), False)]
-    )
-    visited = {PRIMARY_ID}
-    while queue:
-        parent_id, parent_length, parent_removed = queue.popleft()
-        for child in sorted(
-            children.get(parent_id, []),
-            key=lambda item: str(item.root_id),
-        ):
-            child_id = str(child.root_id)
-            if child_id in visited:
-                continue
-            visited.add(child_id)
-            child_length = float(child.length)
-            direct_violation = (
-                not parent_removed
-                and child_length_exceeds_parent(child_length, parent_length)
-            )
-            child_removed = parent_removed or direct_violation
-            if child_removed:
-                removed_ids.add(child_id)
-            if direct_violation:
-                child_points = np.asarray(child.points, dtype=float)
-                related_decisions = [
-                    decision
-                    for decision in (fork_decisions or [])
-                    if str(decision.get("candidate_arm_id")) == child_id
-                    and str(decision.get("action")) == "rejected"
-                ]
-                violations.append(
-                    {
-                        "root_id": child_id,
-                        "parent_id": parent_id,
-                        "child_length_normalized": child_length,
-                        "parent_length_normalized": float(parent_length),
-                        "child_parent_length_ratio": (
-                            child_length / parent_length
-                            if parent_length > 0.0
-                            else None
-                        ),
-                        "geometry_sha256": hashlib.sha256(
-                            child_points.astype("<f8").tobytes()
-                        ).hexdigest(),
-                        "preserved_polyline_normalized": (
-                            child_points.tolist()
-                        ),
-                        "reconciliation_rejections": related_decisions,
-                        "score_evidence": {
-                            str(key): float(value)
-                            for key, value in child.score_components.items()
-                            if isinstance(value, (int, float, np.number))
-                            and np.isfinite(float(value))
-                        },
-                        "qc_flags": list(child.qc_flags),
-                    }
-                )
-            queue.append((child_id, child_length, child_removed))
-
-    retained = [
-        path for path in lateral_paths if str(path.root_id) not in removed_ids
-    ]
-    descendant_count = max(0, len(removed_ids) - len(violations))
-    return retained, violations, descendant_count
+    lengths = {PRIMARY_ID: path_length(np.asarray(primary_path, dtype=float))}
+    lengths.update({str(path.root_id): float(path.length) for path in lateral_paths})
+    details: list[dict[str, object]] = []
+    for child in sorted(lateral_paths, key=lambda item: str(item.root_id)):
+        parent_id = str(child.parent_id)
+        if parent_id not in lengths:
+            continue  # Missing parents remain structural validation errors.
+        child_length, parent_length = float(child.length), lengths[parent_id]
+        if not update_child_length_qc(child.qc_flags, child_length, parent_length):
+            continue
+        child_points = np.asarray(child.points, dtype=float)
+        related_decisions = [
+            decision for decision in (fork_decisions or [])
+            if str(decision.get("final_candidate_arm_id", decision.get("candidate_arm_id")))
+            == str(child.root_id)
+        ]
+        details.append({
+            "root_id": str(child.root_id),
+            "parent_id": parent_id,
+            "action": "retained_for_junction_review",
+            "child_length_normalized": child_length,
+            "parent_length_normalized": parent_length,
+            "child_parent_length_ratio": child_length / parent_length if parent_length > 0.0 else None,
+            "length_penalty": child_parent_length_penalty(child_length, parent_length),
+            "junction_reexamination_status": "reviewed_retained" if related_decisions else "manual_review_needed",
+            "geometry_sha256": hashlib.sha256(child_points.astype("<f8").tobytes()).hexdigest(),
+            "preserved_polyline_normalized": child_points.tolist(),
+            "reconciliation_rejections": [row for row in related_decisions if row.get("action") == "rejected"],
+            "score_evidence": {
+                str(key): float(value) for key, value in child.score_components.items()
+                if isinstance(value, (int, float, np.number)) and np.isfinite(float(value))
+            },
+            "qc_flags": list(child.qc_flags),
+        })
+    return details
 
 
 def _point_at_arc(
@@ -814,6 +783,8 @@ def _fork_decision_record(
     arm_angle: float | None = None,
     departure: float | None = None,
     preserved_points: np.ndarray | None = None,
+    review_scores: dict[str, float] | None = None,
+    parent_geometry_sha256: str | None = None,
 ) -> dict[str, object]:
     """Preserve reviewable geometry and evidence for one fork decision."""
 
@@ -822,6 +793,9 @@ def _fork_decision_record(
         dtype=float,
     )
     digest = hashlib.sha256(child_points.astype("<f8").tobytes()).hexdigest()
+    parent_digest = parent_geometry_sha256 or hashlib.sha256(
+        np.asarray(parent.points, dtype=float).astype("<f8").tobytes()
+    ).hexdigest()
     return {
         "parent_id": str(parent.root_id),
         "candidate_arm_id": str(child.root_id),
@@ -829,6 +803,9 @@ def _fork_decision_record(
         "reason": str(reason),
         "trigger": str(trigger),
         "resurvey_iteration": int(iteration),
+        "proposal_generation": int(iteration),
+        "proposal_snapshot": "frozen_parent_and_candidate_geometry_before_commit",
+        "parent_geometry_sha256": parent_digest,
         "parent_length_normalized": float(parent_length),
         "candidate_arm_length_normalized": float(child_length),
         "post_fork_suffix_length_normalized": float(suffix_length),
@@ -850,7 +827,416 @@ def _fork_decision_record(
         ),
         "geometry_sha256": digest,
         "preserved_polyline_normalized": child_points.tolist(),
+        **(review_scores or {}),
     }
+
+
+def _independent_fork_evidence(path: RootPath) -> float:
+    """Exclude the extent term from current and legacy fork scores."""
+
+    components = path.score_components
+    independent = components.get("fork_hypothesis_independent_evidence_score")
+    if independent is not None:
+        return float(independent)
+    score = float(components.get("fork_hypothesis_evidence_score", 0.0))
+    selected = components.get("fork_selected_supported_extent")
+    alternate = components.get("fork_alternate_supported_extent")
+    if selected is not None and alternate is not None:
+        extent = selected if components.get("fork_hypothesis_index", 0.0) == 0.0 else alternate
+        score = (score - 0.25 * float(extent) / max(float(selected), float(alternate), 1e-12)) / 0.75
+    return score
+
+
+def _fork_review_scores(
+    *, short_turn: float, long_turn: float,
+    parent_fork_evidence: float, child_fork_evidence: float,
+    parent_length: float, child_length: float, suffix_length: float,
+    alternative_parent_length: float, supervisor_length: float,
+) -> dict[str, float]:
+    """Compare both continuations with a small, bounded length prior.
+
+    Direction contributes 55%, independent fork evidence 35%, and sustained
+    continuation length 10%. Penalize the worst affected parent-child edge
+    by at most 0.05. An independent evidence gain is required before the
+    length prior can influence either the decision or candidate ranking.
+    """
+
+    total = max(child_length + suffix_length, 1e-12)
+    current_independent = (
+        0.55 * (1.0 - np.clip(short_turn / 180.0, 0.0, 1.0))
+        + 0.35 * np.clip(parent_fork_evidence, 0.0, 1.0)
+    )
+    alternative_independent = (
+        0.55 * (1.0 - np.clip(long_turn / 180.0, 0.0, 1.0))
+        + 0.35 * np.clip(child_fork_evidence, 0.0, 1.0)
+    )
+    current = current_independent + 0.10 * suffix_length / total
+    alternative = alternative_independent + 0.10 * child_length / total
+    current_penalty = max(
+        child_parent_length_penalty(child_length, parent_length),
+        child_parent_length_penalty(parent_length, supervisor_length),
+    )
+    alternative_penalty = max(
+        child_parent_length_penalty(suffix_length, alternative_parent_length),
+        child_parent_length_penalty(alternative_parent_length, supervisor_length),
+    )
+    return {
+        "current_evidence_score": float(current),
+        "alternative_evidence_score": float(alternative),
+        "current_length_penalty": current_penalty,
+        "alternative_length_penalty": alternative_penalty,
+        "current_review_score": float(current - current_penalty),
+        "alternative_review_score": float(alternative - alternative_penalty),
+        "independent_evidence_gain": float(alternative_independent - current_independent),
+        "review_score_gain": float(alternative - alternative_penalty - current + current_penalty),
+    }
+
+
+def _fork_flank_directions(parent_points, child_points, insertion_index, spacing):
+    """Compare arm directions outside the shared junction/connector bulge.
+
+    A snapped child starts radially across the parent wall. That connector and
+    the parent's first bend are not independent arm tangents. Use three equal
+    physical windows on both sides with the same exclusion around the fork.
+    """
+    parent_arc = _path_arc(parent_points)
+    child_arc = _path_arc(child_points)
+    insertion = parent_arc[insertion_index]
+    skip = 8.0 * spacing
+    turns = []
+    directions = []
+    for width in (16.0 * spacing, 24.0 * spacing, 32.0 * spacing):
+        incoming = (_point_at_arc(parent_points, parent_arc, insertion - skip)
+                    - _point_at_arc(parent_points, parent_arc, insertion - skip - width))
+        short = (_point_at_arc(parent_points, parent_arc, insertion + skip + width)
+                 - _point_at_arc(parent_points, parent_arc, insertion + skip))
+        long = (_point_at_arc(child_points, child_arc, skip + width)
+                - _point_at_arc(child_points, child_arc, skip))
+        if min(np.linalg.norm(v) for v in (incoming, short, long)) <= spacing:
+            continue
+        turns.append((vector_angle_degrees(incoming, short),
+                      vector_angle_degrees(incoming, long)))
+        directions.append((short, long))
+    if len(turns) < 2:
+        return None
+    return (float(np.median(np.asarray(turns)[:, 0])),
+            float(np.median(np.asarray(turns)[:, 1])),
+            float(np.median([vector_angle_degrees(*pair) for pair in directions])))
+
+
+def _comparable_fork_evidence(parent, child):
+    # Scores from unrelated seed/fork observations are not comparable. Missing
+    # evidence is unknown, rather than a zero-quality arm.
+    if (parent.fork_hypothesis_group is not None
+            and parent.fork_hypothesis_group == child.fork_hypothesis_group
+            and parent.score_components.get("fork_step_index") == child.score_components.get("fork_step_index")):
+        return _independent_fork_evidence(parent), _independent_fork_evidence(child)
+    return 0.0, 0.0
+
+
+def _terminal_mesh_connection(
+    parent_points: np.ndarray,
+    child_points: np.ndarray,
+    *,
+    window: float,
+    radius: float,
+    spacing: float,
+    mesh_points: np.ndarray,
+    mesh_triangles: np.ndarray,
+    mesh_excluded_mask: np.ndarray | None,
+    mesh_tree: cKDTree,
+    mesh_context: MeshGeometryContext | None = None,
+) -> tuple[bool, int]:
+    """Check that both sides of a tip junction share native mesh edges."""
+
+    parent_arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(parent_points, axis=0), axis=1))]
+    child_arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(child_points, axis=0), axis=1))]
+    stations = [
+        _point_at_arc(parent_points, parent_arc, parent_arc[-1] - window * fraction)
+        for fraction in (1.0, 0.75, 0.5, 0.25, 0.0)
+    ] + [
+        _point_at_arc(child_points, child_arc, min(child_arc[-1], window * fraction))
+        for fraction in (0.25, 0.5, 0.75, 1.0)
+    ]
+    search_radius = max(2.5 * radius, 5.0 * spacing)
+    local = set()
+    for station in stations:
+        local.update(mesh_tree.query_ball_point(station, r=search_radius))
+    if mesh_excluded_mask is not None:
+        local.difference_update(np.flatnonzero(mesh_excluded_mask).tolist())
+    if len(local) < 24:
+        return False, len(local)
+    parent_anchor = set(mesh_tree.query_ball_point(stations[0], r=search_radius)) & local
+    child_anchor = set(mesh_tree.query_ball_point(stations[-1], r=search_radius)) & local
+    if len(parent_anchor) < 4 or len(child_anchor) < 4:
+        return False, len(local)
+
+    local_mask = np.zeros(len(mesh_points), dtype=bool)
+    local_mask[np.fromiter(sorted(local), dtype=int)] = True
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    limit = max(4.0 * spacing, 0.75 * radius)
+    if mesh_context is not None:
+        edges = mesh_context.edges
+        eligible = (local_mask[edges[:, 0]] & local_mask[edges[:, 1]]
+                    & (mesh_context.edge_lengths <= limit))
+        edges = edges[eligible]
+    else:
+        triangles = np.asarray(mesh_triangles, dtype=int)
+        edge_groups = []
+        for left, right in ((0, 1), (1, 2), (2, 0)):
+            edges = triangles[:, [left, right]]
+            edges = edges[local_mask[edges[:, 0]] & local_mask[edges[:, 1]]]
+            lengths = np.linalg.norm(mesh_points[edges[:, 0]] - mesh_points[edges[:, 1]], axis=1)
+            edge_groups.append(edges[lengths <= limit])
+        edges = np.vstack(edge_groups)
+    for first, second in edges:
+        adjacency[int(first)].add(int(second))
+        adjacency[int(second)].add(int(first))
+    visited = set(parent_anchor)
+    queue = deque(parent_anchor)
+    while queue:
+        vertex = queue.popleft()
+        if vertex in child_anchor:
+            return True, len(local)
+        for neighbor in adjacency.get(vertex, ()):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+    return False, len(local)
+
+
+def _terminal_continuation_evidence(
+    parent: RootPath,
+    child: RootPath,
+    paths: list[RootPath],
+    *,
+    spacing: float,
+    support_points: np.ndarray,
+    mesh_points: np.ndarray,
+    mesh_triangles: np.ndarray,
+    mesh_excluded_mask: np.ndarray | None,
+    mesh_tree: cKDTree,
+    mesh_context: MeshGeometryContext | None = None,
+) -> dict[str, object]:
+    """Require a single sustained tube beyond a capped parent endpoint."""
+
+    evidence: dict[str, object] = {"status": "rejected", "reason": ""}
+    parent_points = np.asarray(parent.points, dtype=float)
+    child_points = np.asarray(child.points, dtype=float)
+    if "tip_extension_limit" not in parent.qc_flags:
+        evidence["reason"] = "parent_did_not_reach_growth_cap"
+        return evidence
+    if child.insertion_index != len(parent_points) - 1:
+        evidence["reason"] = "attachment_not_at_parent_tip"
+        return evidence
+    if np.linalg.norm(child_points[0] - parent_points[-1]) > 2.0 * spacing:
+        evidence["reason"] = "centerline_tip_gap"
+        return evidence
+    child_length = float(child.length)
+    if child_length < 24.0 * spacing:
+        evidence["reason"] = "continuation_not_sustained"
+        return evidence
+    support_count = float(child.score_components.get(
+        "novel_density_support", len(child.novel_support_indices or child.covered_indices)
+    ))
+    evidence["connected_support"] = support_count
+    if support_count < 30.0:
+        evidence["reason"] = "insufficient_connected_support"
+        return evidence
+
+    cloud = np.asarray(support_points, dtype=float)
+    parent_indices = np.fromiter(
+        sorted(index for index in parent.covered_indices if 0 <= index < len(cloud)), dtype=int
+    )
+    child_indices = np.fromiter(
+        sorted(index for index in (child.novel_support_indices or child.covered_indices)
+               if 0 <= index < len(cloud)), dtype=int
+    )
+    if len(parent_indices) < 30 or len(child_indices) < 30:
+        evidence["reason"] = "owned_surface_support_missing"
+        return evidence
+    parent_profile = estimate_parent_radius_profile(parent_points, cloud[parent_indices], spacing)
+    child_profile = estimate_parent_radius_profile(child_points, cloud[child_indices], spacing)
+    parent_arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(parent_points, axis=0), axis=1))]
+    child_arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(child_points, axis=0), axis=1))]
+    radius_window = max(24.0 * spacing, 4.0 * float(parent_profile[-1]))
+    parent_radius = float(np.median(parent_profile[parent_arc >= parent_arc[-1] - radius_window]))
+    child_radius = float(np.median(child_profile[(child_arc >= 8.0 * spacing) & (child_arc <= radius_window)]))
+    if not np.isfinite(child_radius):
+        evidence["reason"] = "child_radius_unavailable"
+        return evidence
+    radius_ratio = child_radius / max(parent_radius, 1e-12)
+    evidence.update(parent_radius=parent_radius, child_radius=child_radius, radius_ratio=radius_ratio)
+    if not 0.55 <= radius_ratio <= 1.45:
+        evidence["reason"] = "radius_discontinuity"
+        return evidence
+    window = max(24.0 * spacing, 5.0 * parent_radius, 5.0 * child_radius)
+    windows = [min(window * multiplier, 0.85 * child_length) for multiplier in (1.0, 2.0, 3.0)]
+    angles = [
+        vector_angle_degrees(
+            parent_points[-1] - _point_at_arc(parent_points, parent_arc, parent_arc[-1] - min(width, 0.5 * parent_arc[-1])),
+            _point_at_arc(child_points, child_arc, width) - child_points[0],
+        )
+        for width in windows
+    ]
+    evidence["windowed_direction_angles_degrees"] = [float(value) for value in angles]
+    if not np.all(np.isfinite(angles)) or np.median(angles) > 30.0 or max(angles) > 50.0:
+        evidence["reason"] = "windowed_direction_discontinuity"
+        return evidence
+
+    competing = [
+        path for path in paths
+        if path is not child and path.parent_id == parent.root_id
+        and path.insertion_point is not None
+        and np.linalg.norm(np.asarray(path.insertion_point) - parent_points[-1])
+        <= max(3.0 * parent_radius, 8.0 * spacing)
+        and path.length >= max(12.0 * spacing, 2.0 * parent_radius)
+    ]
+    if competing:
+        evidence["reason"] = "competing_supported_tip_arm"
+        evidence["competing_arm_ids"] = sorted(str(path.root_id) for path in competing)
+        return evidence
+    other_support = set().union(*(
+        path.novel_support_indices
+        if path.novel_support_indices is not None else path.covered_indices
+        for path in paths if path is not child and path is not parent
+    ))
+    overlap_fraction = len(set(child_indices.tolist()) & other_support) / len(child_indices)
+    evidence["other_root_support_overlap_fraction"] = float(overlap_fraction)
+    if overlap_fraction > 0.20:
+        evidence["reason"] = "competing_surface_ownership"
+        return evidence
+
+    connected, local_vertices = _terminal_mesh_connection(
+        parent_points, child_points,
+        window=window, radius=max(parent_radius, child_radius), spacing=spacing,
+        mesh_points=mesh_points, mesh_triangles=mesh_triangles,
+        mesh_excluded_mask=mesh_excluded_mask, mesh_tree=mesh_tree,
+        mesh_context=mesh_context,
+    )
+    evidence["local_mesh_vertices"] = local_vertices
+    evidence["native_mesh_connected"] = bool(connected)
+    if not connected:
+        evidence["reason"] = "native_mesh_connection_missing"
+        return evidence
+    evidence.update(status="accepted", reason="supported_terminal_continuation")
+    return evidence
+
+
+def _join_displaced_tip_continuations(primary, paths, *, spacing, support_points,
+                                      mesh_points, mesh_triangles, excluded,
+                                      mesh_context, attachment_status):
+    """Recover an endpoint tube discovered from a neighbouring root's surface.
+
+    Candidate joins require an independently supported transverse connector,
+    native connectivity, radius/direction continuity, and an unambiguous tip.
+    The discarded prefix is only an unresolved attachment, never a child body.
+    """
+    from .centerline import _supported_connector
+
+    decisions = []
+    if support_points is None or mesh_points is None or mesh_triangles is None or not len(mesh_triangles):
+        return decisions
+    _assign_recursive_orders(paths)
+    from .displaced_fork import reroute_displaced_forks
+    decisions.extend(reroute_displaced_forks(paths, spacing=spacing, support_points=support_points,
+        mesh_points=mesh_points, mesh_triangles=mesh_triangles, excluded=excluded,
+        mesh_context=mesh_context, attachment_status=attachment_status))
+    cloud = np.asarray(support_points)
+    tree = mesh_context.point_tree if mesh_context is not None else cKDTree(mesh_points)
+    proposals = []
+    for child in sorted(paths, key=lambda r: str(r.root_id)):
+        if child.order < 2 or len(child.points) < 12 or attachment_status.get(str(child.root_id)) == "accepted":
+            continue
+        cp = np.asarray(child.points)
+        ca = _path_arc(cp)
+        cr = max(float(child.score_components.get("trace_local_radius", 2 * spacing)), spacing)
+        child_tree = cKDTree(cp)
+        child_support = cloud[sorted(child.covered_indices)]
+        for parent in paths:
+            if parent is child or parent.root_id == child.parent_id or parent.order != child.order - 1 or len(parent.points) < 12:
+                continue
+            pp = np.asarray(parent.points)
+            pa = _path_arc(pp)
+            pr = max(float(parent.score_components.get("trace_local_radius", 2 * spacing)), spacing)
+            gap, index = child_tree.query(pp[-1])
+            index = int(index)
+            if (gap > max(16 * spacing, 3 * max(pr, cr)) or index < 1
+                    or ca[index] > min(.25 * ca[-1], max(64 * spacing, 8 * cr))
+                    or ca[-1] - ca[index] < 32 * spacing
+                    or not .55 <= cr / pr <= 1.6):
+                continue
+            # Never trim a separately supported child insertion or merge at a
+            # tip already bearing another sustained arm.
+            if any(r.parent_id == child.root_id and (r.insertion_index or 0) <= index for r in paths):
+                continue
+            if any(r.parent_id == parent.root_id and r.insertion_point is not None
+                   and np.linalg.norm(r.insertion_point - pp[-1]) < max(4 * pr, 12 * spacing)
+                   and r.length > 16 * spacing for r in paths):
+                continue
+            angles = [vector_angle_degrees(
+                pp[-1] - _point_at_arc(pp, pa, pa[-1] - w),
+                _point_at_arc(cp, ca, ca[index] + w) - cp[index],
+            ) for w in (24 * spacing, 40 * spacing, 64 * spacing)]
+            if not np.all(np.isfinite(angles)) or np.median(angles) > 30 or max(angles) > 45:
+                continue
+            former = next((r for r in paths if r.root_id == child.parent_id), None)
+            if former is None or child.insertion_index is None:
+                continue
+            fa = _path_arc(former.points)
+            fi = int(np.clip(child.insertion_index, 0, len(fa) - 1))
+            old_angles = [vector_angle_degrees(
+                former.points[fi] - _point_at_arc(former.points, fa, fa[fi] - w),
+                _point_at_arc(cp, ca, ca[index] + w) - cp[index],
+            ) for w in (24 * spacing, 40 * spacing, 64 * spacing)]
+            if not np.all(np.isfinite(old_angles)) or np.median(old_angles) < np.median(angles) + 15:
+                continue
+            bridge = np.linspace(pp[-1], cp[index], max(3, int(np.ceil(gap / spacing))))
+            parent_support = cloud[sorted(parent.covered_indices)]
+            if gap > 1e-12 and not _supported_connector(bridge, parent_support, child_support, spacing):
+                continue
+            connected, _ = _terminal_mesh_connection(
+                pp, cp[index:], window=40 * spacing, radius=max(pr, cr),
+                spacing=spacing, mesh_points=mesh_points, mesh_triangles=mesh_triangles,
+                mesh_excluded_mask=excluded, mesh_tree=tree, mesh_context=mesh_context,
+            )
+            if connected:
+                proposals.append((parent, child, index, angles, float(gap), old_angles))
+    # All proposals use the same snapshot. Shared endpoints/arms remain QC.
+    counts = defaultdict(int)
+    for parent, child, *_ in proposals:
+        counts[str(parent.root_id)] += 1
+        counts[str(child.root_id)] += 1
+    for parent, child, index, angles, gap, old_angles in proposals:
+        if counts[str(parent.root_id)] != 1 or counts[str(child.root_id)] != 1:
+            continue
+        old_parent = str(child.parent_id)
+        prior_count = len(parent.points)
+        parent.points = np.vstack((parent.points, child.points[index:]))
+        parent.node_indices = None
+        parent.covered_indices |= child.covered_indices
+        parent.novel_support_indices = set(parent.novel_support_indices or ()) | set(child.novel_support_indices or ())
+        parent.qc_flags.append("displaced_tip_continuation_joined")
+        reassessed = []
+        for descendant in paths:
+            if descendant.parent_id == child.root_id:
+                new_index = prior_count + int(descendant.insertion_index) - index
+                descendant.parent_id = parent.root_id
+                descendant.insertion_index = new_index
+                descendant.insertion_point = parent.points[new_index].copy()
+                descendant.points[0] = descendant.insertion_point
+                reassessed.append(str(descendant.root_id))
+        paths[:] = [r for r in paths if r is not child]
+        decisions.append({"parent_id": str(parent.root_id), "absorbed_root_id": str(child.root_id),
+                          "former_parent_id": old_parent, "trimmed_attachment_nodes": index,
+                          "gap_normalized": gap, "windowed_angles_degrees": angles,
+                          "former_parent_direction_angles_degrees": old_angles,
+                          "native_mesh_connected": True, "transverse_connector_supported": True,
+                          "reassessed_descendant_ids": reassessed, "action": "joined",
+                          "parent_ref": parent})
+    _assign_recursive_orders(paths)
+    _refresh_parent_references(primary, paths)
+    return decisions
 
 
 def _reconcile_overlong_forks(
@@ -861,15 +1247,24 @@ def _reconcile_overlong_forks(
     decision_log: list[dict[str, object]] | None = None,
     queue_stats: dict[str, int] | None = None,
     max_iterations: int | None = None,
+    support_points: np.ndarray | None = None,
+    mesh_points: np.ndarray | None = None,
+    mesh_triangles: np.ndarray | None = None,
+    mesh_excluded_mask: np.ndarray | None = None,
+    mesh_context: MeshGeometryContext | None = None,
+    terminal_decision_log: list[dict[str, object]] | None = None,
+    terminal_join_refs: list[tuple[dict[str, object], RootPath]] | None = None,
+    attachment_status_by_root: dict[str, str] | None = None,
 ) -> tuple[list[_ForkArmReconciliation], set[str]]:
     """Resurvey supported fork arms to a deterministic stable result.
 
     Greedy growth can follow the locally straighter, short arm at a fork and
-    rediscover the persistent arm during child tracing. The ordinary length
-    rule would then delete precisely the supported continuation. Reconcile only
-    high-separation internal forks with automatic surface and density evidence.
-    The same child-parent length control is applied to the alternative parent
-    route and its retained short child before committing the swap. Parents
+    rediscover the persistent arm during child tracing. It can also stop at a
+    capped tip and rediscover the same tube as a child. Internal forks require
+    two sustained arms; a terminal join instead requires one connected tube,
+    stable radius and direction, and no competing supported tip arm.
+    Excess child length triggers review and contributes only a small penalty
+    when comparing supported continuations; it never removes a root. Parents
     affected by a swap are put back on a deterministic queue, so a newly
     exposed downstream fork is reviewed in the same call. Every accepted swap
     strictly lengthens the post-fork continuation; pair/state guards and an
@@ -877,6 +1272,7 @@ def _reconcile_overlong_forks(
     """
 
     spacing = float(d_bar)
+    _warn_overlong_children(primary_path, paths)
     primary_length = path_length(np.asarray(primary_path, dtype=float))
     reconciled: list[_ForkArmReconciliation] = []
     reassigned: set[str] = set()
@@ -902,7 +1298,7 @@ def _reconcile_overlong_forks(
                     )
                 )
                 or (
-                    int(path.order) > 1
+                    int(path.order) >= 1
                     and float(
                         path.score_components.get(
                             "novel_density_support",
@@ -924,6 +1320,24 @@ def _reconcile_overlong_forks(
     queued = set(parent_ids)
     seen_swap_pairs: set[tuple[str, str]] = set()
     seen_states: set[tuple[tuple[str, str, int, int], ...]] = set()
+    if mesh_context is not None:
+        if mesh_points is None:
+            raise ValueError("mesh_points are required with mesh_context")
+        mesh_context.validate(mesh_points, mesh_triangles)
+    mesh_tree = (
+        (mesh_context.point_tree if mesh_context is not None else
+         cKDTree(np.asarray(mesh_points, dtype=float)))
+        if support_points is not None and mesh_points is not None
+        and mesh_triangles is not None and len(mesh_triangles)
+        else None
+    )
+    terminal_joins = 0
+    native_unsafe = None
+    if mesh_tree is not None:
+        from .primary_surface import _unsafe_native_vertices
+        native_unsafe = _unsafe_native_vertices(np.asarray(mesh_triangles), len(mesh_points))
+        if mesh_excluded_mask is not None:
+            native_unsafe |= np.asarray(mesh_excluded_mask, bool)
     iteration_limit = int(
         max_iterations
         if max_iterations is not None
@@ -976,6 +1390,131 @@ def _reconcile_overlong_forks(
         )
         if parent.parent_id != PRIMARY_ID and supervisor is None:
             continue
+        if mesh_tree is not None and "tip_extension_limit" in parent.qc_flags:
+            tip_children = sorted(
+                (
+                    child for child in paths
+                    if child.parent_id == parent.root_id
+                    and child.insertion_index == len(parent_points) - 1
+                    and int(child.order) == int(parent.order) + 1
+                    and len(child.points) >= 6
+                ),
+                key=lambda child: (-float(child.length), str(child.root_id)),
+            )
+            for child in tip_children:
+                if (attachment_status_by_root or {}).get(str(child.root_id)) == "accepted":
+                    evidence: dict[str, object] = {
+                        "status": "rejected",
+                        "reason": "separate_attachment_surface_accepted",
+                    }
+                else:
+                    evidence = _terminal_continuation_evidence(
+                        parent, child, paths,
+                        spacing=spacing,
+                        support_points=np.asarray(support_points, dtype=float),
+                        mesh_points=np.asarray(mesh_points, dtype=float),
+                        mesh_triangles=np.asarray(mesh_triangles, dtype=int),
+                        mesh_excluded_mask=mesh_excluded_mask,
+                        mesh_tree=mesh_tree,
+                        mesh_context=mesh_context,
+                    )
+                evidence["joined_length_penalty"] = child_parent_length_penalty(
+                    parent_length + child.length, supervisor_length,
+                )
+                if evidence["status"] == "accepted":
+                    # The union is checked against the established basal path;
+                    # a tip that loops back cannot become its own continuation.
+                    basal = parent_points[:-max(4, int(np.ceil(0.02 * len(parent_points))))]
+                    if len(basal):
+                        gap, _ = cKDTree(basal).query(
+                            np.asarray(child.points[-1], dtype=float), k=1,
+                        )
+                        if float(gap) <= max(4.0 * spacing, 2.0 * float(evidence["parent_radius"])):
+                            evidence.update(status="rejected", reason="continuation_loops_into_parent")
+                child_points = np.asarray(child.points, dtype=float).copy()
+                record: dict[str, object] = {
+                    "parent_id_before_stable_ids": str(parent.root_id),
+                    "child_id_before_stable_ids": str(child.root_id),
+                    "action": "joined" if evidence["status"] == "accepted" else "rejected",
+                    "reason": str(evidence["reason"]),
+                    "resurvey_iteration": int(iterations),
+                    "proposal_generation": int(iterations),
+                    "proposal_snapshot": "frozen_parent_and_candidate_geometry_before_commit",
+                    "parent_length_normalized": float(parent_length),
+                    "candidate_length_normalized": float(child.length),
+                    "parent_geometry_sha256": hashlib.sha256(
+                        parent_points.astype("<f8").tobytes()
+                    ).hexdigest(),
+                    "candidate_geometry_sha256": hashlib.sha256(
+                        child_points.astype("<f8").tobytes()
+                    ).hexdigest(),
+                    "candidate_polyline_normalized": child_points.tolist(),
+                    **{key: value for key, value in evidence.items()
+                       if key not in {"status", "reason"}},
+                }
+                if terminal_decision_log is not None:
+                    terminal_decision_log.append(record)
+                if evidence["status"] != "accepted":
+                    if evidence["reason"] in {
+                        "owned_surface_support_missing",
+                        "child_radius_unavailable",
+                        "competing_supported_tip_arm",
+                        "competing_surface_ownership",
+                        "native_mesh_connection_missing",
+                    } and "terminal_continuation_unresolved" not in child.qc_flags:
+                        child.qc_flags.append("terminal_continuation_unresolved")
+                    continue
+                prior_count = len(parent_points)
+                parent.points = np.vstack([parent_points, child_points[1:]])
+                parent.node_indices = None
+                parent.covered_indices = set(parent.covered_indices) | set(child.covered_indices)
+                if parent.novel_support_indices is not None or child.novel_support_indices is not None:
+                    parent.novel_support_indices = set(parent.novel_support_indices or ()) | set(child.novel_support_indices or ())
+                parent.score_components["terminal_continuation_joined"] = 1.0
+                parent.score_components["terminal_continuation_support"] = float(
+                    evidence["connected_support"]
+                )
+                if "terminal_continuation_joined" not in parent.qc_flags:
+                    parent.qc_flags.append("terminal_continuation_joined")
+                parent.qc_flags = [
+                    flag for flag in parent.qc_flags if flag != "tip_extension_limit"
+                ]
+                if "tip_extension_limit" in child.qc_flags:
+                    parent.qc_flags.append("tip_extension_limit")
+                descendant_ids: list[str] = []
+                for descendant in paths:
+                    if descendant.parent_id != child.root_id:
+                        continue
+                    old_index = int(np.clip(
+                        descendant.insertion_index or 0, 0, len(child_points) - 1,
+                    ))
+                    new_index = prior_count - 1 + old_index
+                    descendant.parent_id = parent.root_id
+                    descendant.parent_points = parent.points
+                    descendant.insertion_index = new_index
+                    descendant.insertion_point = parent.points[new_index].copy()
+                    descendant.points[0] = descendant.insertion_point
+                    descendant_ids.append(str(descendant.root_id))
+                    reassigned.add(str(descendant.root_id))
+                record["reassessed_descendant_ids"] = sorted(descendant_ids)
+                paths[:] = [path for path in paths if path is not child]
+                consumed.add(str(child.root_id))
+                terminal_joins += 1
+                if terminal_join_refs is not None:
+                    terminal_join_refs.append((record, parent))
+                _assign_recursive_orders(paths)
+                _refresh_parent_references(primary_path, paths)
+                reconsideration = [
+                    str(parent.root_id), str(parent.parent_id), *descendant_ids,
+                ]
+                record["reevaluation_requested_root_ids"] = list(
+                    dict.fromkeys(reconsideration)
+                )
+                for root_id in reconsideration:
+                    enqueue(root_id)
+                break
+            if len(parent.points) != len(parent_points):
+                continue
         candidates: list[tuple[float, float, RootPath, dict[str, object]]] = []
         for child in paths:
             if (
@@ -998,21 +1537,21 @@ def _reconcile_overlong_forks(
             suffix_length = parent_length - insertion_arc
             long_to_suffix_ratio = child_length / max(suffix_length, 1e-12)
             continuation_improvement = child_length - suffix_length
-            whole_parent_violation = child_length_exceeds_parent(
+            overlong_child = child_length_exceeds_parent(
                 child_length,
                 parent_length,
             )
             suffix_dominance = bool(
                 continuation_improvement
                 > max(8.0 * spacing, 0.05 * parent_length)
-                and long_to_suffix_ratio >= 2.5
+                and long_to_suffix_ratio >= 2.25
             )
             early_termination = bool(
                 suffix_length
                 <= max(0.55 * child_length, 24.0 * spacing)
             )
-            if whole_parent_violation:
-                trigger = "whole_parent_length_violation"
+            if overlong_child:
+                trigger = "child_longer_than_parent_warning"
             elif suffix_dominance and early_termination:
                 trigger = "post_fork_suffix_dominance_and_early_termination"
             else:
@@ -1045,7 +1584,7 @@ def _reconcile_overlong_forks(
                 )
                 continue
             minimum_insertion_fraction = (
-                0.50 if whole_parent_violation else 0.30
+                0.50 if overlong_child else 0.30
             )
             if insertion_arc < max(
                 12.0 * spacing,
@@ -1067,7 +1606,17 @@ def _reconcile_overlong_forks(
                     )
                 )
                 continue
-            if suffix_length < max(
+            surface_evidence = None
+            if mesh_tree is not None and support_points is not None:
+                from .fork_evidence import native_fork_surface_evidence
+                surface_evidence = native_fork_surface_evidence(
+                    parent, child, insertion_index, support_points, spacing,
+                    mesh_tree, native_unsafe,
+                )
+            surface_advantage = bool(surface_evidence is not None
+                and surface_evidence['surface_evidence_gain'] >= .10
+                and surface_evidence['long_arm_radius_similarity'] >= .72)
+            if not surface_advantage and suffix_length < max(
                 8.0 * spacing,
                 0.03 * parent_length,
             ):
@@ -1089,31 +1638,16 @@ def _reconcile_overlong_forks(
                 continue
 
             alternative_parent_length = insertion_arc + child_length
-            if (
-                child_length_exceeds_parent(
-                    alternative_parent_length,
-                    supervisor_length,
-                )
-                or child_length_exceeds_parent(
-                    suffix_length,
-                    alternative_parent_length,
-                )
-            ):
-                decisions.append(
-                    _fork_decision_record(
-                        parent,
-                        child,
-                        action="rejected",
-                        reason="alternative_parent_length_control",
-                        trigger=trigger,
-                        iteration=iterations,
-                        parent_length=parent_length,
-                        child_length=child_length,
-                        suffix_length=suffix_length,
-                        insertion_arc=insertion_arc,
-                        support=support,
-                    )
-                )
+            # Every swap must still lengthen the continuation, so the queue
+            # cannot oscillate. Excess relative to the supervisor is a prior.
+            if continuation_improvement <= max(8.0 * spacing, 0.05 * parent_length):
+                decisions.append(_fork_decision_record(
+                    parent, child, action="rejected",
+                    reason="continuation_not_longer_after_swap", trigger=trigger,
+                    iteration=iterations, parent_length=parent_length,
+                    child_length=child_length, suffix_length=suffix_length,
+                    insertion_arc=insertion_arc, support=support,
+                ))
                 continue
 
             window = max(16.0 * spacing, 0.04 * parent_length)
@@ -1153,20 +1687,14 @@ def _reconcile_overlong_forks(
                 prefix_direction,
                 long_direction,
             )
-            child_fork_evidence = float(
-                child.score_components.get(
-                    "fork_hypothesis_evidence_score",
-                    0.0,
-                )
+            parent_fork_evidence, child_fork_evidence = _comparable_fork_evidence(parent, child)
+            flank = _fork_flank_directions(
+                parent_points, child_points, insertion_index, spacing,
             )
-            parent_fork_evidence = float(
-                parent.score_components.get(
-                    "fork_hypothesis_evidence_score",
-                    0.0,
-                )
-            )
+            if flank is not None:
+                short_turn, long_turn, flank_angle = flank
             if (
-                not whole_parent_violation
+                not surface_advantage
                 and np.isfinite(short_turn)
                 and np.isfinite(long_turn)
                 and float(long_turn) > float(short_turn) + 35.0
@@ -1190,9 +1718,11 @@ def _reconcile_overlong_forks(
                 )
                 continue
             arm_angle = vector_angle_degrees(short_direction, long_direction)
+            if flank is not None:
+                arm_angle = flank_angle
             if (
                 not np.isfinite(arm_angle)
-                or float(arm_angle) < 45.0
+                or (float(arm_angle) < 45.0 and not surface_advantage)
                 or float(arm_angle) > 135.0
             ):
                 decisions.append(
@@ -1234,6 +1764,73 @@ def _reconcile_overlong_forks(
                     )
                 )
                 continue
+            review_scores = _fork_review_scores(
+                short_turn=float(short_turn), long_turn=float(long_turn),
+                parent_fork_evidence=parent_fork_evidence,
+                child_fork_evidence=child_fork_evidence,
+                parent_length=parent_length, child_length=child_length,
+                suffix_length=suffix_length,
+                alternative_parent_length=alternative_parent_length,
+                supervisor_length=supervisor_length,
+            )
+            if surface_advantage:
+                # Direction at a swollen junction can follow its circumference.
+                # Measured tube caliber is independent of candidate extent and
+                # may identify the continuation through a legitimate bend.
+                matched = bool(parent.fork_hypothesis_group is not None
+                    and parent.fork_hypothesis_group == child.fork_hypothesis_group
+                    and parent.score_components.get('fork_step_index') == child.score_components.get('fork_step_index'))
+                surface_weight = .40 if matched else .75
+                fork_weight = .35 if matched else 0.
+                current = (.25 * (1 - short_turn / 180.)
+                    + surface_weight * surface_evidence['short_arm_surface_score']
+                    + fork_weight * parent_fork_evidence)
+                alternate = (.25 * (1 - long_turn / 180.)
+                    + surface_weight * surface_evidence['long_arm_surface_score']
+                    + fork_weight * child_fork_evidence)
+                total = max(child_length + suffix_length, spacing)
+                review_scores.update(
+                    current_evidence_score=current + .10 * suffix_length / total,
+                    alternative_evidence_score=alternate + .10 * child_length / total,
+                    independent_evidence_gain=alternate - current,
+                    current_review_score=current + .10 * suffix_length / total - review_scores['current_length_penalty'],
+                    alternative_review_score=alternate + .10 * child_length / total - review_scores['alternative_length_penalty'],
+                )
+                review_scores['review_score_gain'] = review_scores['alternative_review_score'] - review_scores['current_review_score']
+                review_scores.update(surface_evidence)
+            if mesh_tree is not None:
+                radius = max(float(child.score_components.get("trace_local_radius", 2 * spacing)),
+                             float(parent.score_components.get("trace_local_radius", 2 * spacing)))
+                connected, _ = _terminal_mesh_connection(
+                    parent_points[:insertion_index + 1], child_points,
+                    window=32 * spacing, radius=radius, spacing=spacing,
+                    mesh_points=mesh_points, mesh_triangles=mesh_triangles,
+                    mesh_excluded_mask=mesh_excluded_mask, mesh_tree=mesh_tree,
+                    mesh_context=mesh_context,
+                )
+                if not connected:
+                    decisions.append(_fork_decision_record(
+                        parent, child, action="rejected", reason="native_mesh_connection_missing",
+                        trigger=trigger, iteration=iterations, parent_length=parent_length,
+                        child_length=child_length, suffix_length=suffix_length,
+                        insertion_arc=insertion_arc, support=support, review_scores=review_scores,
+                    ))
+                    continue
+            if (
+                not all(np.isfinite(value) for value in review_scores.values())
+                or review_scores["independent_evidence_gain"] <= FORK_RESURVEY_MIN_EVIDENCE_GAIN
+                or review_scores["review_score_gain"] <= FORK_RESURVEY_MIN_EVIDENCE_GAIN
+            ):
+                decisions.append(_fork_decision_record(
+                    parent, child, action="rejected",
+                    reason="existing_continuation_not_worse", trigger=trigger,
+                    iteration=iterations, parent_length=parent_length,
+                    child_length=child_length, suffix_length=suffix_length,
+                    insertion_arc=insertion_arc, support=support,
+                    arm_angle=float(arm_angle), departure=departure,
+                    review_scores=review_scores,
+                ))
+                continue
             evidence = {
                 "insertion_index": float(insertion_index),
                 "parent_order": float(parent.order),
@@ -1258,9 +1855,10 @@ def _reconcile_overlong_forks(
                 "continuation_improvement": continuation_improvement,
                 "long_to_suffix_ratio": long_to_suffix_ratio,
                 "resurvey_iteration": float(iterations),
+                **review_scores,
             }
             candidates.append(
-                (long_to_suffix_ratio, support, child, evidence)
+                (review_scores["review_score_gain"], support, child, evidence)
             )
 
         if not candidates:
@@ -1269,6 +1867,36 @@ def _reconcile_overlong_forks(
             candidates,
             key=lambda item: (item[0], item[1], str(item[2].root_id)),
         )
+        # All alternatives for this parent were scored against the same path
+        # snapshot. Preserve the losing proposals before the winning geometry
+        # is committed, so later reviews can distinguish rejection from a
+        # candidate that was never examined.
+        for _, loser_support, loser, loser_evidence in candidates:
+            if loser is long_child:
+                continue
+            loser_record = _fork_decision_record(
+                parent, loser, action="deferred",
+                reason="lower_ranked_frozen_proposal",
+                trigger=str(loser_evidence["trigger"]),
+                iteration=iterations, parent_length=parent_length,
+                child_length=float(loser_evidence["long_arm_length"]),
+                suffix_length=float(loser_evidence["short_arm_length"]),
+                insertion_arc=float(loser_evidence["insertion_arc"]),
+                support=float(loser_support),
+                arm_angle=float(loser_evidence["arm_angle_degrees"]),
+                departure=float(loser_evidence["long_arm_departure"]),
+                review_scores={key: float(loser_evidence[key]) for key in (
+                    "current_evidence_score", "alternative_evidence_score",
+                    "current_length_penalty", "alternative_length_penalty",
+                    "current_review_score", "alternative_review_score",
+                    "independent_evidence_gain", "review_score_gain",
+                )},
+            )
+            loser_record["selected_candidate_arm_id"] = str(long_child.root_id)
+            decisions.append(loser_record)
+        parent_snapshot_digest = hashlib.sha256(
+            parent_points.astype("<f8").tobytes()
+        ).hexdigest()
         seen_swap_pairs.add((str(parent.root_id), str(long_child.root_id)))
         insertion_index = int(evidence["insertion_index"])
         junction = parent_points[insertion_index].copy()
@@ -1383,9 +2011,11 @@ def _reconcile_overlong_forks(
             descendant.insertion_index = new_index
             descendant.insertion_point = new_parent.points[new_index].copy()
             descendant.points[0] = descendant.insertion_point
+            # An unchanged parent ID can still have a changed path or
+            # insertion point after the swap. Revisit that child's fork too.
+            affected_descendants.append(str(descendant.root_id))
             if descendant.parent_id != old_parent_id:
                 changed_descendants += 1
-                affected_descendants.append(str(descendant.root_id))
                 reassigned.add(str(descendant.root_id))
                 descendant.score_components[
                     "fork_descendant_attachment_reassessed"
@@ -1447,8 +2077,7 @@ def _reconcile_overlong_forks(
             cycle_states += 1
         else:
             seen_states.add(state)
-        decisions.append(
-            _fork_decision_record(
+        accepted_record = _fork_decision_record(
                 parent,
                 long_child,
                 action="accepted",
@@ -1463,11 +2092,17 @@ def _reconcile_overlong_forks(
                 arm_angle=float(evidence["arm_angle_degrees"]),
                 departure=float(evidence["long_arm_departure"]),
                 preserved_points=long_points,
-            )
+                parent_geometry_sha256=parent_snapshot_digest,
+                review_scores={key: float(evidence[key]) for key in (
+                    "current_evidence_score", "alternative_evidence_score",
+                    "current_length_penalty", "alternative_length_penalty",
+                    "current_review_score", "alternative_review_score",
+                    "independent_evidence_gain", "review_score_gain",
+                )},
         )
-        enqueue(str(parent.root_id))
-        enqueue(str(long_child.root_id))
-        enqueue(str(parent.parent_id))
+        reconsideration = [
+            str(parent.root_id), str(long_child.root_id), str(parent.parent_id),
+        ]
         for descendant_id in affected_descendants:
             descendant = next(
                 (
@@ -1478,14 +2113,29 @@ def _reconcile_overlong_forks(
                 None,
             )
             if descendant is not None:
-                enqueue(str(descendant.parent_id))
-                enqueue(str(descendant.root_id))
+                reconsideration.extend([
+                    str(descendant.parent_id), str(descendant.root_id),
+                ])
+        accepted_record["reevaluation_requested_root_ids"] = list(
+            dict.fromkeys(reconsideration)
+        )
+        if "surface_evidence_gain" in evidence:
+            accepted_record["native_surface_evidence"] = {
+                key: float(value) for key, value in evidence.items()
+                if ("surface" in key or "section" in key or "radius_similarity" in key
+                    or key == "closed_cap_evidence")
+            }
+        decisions.append(accepted_record)
+        for root_id in reconsideration:
+            enqueue(root_id)
 
     if queue_stats is not None:
         queue_stats["iterations"] = int(iterations)
         queue_stats["cycle_states"] = int(cycle_states)
         queue_stats["iteration_limit"] = int(iteration_limit)
         queue_stats["remaining_items"] = int(len(work_queue))
+        queue_stats["terminal_continuation_joins"] = int(terminal_joins)
+    _warn_overlong_children(primary_path, paths, fork_decisions=decisions)
     return reconciled, reassigned
 
 
@@ -1556,6 +2206,11 @@ def repair_root_hierarchy(
     gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
     primary_top_reference: np.ndarray | None = None,
     attachment_evidence: dict[str, object] | None = None,
+    support_points: np.ndarray | None = None,
+    mesh_points: np.ndarray | None = None,
+    mesh_triangles: np.ndarray | None = None,
+    mesh_excluded_mask: np.ndarray | None = None,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> tuple[list[RootPath], TopologyReport]:
     """Orient, attach, validate, and deterministically label a root tree.
 
@@ -1818,7 +2473,16 @@ def repair_root_hierarchy(
     )
     reassigned_roots.update(duplicate_promotions)
     _refresh_parent_references(primary_path, repaired)
+    displaced_joins = _join_displaced_tip_continuations(
+        primary_path, repaired, spacing=d_bar, support_points=support_points,
+        mesh_points=mesh_points, mesh_triangles=mesh_triangles,
+        excluded=mesh_excluded_mask, mesh_context=mesh_context,
+        attachment_status={root_id: str(row.get("status", ""))
+                           for root_id, row in latest_attachment.items()},
+    )
     fork_decisions: list[dict[str, object]] = []
+    terminal_decisions: list[dict[str, object]] = []
+    terminal_join_refs: list[tuple[dict[str, object], RootPath]] = []
     fork_queue_stats: dict[str, int] = {}
     fork_reconciliations, fork_reassignments = (
         _reconcile_overlong_forks(
@@ -1827,12 +2491,38 @@ def repair_root_hierarchy(
             d_bar=d_bar,
             decision_log=fork_decisions,
             queue_stats=fork_queue_stats,
+            support_points=support_points,
+            mesh_points=mesh_points,
+            mesh_triangles=mesh_triangles,
+            mesh_excluded_mask=mesh_excluded_mask,
+            mesh_context=mesh_context,
+            terminal_decision_log=terminal_decisions,
+            terminal_join_refs=terminal_join_refs,
+            attachment_status_by_root={
+                root_id: str(row.get("status", ""))
+                for root_id, row in latest_attachment.items()
+            },
         )
     )
     reassigned_roots.update(fork_reassignments)
     _assign_recursive_orders(repaired)
+    roots_before_stable_ids = {str(path.root_id): path for path in repaired}
     _assign_stable_ids(repaired)
+    for decision in displaced_joins:
+        decision["final_parent_id"] = str(decision.pop("parent_ref").root_id)
+    report.displaced_tip_continuation_decisions = displaced_joins
+    for decision in fork_decisions:
+        candidate = roots_before_stable_ids.get(str(decision["candidate_arm_id"]))
+        if candidate is not None:
+            decision["final_candidate_arm_id"] = str(candidate.root_id)
     _refresh_parent_references(primary_path, repaired)
+    for decision, parent in terminal_join_refs:
+        decision["final_parent_id"] = str(parent.root_id)
+        decision["final_parent_order"] = int(parent.order)
+    report.terminal_continuation_joins = int(
+        fork_queue_stats.get("terminal_continuation_joins", 0)
+    )
+    report.terminal_continuation_decisions = terminal_decisions
     report.fork_arms_reconciled = len(fork_reconciliations)
     report.fork_arm_details = [
         {
@@ -1869,17 +2559,6 @@ def repair_root_hierarchy(
     )
     report.fork_resurvey_decisions = fork_decisions
     report.parents_reassigned = len(reassigned_roots)
-    (
-        repaired,
-        report.overlong_child_details,
-        report.overlong_descendants_removed,
-    ) = _prune_overlong_child_subtrees(
-        primary_path,
-        repaired,
-        fork_decisions=fork_decisions,
-    )
-    report.overlong_children_removed = len(report.overlong_child_details)
-    report.unresolved_long_arm_details = list(report.overlong_child_details)
     repaired, final_above_top_details, final_above_top_descendants = (
         _prune_above_primary_top_subtrees(
             top_reference_path,
@@ -1893,6 +2572,17 @@ def repair_root_hierarchy(
     )
     report.origins_above_primary_top_removed = len(
         report.above_primary_top_details
+    )
+    report.overlong_child_details = _warn_overlong_children(
+        primary_path, repaired, fork_decisions=fork_decisions,
+    )
+    report.overlong_children_warned = len(report.overlong_child_details)
+    report.unresolved_long_arm_details = list(report.overlong_child_details)
+    report.warnings.extend(
+        f"{row['root_id']}: centreline length {row['child_length_normalized']:.9g} "
+        f"exceeds parent {row['parent_id']} length {row['parent_length_normalized']:.9g}; "
+        "retained for junction review"
+        for row in report.overlong_child_details
     )
     report.low_confidence_roots = sum(
         float(path.confidence) < 0.55 for path in repaired
@@ -1979,30 +2669,6 @@ def validate_root_tree(
                     f"{path.root_id}: lateral origin is {excess:.9g} above "
                     "the primary-root top along the configured up direction"
                 )
-        parent_length: float | None = None
-        if path.parent_id == PRIMARY_ID:
-            reference = (
-                primary_reference
-                if primary_reference is not None
-                else (
-                    np.asarray(path.parent_points, dtype=float)
-                    if path.parent_points is not None
-                    else None
-                )
-            )
-            if reference is not None and reference.ndim == 2 and len(reference) >= 2:
-                parent_length = path_length(reference)
-        else:
-            parent_length = float(by_id[path.parent_id].length)
-        child_length = float(path.length)
-        if (
-            parent_length is not None
-            and child_length_exceeds_parent(child_length, parent_length)
-        ):
-            errors.append(
-                f"{path.root_id}: centreline length {child_length:.9g} exceeds "
-                f"parent {path.parent_id} length {parent_length:.9g}"
-            )
     if not nx.is_directed_acyclic_graph(graph):
         errors.append("root hierarchy contains a cycle")
     unreachable = set(graph.nodes) - set(nx.descendants(graph, PRIMARY_ID)) - {PRIMARY_ID}
@@ -2274,6 +2940,7 @@ def apply_hierarchy_corrections(
     )
     if errors:
         raise ValueError("Invalid corrected hierarchy: " + "; ".join(errors))
+    _warn_overlong_children(primary_path, kept)
     return kept
 
 

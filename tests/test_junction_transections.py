@@ -33,6 +33,21 @@ def test_surface_onset_can_differ_from_internal_insertion():
     assert np.all(result[(case[0][:,0]>.06)&(case[0][:,0]<.095)]==1)
 
 
+def test_independent_primary_wall_evidence_prevents_reclaiming_a_flat_patch():
+    case = junction()
+    p, before, _, _, _, n = case
+    # Geometry-only flank trimming sees this exterior as a branch. Earlier
+    # native transverse evidence has certified part of it as parent wall.
+    protected = ((np.arange(len(p)) >= n) & (before == 0)
+                 & (p[:, 0] >= .055) & (p[:, 0] < .08))
+    ordinary, _ = run(case)
+    assert np.any(ordinary[protected] == 1)
+    result, report = run(case, protected_primary_mask=protected)
+    assert np.all(result[protected] == 0)
+    assert report['protected_primary_vertex_count'] == int(protected.sum())
+    assert report['transferred_vertex_count'] > 0
+
+
 def test_missing_mesh_contact_is_not_replaced_by_spatial_proximity():
     case=list(junction())
     p,_,_,_,faces,_=case

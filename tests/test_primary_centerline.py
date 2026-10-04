@@ -2,8 +2,10 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from scipy.spatial import cKDTree
 
+import soyrootbio.primary as primary_module
 from soyrootbio.geometry import mean_nearest_neighbor_distance
 from soyrootbio.primary import cluster_hdbscan, refine_primary_centerline, tangent_plane_primary_segmentation
 
@@ -140,3 +142,36 @@ def test_two_pass_primary_segmentation_completes_an_off_wall_collar():
     completed_collar_fraction = completed_mask.reshape(len(z), len(angles))[:12].mean()
     assert completed_collar_fraction > 0.90
     assert completed_collar_fraction > first_collar_fraction + 0.20
+
+
+def test_primary_segmentation_reuses_only_the_same_ordered_point_tree(monkeypatch):
+    points, centerline, surface_path = _curved_tube()
+    d_bar = mean_nearest_neighbor_distance(points)
+    expected_first = tangent_plane_primary_segmentation(points, surface_path, d_bar)
+    expected_second = tangent_plane_primary_segmentation(
+        points, centerline, d_bar, complete_cross_section=True,
+    )
+
+    shared_tree = cKDTree(points)
+    original_constructor = primary_module.cKDTree
+
+    def reject_point_tree_rebuild(data, *args, **kwargs):
+        if len(data) == len(points):
+            raise AssertionError("the unchanged point tree was rebuilt")
+        return original_constructor(data, *args, **kwargs)
+
+    monkeypatch.setattr(primary_module, "cKDTree", reject_point_tree_rebuild)
+    actual_first = tangent_plane_primary_segmentation(
+        points, surface_path, d_bar, point_tree=shared_tree,
+    )
+    actual_second = tangent_plane_primary_segmentation(
+        points, centerline, d_bar, complete_cross_section=True,
+        point_tree=shared_tree,
+    )
+    np.testing.assert_array_equal(actual_first, expected_first)
+    np.testing.assert_array_equal(actual_second, expected_second)
+
+    with pytest.raises(ValueError, match="same ordered points"):
+        tangent_plane_primary_segmentation(
+            points, surface_path, d_bar, point_tree=cKDTree(points[::-1]),
+        )

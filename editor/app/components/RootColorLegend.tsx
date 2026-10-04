@@ -1,6 +1,7 @@
 import { ROOT_EXPORT_COLORS, rgbToCss } from "../lib/rootColors";
 
 const LEGEND_ITEMS = [
+  { label: "Nodule", order: "N", color: ROOT_EXPORT_COLORS.nodule },
   { label: "Primary", order: "O0", color: ROOT_EXPORT_COLORS.primary },
   { label: "First order", order: "O1", color: ROOT_EXPORT_COLORS.order1 },
   { label: "Second order", order: "O2", color: ROOT_EXPORT_COLORS.order2 },

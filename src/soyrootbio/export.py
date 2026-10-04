@@ -18,9 +18,11 @@ from .io import write_labeled_ply, write_point_cloud
 from .topology import hierarchy_frame, write_editable_hierarchy
 from .traits import angle_vectors_frame, lateral_counts_frame, trait_summary_frame
 from .types import Normalization, RootPath, TopologyReport
+from .nodules import NODULE_COLOR, NoduleResult, export_nodules, geometry_digest
 
 
 SEGMENT_COLORS = {
+    "nodule": NODULE_COLOR,
     "unassigned": np.array([0.55, 0.55, 0.55]),
     "uncertain": np.array([0.98, 0.48, 0.05]),
     "primary": np.array([0.05, 0.23, 0.88]),
@@ -52,6 +54,7 @@ def export_results(
     triangles: np.ndarray | None = None,
     full_root_labels: np.ndarray | None = None,
     topology_report: TopologyReport | None = None,
+    nodules: NoduleResult | None = None,
 ) -> None:
     """Write measurement, topology, provenance, figure-input, and PLY outputs."""
 
@@ -69,6 +72,17 @@ def export_results(
     lateral_skeletons.to_csv(output_dir / "lateral_skeletons.csv", index=False)
 
     tables = _trait_tables(traits, lateral_paths, normalization, primary_path)
+    if nodules is not None:
+        nodules.evidence["geometry_sha256"] = geometry_digest(full_points if full_points is not None else original_points)
+        nodule_traits, nodule_summary, nodule_depth = export_nodules(output_dir, nodules)
+        tables.update({"nodule_traits.csv": nodule_traits, "nodule_summary.csv": nodule_summary,
+                       "nodule_depth_distribution.csv": nodule_depth})
+        metadata["nodule_analysis"] = {k: v for k, v in nodules.public().items() if k != "objects"}
+        nodule_map = pd.DataFrame([{"numeric_label": o["numeric_label"], "root_id": o["nodule_id"],
+                                    "parent_id": "", "root_order": "", "color_rgb": "255,244,179"}
+                                   for o in nodules.objects if o["status"] == "accepted"])
+        if len(nodule_map):
+            tables["root_label_map.csv"] = pd.concat([tables["root_label_map.csv"], nodule_map], ignore_index=True)
     traits.to_csv(output_dir / "root_traits.csv", index=False)
     for filename, frame in tables.items():
         frame.to_csv(csv_dir / filename, index=False)
@@ -397,6 +411,9 @@ def _write_trait_workbook(path: Path, traits: pd.DataFrame, tables: dict[str, pd
         "root_topology.csv": "Topology",
         "root_qc.csv": "QC",
         "root_label_map.csv": "Label map",
+        "nodule_traits.csv": "Nodules",
+        "nodule_summary.csv": "Nodule summary",
+        "nodule_depth_distribution.csv": "Nodule depth",
     }
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         traits.to_excel(writer, sheet_name="Root traits", index=False)
@@ -510,6 +527,9 @@ def _label_properties(labels: np.ndarray, paths: list[RootPath]) -> tuple[np.nda
     colors[uncertain] = SEGMENT_COLORS["uncertain"]
     orders[uncertain] = 254
     states[uncertain] = 2
+    nodules = labels <= -3
+    colors[nodules] = NODULE_COLOR
+    states[nodules] = 3
     primary = labels == 0
     colors[primary] = SEGMENT_COLORS["primary"]
     orders[primary] = 0
@@ -528,6 +548,7 @@ def _write_class_point_clouds(output_dir: Path, points: np.ndarray, labels: np.n
         "lateral_points.ply": labels > 0,
         "unassigned_points.ply": labels == -1,
         "uncertain_points.ply": labels == -2,
+        "nodule_points.ply": labels <= -3,
     }
     for filename, mask in masks.items():
         if np.any(mask):

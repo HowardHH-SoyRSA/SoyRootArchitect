@@ -13,6 +13,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
+from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
+
 from .surface_patches import _polyline_projection_distance_and_arc as project
 from .types import RootPath
 
@@ -77,7 +79,8 @@ def _manifold_vertex_links(faces: np.ndarray, incidence, vertices: np.ndarray) -
 
 
 def _exposed_radius(points: np.ndarray, labels: np.ndarray, label: int,
-                    root: RootPath, spacing: float) -> tuple[float | None, str, dict]:
+                    root: RootPath, spacing: float,
+                    support_indices: np.ndarray | None = None) -> tuple[float | None, str, dict]:
     path = np.asarray(root.points, float)
     start = int(root.body_start_index)
     if start < 0 or start >= len(path) or len(path[start:]) < 3:
@@ -86,7 +89,7 @@ def _exposed_radius(points: np.ndarray, labels: np.ndarray, label: int,
     arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(body, axis=0), axis=1))]
     if arc[-1] < 12 * spacing:
         return None, "insufficient_stable_length", {}
-    support = points[labels == label]
+    support = points[labels == label] if support_indices is None else points[support_indices]
     if len(support) < 24:
         return None, "insufficient_exposed_surface", {}
     distance, station = project(support, body)
@@ -135,6 +138,7 @@ def assess_attachment_footprints(
     excluded_mask: np.ndarray | None = None,
     bounds: AttachmentBounds = AttachmentBounds(),
     include_competitors: bool = False,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> dict:
     """Assess every current parent from the same frozen mesh and labels.
 
@@ -171,33 +175,37 @@ def assess_attachment_footprints(
                                         "status": "unresolved_no_mesh"})
         return report
     good_face = ~excluded[faces].any(axis=1) & (owner[faces] >= 0).all(axis=1)
-    area = .5 * np.linalg.norm(np.cross(p[faces[:, 1]] - p[faces[:, 0]],
-                                       p[faces[:, 2]] - p[faces[:, 0]]), axis=1)
+    if mesh_context is not None:
+        mesh_context.validate(p, faces)
+        area = mesh_context.face_areas
+        centroids = mesh_context.face_centroids
+        tree = mesh_context.centroid_tree
+        face_incidence = mesh_context.vertex_face_incidence
+        mesh_edges = mesh_context.edges
+        mesh_incidence = mesh_context.edge_incidence
+        mesh_edge_length = mesh_context.edge_lengths
+    else:
+        area = .5 * np.linalg.norm(np.cross(p[faces[:, 1]] - p[faces[:, 0]],
+                                           p[faces[:, 2]] - p[faces[:, 0]]), axis=1)
+        centroids = p[faces].mean(axis=1)
+        tree = cKDTree(centroids)
+        face_incidence = coo_matrix(
+            (np.ones(3*len(faces)),
+             (faces.ravel(), np.repeat(np.arange(len(faces)), 3))),
+            shape=(len(p), len(faces))).tocsr()
+        all_edges = _edge_rows(faces)
+        mesh_edges, mesh_incidence = np.unique(all_edges, axis=0, return_counts=True)
+        mesh_edge_length = np.linalg.norm(p[mesh_edges[:, 0]] - p[mesh_edges[:, 1]], axis=1)
     good_face &= area > 1e-12 * d_bar**2
-    centroids = p[faces].mean(axis=1)
-    tree = cKDTree(centroids)
-    face_incidence = coo_matrix(
-        (np.ones(3*len(faces)),
-         (faces.ravel(), np.repeat(np.arange(len(faces)), 3))),
-        shape=(len(p), len(faces))).tocsr()
-    all_edges = _edge_rows(faces)
-    mesh_edges, mesh_incidence = np.unique(all_edges, axis=0, return_counts=True)
-    mesh_edge_length = np.linalg.norm(p[mesh_edges[:, 0]] - p[mesh_edges[:, 1]], axis=1)
     parent_paths = {"primary": np.asarray(primary_path, float)}
     parent_paths.update({str(root.root_id): np.asarray(root.points, float) for root in roots})
     root_by_id = {str(root.root_id): root for root in roots}
     label_by_id = {"primary": 0, **{str(root.root_id): i for i, root in enumerate(roots, 1)}}
     frozen = owner.copy()
     frozen[excluded] = -1
-    support_edges = mesh_edges[(mesh_edge_length <= 4*d_bar)
-                               & (frozen[mesh_edges[:, 0]] == frozen[mesh_edges[:, 1]])
-                               & (frozen[mesh_edges[:, 0]] >= 0)]
-    support_graph = coo_matrix(
-        (np.ones(2*len(support_edges)),
-         (np.r_[support_edges[:, 0], support_edges[:, 1]],
-          np.r_[support_edges[:, 1], support_edges[:, 0]])),
-        shape=(len(p), len(p))).tocsr()
-    _, support_component = connected_components(support_graph, directed=False)
+    ownership = (mesh_context.ownership(frozen) if mesh_context is not None
+                 else OwnershipGeometryGeneration(frozen, p))
+    support_component = ownership.components(mesh_edges[mesh_edge_length <= 4*d_bar])
     for child_label, child in enumerate(roots, 1):
         row = {"root_id": str(child.root_id), "parent_id": str(child.parent_id)}
         report["junctions"].append(row)
@@ -205,7 +213,9 @@ def assess_attachment_footprints(
         if parent_id not in parent_paths or parent_id == str(child.root_id):
             row["status"] = "unresolved_parent_missing"
             continue
-        radius, radius_status, radius_meta = _exposed_radius(p, frozen, child_label, child, d_bar)
+        child_indices = ownership.vertices(child_label)
+        radius, radius_status, radius_meta = _exposed_radius(
+            p, frozen, child_label, child, d_bar, support_indices=child_indices)
         row["radius_evidence"] = radius_meta
         if radius is None:
             row["status"] = "unresolved_" + radius_status
@@ -217,7 +227,7 @@ def assess_attachment_footprints(
         tangent = body[step] - body[0]
         tangent /= max(float(np.linalg.norm(tangent)), np.finfo(float).tiny)
         # Require an actually observed proximal child cross-section.
-        child_surface = p[frozen == child_label]
+        child_surface = p[child_indices]
         _, child_station = project(child_surface, body)
         section_at = min(max(radius, 3*d_bar), .25 * body_arc[-1])
         near_section = np.abs(child_station - section_at) <= max(.5 * radius, 2*d_bar)
@@ -318,7 +328,6 @@ def assess_attachment_footprints(
             continue
         contact_child_vertices = np.unique(patch_edges[contact][
             owner[patch_edges[contact]] == child_label])
-        child_indices = np.flatnonzero(frozen == child_label)
         distal_indices = child_indices[child_station >= float(radius_meta["stable_arc_start"])]
         if not len(distal_indices) or not np.intersect1d(
             support_component[contact_child_vertices],
@@ -479,7 +488,8 @@ def mark_final_attachment_qc(roots: list[RootPath], report: dict) -> None:
 def restrict_rejected_contacts(labels: np.ndarray, report: dict,
                               roots: list[RootPath], points: np.ndarray, *,
                               triangles: np.ndarray | None = None,
-                              d_bar: float | None = None) -> tuple[np.ndarray, dict]:
+                              d_bar: float | None = None,
+                              mesh_context: MeshGeometryContext | None = None) -> tuple[np.ndarray, dict]:
     """Leave only implicated proximal child interface vertices uncertain.
 
     The distal exposed body, parent surface, other roots, and all pre-existing
@@ -491,22 +501,24 @@ def restrict_rejected_contacts(labels: np.ndarray, report: dict,
         raise ValueError("labels must match points")
     changed: dict[str, list[int]] = {}
     connectivity_rollbacks: list[str] = []
+    rollback_reasons: dict[str, str] = {}
     mesh_edges = None
     if triangles is not None and len(triangles):
-        mesh_edges = np.unique(_edge_rows(np.asarray(triangles, int)), axis=0)
-        if d_bar is not None:
-            lengths = np.linalg.norm(p[mesh_edges[:, 0]] - p[mesh_edges[:, 1]], axis=1)
-            mesh_edges = mesh_edges[lengths <= 4*float(d_bar)]
+        if mesh_context is not None:
+            mesh_context.validate(p, triangles)
+            mesh_edges = (mesh_context.edges if d_bar is None else
+                          mesh_context.edges[mesh_context.edge_lengths <= 4*float(d_bar)])
+        else:
+            mesh_edges = np.unique(_edge_rows(np.asarray(triangles, int)), axis=0)
+            if d_bar is not None:
+                lengths = np.linalg.norm(p[mesh_edges[:, 0]] - p[mesh_edges[:, 1]], axis=1)
+                mesh_edges = mesh_edges[lengths <= 4*float(d_bar)]
 
-    def support_components(current: np.ndarray, label: int) -> np.ndarray:
+    def support_generation(current: np.ndarray) -> OwnershipGeometryGeneration:
         assert mesh_edges is not None
-        edges = mesh_edges[(current[mesh_edges[:, 0]] == label) &
-                           (current[mesh_edges[:, 1]] == label)]
-        graph = coo_matrix((np.ones(2*len(edges)),
-                            (np.r_[edges[:, 0], edges[:, 1]],
-                             np.r_[edges[:, 1], edges[:, 0]])),
-                           shape=(len(p), len(p))).tocsr()
-        return connected_components(graph, directed=False)[1]
+        mesh_edges.setflags(write=False)
+        return (mesh_context.ownership(current) if mesh_context is not None
+                else OwnershipGeometryGeneration(current, p))
     for label, (root, row) in enumerate(zip(roots, report.get("junctions", [])), 1):
         if not str(row.get("status", "")).startswith("rejected"):
             continue
@@ -523,22 +535,61 @@ def restrict_rejected_contacts(labels: np.ndarray, report: dict,
         vertices = vertices[station < stable_start]
         if not len(vertices):
             continue
-        if mesh_edges is not None:
-            owned = np.flatnonzero(result == label)
-            retained = np.setdiff1d(owned, vertices, assume_unique=True)
-            before_component = support_components(result, label)[retained]
-            proposed = result.copy()
-            proposed[vertices] = -2
-            after_component = support_components(proposed, label)[retained]
-            splits_body = any(
-                np.unique(after_component[before_component == component]).size > 1
-                for component in np.unique(before_component))
-            if splits_body:
-                connectivity_rollbacks.append(str(root.root_id))
+        if mesh_edges is None:
+            connectivity_rollbacks.append(str(root.root_id))
+            rollback_reasons[str(root.root_id)] = "unresolved_no_native_connectivity"
+            continue
+        ownership = support_generation(result)
+        owned = ownership.vertices(label)
+        retained = np.setdiff1d(owned, vertices, assume_unique=True)
+        before_components = connected_components(ownership.local_graph(label, mesh_edges), directed=False)[1]
+        retained_local = np.searchsorted(owned, retained)
+        prior_parts = np.unique(before_components)
+        erases_component = any(
+            not np.any(before_components[retained_local] == part)
+            for part in prior_parts
+        )
+        proposed = result.copy()
+        proposed[vertices] = -2
+        after_generation = support_generation(proposed)
+        after_components = connected_components(after_generation.local_graph(label, mesh_edges), directed=False)[1]
+        splits_body = any(
+            np.unique(after_components[before_components[retained_local] == part]).size > 1
+            for part in np.unique(before_components[retained_local])
+        )
+        descendant_contact_lost = False
+        for child_label, child in enumerate(roots, 1):
+            if str(child.parent_id) != str(root.root_id):
                 continue
+            before_edges = (
+                ((result[mesh_edges[:, 0]] == label) &
+                 (result[mesh_edges[:, 1]] == child_label)) |
+                ((result[mesh_edges[:, 1]] == label) &
+                 (result[mesh_edges[:, 0]] == child_label))
+            )
+            if not np.any(before_edges):
+                continue
+            after_edges = (
+                ((proposed[mesh_edges[:, 0]] == label) &
+                 (proposed[mesh_edges[:, 1]] == child_label)) |
+                ((proposed[mesh_edges[:, 1]] == label) &
+                 (proposed[mesh_edges[:, 0]] == child_label))
+            )
+            if not np.any(after_edges):
+                descendant_contact_lost = True
+                break
+        if erases_component or splits_body or descendant_contact_lost:
+            connectivity_rollbacks.append(str(root.root_id))
+            rollback_reasons[str(root.root_id)] = (
+                "would_erase_owned_component" if erases_component else
+                "would_split_owned_component" if splits_body else
+                "would_remove_descendant_contact"
+            )
+            continue
         result[vertices] = -2
         changed[str(root.root_id)] = vertices.tolist()
     return result, {"policy": "rejected-proximal-contact-to-uncertain-v1",
                     "changed_vertex_count": int(sum(map(len, changed.values()))),
                     "changed_by_root": changed,
-                    "connectivity_rollbacks": connectivity_rollbacks}
+                    "connectivity_rollbacks": connectivity_rollbacks,
+                    "rollback_reasons": rollback_reasons}

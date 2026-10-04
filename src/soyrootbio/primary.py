@@ -479,10 +479,19 @@ def tangent_plane_primary_segmentation(
     min_cluster_size: int = 12,
     complete_cross_section: bool = False,
     cooperate: Callable[[], None] | None = None,
+    point_tree: cKDTree | None = None,
 ) -> np.ndarray:
     plane_radius = float(plane_radius or max(8.0 * d_bar, 0.01))
     slab_half_thickness = float(slab_half_thickness or max(2.5 * d_bar, 0.003))
-    tree = cKDTree(points)
+    if point_tree is None:
+        tree = cKDTree(points)
+    else:
+        # A point tree is reusable across path/refinement passes, but only for
+        # the same ordered geometry.  Segmentation masks are deliberately not
+        # cached because the path and cross-section policy can change.
+        if point_tree.n != len(points) or not np.array_equal(point_tree.data, points):
+            raise ValueError("point_tree must index the same ordered points")
+        tree = point_tree
     tangents = tangent_vectors(primary_path)
     primary_indices: set[int] = set()
     collar_station_count = max(

@@ -1,7 +1,9 @@
 import numpy as np
 
+import soyrootbio.pipeline as pipeline_module
 from soyrootbio.pipeline import (
-    _assign_full_root_labels, _assign_lateral_points, _nearest_exposed_segments,
+    _ExposedSegmentIndexCache, _assign_full_root_labels,
+    _assign_lateral_points, _nearest_exposed_segments,
 )
 from soyrootbio.surface_patches import _polyline_projection_distance_and_arc
 from soyrootbio.types import RootPath
@@ -84,3 +86,106 @@ def test_spatial_segment_search_matches_all_segment_projection_in_assignment_ran
         if exact[i, other] <= exact[i, first] + margin:
             assert second[i] == other
             assert np.isclose(second_distance[i], exact[i, other], atol=1e-12)
+
+
+def test_segment_index_cache_reuses_geometry_across_query_policies(monkeypatch):
+    paths = [
+        (1, np.array([[0., 0., 0.], [0., 0., 1.]])),
+        (2, np.array([[.2, 0., 0.], [.2, 0., 1.]])),
+    ]
+    points = np.array([[.01, 0., .5], [.19, 0., .5], [.1, 0., .5]])
+    policies = [(.03, .005), (.3, .05)]
+    expected = [
+        _nearest_exposed_segments(points, paths, d_bar=.01, radius=radius, margin=margin)
+        for radius, margin in policies
+    ]
+    real_build = pipeline_module._build_exposed_segment_index
+    builds = []
+
+    def counted_build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_build_exposed_segment_index", counted_build)
+    cache = _ExposedSegmentIndexCache(max_entries=5)
+    for (radius, margin), reference in zip(policies, expected, strict=True):
+        observed = _nearest_exposed_segments(
+            points, paths, d_bar=.01, radius=radius, margin=margin,
+            segment_index_cache=cache,
+        )
+        assert all(np.array_equal(actual, prior) for actual, prior in zip(observed, reference))
+    assert len(builds) == 1
+
+
+def test_segment_index_cache_invalidates_changed_path_body_and_labels(monkeypatch):
+    primary = np.array([[0., 0., 0.], [0., 0., 1.]])
+    child = RootPath("child", np.array([[.1, 0., 0.], [.1, 0., 1.]]))
+    points = np.array([[.1, 0., .5], [0., 0., .5]])
+    real_build = pipeline_module._build_exposed_segment_index
+    builds = []
+
+    def counted_build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_build_exposed_segment_index", counted_build)
+    cache = _ExposedSegmentIndexCache(max_entries=5)
+
+    def assign_full(spacing=.01):
+        return _assign_full_root_labels(
+            points, primary, [child], d_bar=spacing,
+            segment_index_cache=cache,
+        )
+
+    assert assign_full().tolist() == [1, 0]
+    assert assign_full().tolist() == [1, 0]
+    assert len(builds) == 1
+    excluded = np.array([True, False])
+    assert _assign_full_root_labels(
+        points, primary, [child], d_bar=.01,
+        excluded_mask=excluded, segment_index_cache=cache,
+    ).tolist() == [-1, 0]
+    assert len(builds) == 1  # The exclusion mask is applied after the query.
+    child.body_start_index = 1
+    assign_full()
+    assert len(builds) == 2
+    child.points[1, 0] = .15
+    assign_full()
+    assert len(builds) == 3
+    assign_full(.02)
+    assert len(builds) == 4
+    _assign_lateral_points(
+        points, [child], np.zeros(len(points), bool), .02,
+        segment_index_cache=cache,
+    )
+    assert len(builds) == 5  # No primary segment in the analysis policy.
+    child.points[1, 0] = .1
+    child.body_start_index = 0
+    assert assign_full().tolist() == [1, 0]
+    assert len(builds) == 5  # The original exact index is still in the LRU.
+
+
+def test_segment_index_cache_distinguishes_label_sequence(monkeypatch):
+    first = np.array([[0., 0., 0.], [0., 0., 1.]])
+    other = np.array([[.2, 0., 0.], [.2, 0., 1.]])
+    sample = np.array([[0., 0., .5]])
+    real_build = pipeline_module._build_exposed_segment_index
+    builds = []
+
+    def counted_build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_build_exposed_segment_index", counted_build)
+    cache = _ExposedSegmentIndexCache()
+    left = _nearest_exposed_segments(
+        sample, [(1, first), (2, other)], d_bar=.01,
+        radius=.3, margin=.01, segment_index_cache=cache,
+    )
+    right = _nearest_exposed_segments(
+        sample, [(2, first), (1, other)], d_bar=.01,
+        radius=.3, margin=.01, segment_index_cache=cache,
+    )
+    assert left[1].tolist() == [1]
+    assert right[1].tolist() == [2]
+    assert len(builds) == 2

@@ -16,13 +16,15 @@ from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import ConvexHull, QhullError, cKDTree
 
+from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
+
 from .geometry import (
-    child_length_exceeds_parent,
     is_above_primary_top,
     path_length,
     primary_top_excess,
     resample_polyline,
     tangent_vectors,
+    update_child_length_qc,
 )
 from .primary import _plane_basis, _robust_cross_section_center
 from .types import RootPath
@@ -56,7 +58,8 @@ POLICY = {
 }
 
 
-def _support_edges(points: np.ndarray, triangles: np.ndarray | None, spacing: float) -> np.ndarray:
+def _support_edges(points: np.ndarray, triangles: np.ndarray | None, spacing: float,
+                   point_tree: cKDTree | None = None) -> np.ndarray:
     if triangles is not None and len(triangles):
         faces = np.asarray(triangles, dtype=int)
         edges = np.unique(np.sort(np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1), axis=0)
@@ -67,7 +70,8 @@ def _support_edges(points: np.ndarray, triangles: np.ndarray | None, spacing: fl
         return edges[lengths <= limit]
     if len(points) < 2:
         return np.empty((0, 2), dtype=int)
-    distances, neighbours = cKDTree(points).query(points, k=min(9, len(points)))
+    tree = point_tree if point_tree is not None else cKDTree(points)
+    distances, neighbours = tree.query(points, k=min(9, len(points)))
     local = np.maximum(distances[:, 1], spacing)
     rows = np.broadcast_to(np.arange(len(points))[:, None], neighbours[:, 1:].shape)
     keep = distances[:, 1:] <= np.minimum(4 * spacing, 4 * np.minimum(local[:, None], local[neighbours[:, 1:]]))
@@ -849,6 +853,8 @@ def refit_final_centerlines(
     gravity: np.ndarray | tuple[float, float, float] = (0.0, 0.0, -1.0),
     primary_top_reference: np.ndarray | None = None,
     cooperate: Callable[[], None] | None = None,
+    mesh_context: MeshGeometryContext | None = None,
+    nodule_labels: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Refit all roots in parent-first order using full-resolution final labels.
 
@@ -857,6 +863,8 @@ def refit_final_centerlines(
     An unsupported attachment keeps its topology metadata but no spatial bridge.
     """
     points, labels = np.asarray(points, dtype=float), np.asarray(labels)
+    if nodule_labels is not None and np.asarray(nodule_labels).shape != labels.shape:
+        raise ValueError("nodule labels must match final-support vertices")
     primary = np.asarray(primary, dtype=float)
     gravity_direction = np.asarray(gravity, dtype=float)
     if points.ndim != 2 or points.shape[1] != 3 or labels.shape != (len(points),):
@@ -904,10 +912,19 @@ def refit_final_centerlines(
                 f"{root.root_id}: lateral origin is {excess:.9g} above "
                 "the primary-root top"
             )
-    edges = _support_edges(points, triangles, d_bar)
-    vertex_area_weights = _vertex_area_weights(points, triangles)
-    same = labels[edges[:, 0]] == labels[edges[:, 1]]
-    owned_edges = edges[same]
+    if mesh_context is not None and triangles is not None and len(triangles):
+        mesh_context.validate(points, triangles)
+        edges = mesh_context.support_edges(d_bar)
+        vertex_area_weights = mesh_context.vertex_area_weights
+    else:
+        if mesh_context is not None:
+            mesh_context.validate(points, triangles)
+        edges = _support_edges(points, triangles, d_bar,
+                               point_tree=mesh_context.point_tree if mesh_context is not None else None)
+        vertex_area_weights = _vertex_area_weights(points, triangles)
+    edges.setflags(write=False)
+    ownership = (mesh_context.ownership(labels) if mesh_context is not None
+                 else OwnershipGeometryGeneration(labels, points))
     by_id = {root.root_id: (i, root) for i, root in enumerate(roots, 1)}
     if len(by_id) != len(roots) or "primary" in by_id:
         raise ValueError("root IDs must be unique and distinct from primary")
@@ -936,7 +953,7 @@ def refit_final_centerlines(
         rid = "primary" if root is None else root.root_id
         label = 0 if root is None else by_id[rid][0]
         old = prior[rid]
-        indices = np.flatnonzero(labels == label)
+        indices = ownership.vertices(label)
         flags = []
         detail = {"root_id": rid, "numeric_label": label, "assigned_point_count": int(len(indices)), "length_before": path_length(old),
                   "coordinate_unit": "normalized", "input_geometry_fingerprint": hashlib.sha256(np.round(np.asarray(old, dtype=np.float64), decimals=8).tobytes(order="C")).hexdigest()[:20]}
@@ -946,11 +963,8 @@ def refit_final_centerlines(
             support = np.empty((0, 3))
             detail.update(status="no_support", component_count=0, excluded_fragment_points=0)
         else:
-            lookup = np.full(len(points), -1, dtype=int)
-            lookup[indices] = np.arange(len(indices))
-            local_edges = lookup[owned_edges[labels[owned_edges[:, 0]] == label]]
             cloud = points[indices]
-            graph = _graph(cloud, local_edges)
+            graph = ownership.local_graph(label, edges)
             count, components = connected_components(graph, directed=False)
             sizes = np.bincount(components)
             keep = components == int(np.argmax(sizes))
@@ -983,6 +997,25 @@ def refit_final_centerlines(
                     body, fit_report = _fit_body(support, initial, spacing)
                 detail.update(fit_report)
                 flags.extend(fit_report.get("qc_flags", []))
+        if nodule_labels is not None and len(indices) and detail.get("component_count", 0) > 1:
+            native_nodules = np.asarray(nodule_labels)
+            crossing = edges[((labels[edges[:, 0]] == label) & (native_nodules[edges[:, 1]] <= -3))
+                             | ((labels[edges[:, 1]] == label) & (native_nodules[edges[:, 0]] <= -3))]
+            obscured = False
+            if len(crossing):
+                root_vertex = np.where(labels[crossing[:, 0]] == label, crossing[:, 0], crossing[:, 1])
+                nodule_vertex = np.where(labels[crossing[:, 0]] == label, crossing[:, 1], crossing[:, 0])
+                local_component = components[np.searchsorted(indices, root_vertex)]
+                for nodule_id in np.unique(native_nodules[nodule_vertex]):
+                    if len(np.unique(local_component[native_nodules[nodule_vertex] == nodule_id])) > 1:
+                        obscured = True
+                        break
+            if obscured:
+                body, support = old.copy(), points[indices]
+                detail.update(status="nodule_obscured", fit_applied=False, fit_qc_passed=False,
+                              traits_geometry_source="retained_prior_nodule_obscured",
+                              exposed_body_supported=False,
+                              nodule_gap_policy="retain_existing_topology_without_measuring_hidden_root")
         if detail["status"] != "fitted":
             flags.append("centerline_" + detail["status"])
         staged[rid] = (body, support, detail, flags)
@@ -1137,7 +1170,8 @@ def refit_final_centerlines(
                 flags.append("centerline_descendant_attachment_shift")
 
         if root is not None:
-            if child_length_exceeds_parent(path_length(line), path_length(parent)):
+            flags = [flag for flag in flags if flag != "centerline_refit_child_longer_than_parent"]
+            if update_child_length_qc(flags, path_length(line), path_length(parent)):
                 flags.append("centerline_refit_child_longer_than_parent")
         else:
             primary_flags = flags

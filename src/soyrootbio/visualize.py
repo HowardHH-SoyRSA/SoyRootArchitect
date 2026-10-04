@@ -77,7 +77,8 @@ def _save_overview_plot(
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(111, projection="3d")
     unassigned = idx[(~primary_mask[idx]) & (lateral_labels[idx] == 0)]
-    uncertain = idx[(~primary_mask[idx]) & (lateral_labels[idx] < 0)]
+    uncertain = idx[(~primary_mask[idx]) & (lateral_labels[idx] == -1)]
+    nodules = idx[lateral_labels[idx] == -2]
     primary = idx[primary_mask[idx]]
     lateral = idx[lateral_labels[idx] > 0]
     if len(unassigned):
@@ -86,6 +87,9 @@ def _save_overview_plot(
         ax.scatter(points[uncertain, 0], points[uncertain, 1], points[uncertain, 2], s=0.5, c="#fa7a0a", alpha=0.30)
     if len(primary):
         ax.scatter(points[primary, 0], points[primary, 1], points[primary, 2], s=0.7, c="#1646d8", alpha=0.45)
+    if len(nodules):
+        ax.scatter(*points[nodules].T, s=3, c="#FFF4B3", edgecolors="#817751", linewidths=.15, label="Nodules", alpha=1)
+        ax.legend(loc="upper right")
     if len(lateral):
         lateral_point_colors = np.tile(order_color(1), (len(lateral), 1))
         for label, path_obj in enumerate(lateral_paths, start=1):
@@ -270,7 +274,8 @@ def _save_one_angle_front_view(
     figure_height = max(10.0, min(18.0, 8.0 + 0.06 * max_side_count))
     fig, ax = plt.subplots(figsize=(12, figure_height))
     unassigned = idx[(~primary_mask[idx]) & (lateral_labels[idx] == 0)]
-    uncertain = idx[(~primary_mask[idx]) & (lateral_labels[idx] < 0)]
+    uncertain = idx[(~primary_mask[idx]) & (lateral_labels[idx] == -1)]
+    nodules = idx[lateral_labels[idx] == -2]
     primary = idx[primary_mask[idx]]
     lateral = idx[lateral_labels[idx] > 0]
     if len(unassigned):
@@ -279,6 +284,8 @@ def _save_one_angle_front_view(
         ax.scatter(points[uncertain, 0], points[uncertain, 2], s=0.45, c="#fa7a0a", alpha=0.25, linewidths=0)
     if len(primary):
         ax.scatter(points[primary, 0], points[primary, 2], s=0.55, c="#1646d8", alpha=0.35, linewidths=0)
+    if len(nodules):
+        ax.scatter(points[nodules, 0], points[nodules, 2], s=3, c="#FFF4B3", edgecolors="#817751", linewidths=.15, alpha=1)
     if len(lateral):
         lateral_point_colors = np.tile(order_color(1), (len(lateral), 1))
         for label, path_obj in enumerate(lateral_paths, start=1):

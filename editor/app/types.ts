@@ -44,8 +44,22 @@ export interface RootRecord {
 
 export interface PointPatchRecord {
   patch_id: string;
-  kind: "uncertain" | "unassigned";
-  numeric_label: -2 | -1;
+  kind: "uncertain" | "unassigned" | "nodule" | "nodule_candidate";
+  numeric_label: number;
+  nodule?: {
+    nodule_id: string;
+    status: "accepted" | "candidate" | "rejected";
+    review_status: string;
+    principal_dimensions: Vec3;
+    surface_area: number | null;
+    volume: number | null;
+    volume_method: string;
+    depth_below_primary_top: number;
+    supporting_root_id: string | null;
+    distance_along_supporting_root: number | null;
+    qc_flags: string[];
+    requires_reanalysis?: boolean;
+  };
   point_count: number;
   anchor_vertex_index: number;
   centroid: Vec3;
@@ -73,6 +87,8 @@ export interface EditorState {
   };
   roots: RootRecord[];
   root_count: number;
+  nodule_count?: number;
+  nodule_requires_reanalysis?: boolean;
   point_patches: PointPatchRecord[];
   point_patch_count: number;
   can_undo: boolean;

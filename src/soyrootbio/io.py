@@ -22,6 +22,31 @@ MIN_POINT_COUNT = 10
 POINT_EXTENSIONS = {".ply", ".pcd", ".xyz", ".xyzn", ".xyzrgb", ".pts", ".txt", ".csv"}
 MESH_EXTENSIONS = {".stl", ".obj", ".off", ".gltf", ".glb", ".fbx", ".dae", ".ply"}
 ProgressCallback = Callable[[str, float, float | None], None]
+INPUT_MODES = ("auto", "surface_points", "triangle_mesh", "occupied_volume")
+
+
+def input_mode_contract(requested: str, *, has_triangles: bool) -> dict:
+    """Declare representation and evidence without reconstructing surfaces."""
+    if requested not in INPUT_MODES:
+        raise ValueError(f"input_mode must be one of {INPUT_MODES}; got {requested!r}")
+    resolved = ("triangle_mesh" if has_triangles else "surface_points") if requested == "auto" else requested
+    if resolved == "triangle_mesh" and not has_triangles:
+        raise ValueError("triangle_mesh input mode requires native triangle faces; no mesh is generated")
+    if has_triangles and resolved != "triangle_mesh":
+        raise ValueError("Input contains native faces: use triangle_mesh or auto to preserve mesh evidence")
+    return {
+        "requested_input_mode": requested,
+        "input_mode": resolved,
+        "representation_assumed": requested == "auto" and not has_triangles,
+        "native_mesh_support": has_triangles,
+        "evidence_basis": "native_triangle_connectivity" if has_triangles else "bounded_point_neighborhood_diagnostics",
+        "mesh_generated": False,
+        "native_contact_and_patch_checks_available": has_triangles,
+        "measurement_interpretation": (
+            "surface_radius_and_frustum_estimates_not_calibrated_for_occupied_volume"
+            if resolved == "occupied_volume" else "surface_radius_and_frustum_estimates"
+        ),
+    }
 
 
 def require_open3d():
@@ -39,11 +64,12 @@ def load_root_geometry(
     random_seed: int | None = 42,
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
+    input_mode: str = "auto",
 ) -> PointCloudData:
     """Load a root-only point cloud or mesh and return points in source units.
 
-    Mesh vertices and faces are preserved at full resolution for measurement
-    and labelled export.  ``sample_points`` is an optional explicit analysis
+    Source points and native faces are preserved at full resolution for measurement
+    and labelled export. ``sample_points`` is an optional explicit analysis
     cap; when omitted, a short k-NN pilot only reduces the analysis cloud if the
     projected runtime or memory would exceed the configured 30-minute policy.
     CSV inputs prefer named x/y/z columns; other text inputs use the first
@@ -55,6 +81,7 @@ def load_root_geometry(
         random_seed=random_seed,
         runtime_limit_seconds=runtime_limit_seconds,
         minimum_retained_fraction=minimum_retained_fraction,
+        input_mode=input_mode,
     )
 
 
@@ -65,8 +92,9 @@ def load_root_geometry_with_progress(
     random_seed: int | None = 42,
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
+    input_mode: str = "auto",
 ) -> PointCloudData:
-    """Load geometry while reporting progress and a mesh-sampling ETA."""
+    """Load any supported geometry with the shared analysis-cap preflight."""
     return _load_root_geometry(
         path,
         sample_points=sample_points,
@@ -74,6 +102,7 @@ def load_root_geometry_with_progress(
         random_seed=random_seed,
         runtime_limit_seconds=runtime_limit_seconds,
         minimum_retained_fraction=minimum_retained_fraction,
+        input_mode=input_mode,
     )
 
 
@@ -84,33 +113,28 @@ def _load_root_geometry(
     random_seed: int | None = 42,
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
+    input_mode: str = "auto",
 ) -> PointCloudData:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Input file does not exist: {path}")
-    if sample_points is not None and int(sample_points) != 0 and sample_points < MIN_POINT_COUNT:
+    if sample_points is not None and (int(sample_points) != sample_points or (sample_points != 0 and sample_points < MIN_POINT_COUNT)):
         raise ValueError(f"sample_points must be at least {MIN_POINT_COUNT}; got {sample_points}")
     if runtime_limit_seconds <= 0:
         raise ValueError("runtime_limit_seconds must be positive")
     if not 0 < minimum_retained_fraction <= 1:
         raise ValueError("minimum_retained_fraction must be in (0, 1]")
+    if input_mode not in INPUT_MODES:
+        raise ValueError(f"input_mode must be one of {INPUT_MODES}; got {input_mode!r}")
     suffix = path.suffix.lower()
     if suffix in {".xyz", ".pts", ".txt", ".csv"}:
         _report_progress(progress_callback, "Reading point cloud", 0.10, None)
-        text_points = _validate_points(_load_xyz_text(path), path)
-        cloud = PointCloudData(
-            points=text_points,
-            source_path=path,
-            full_points=text_points,
-            source_metadata={
-                "geometry_kind": "point_cloud",
-                "full_point_count": int(len(text_points)),
-                "analysis_point_count": int(len(text_points)),
-                "analysis_reduced": False,
-            },
+        return _prepare_geometry(
+            _load_xyz_text(path), None, path=path, sample_points=sample_points,
+            random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
+            minimum_retained_fraction=minimum_retained_fraction,
+            input_mode=input_mode, progress_callback=progress_callback,
         )
-        _report_progress(progress_callback, "Point cloud ready", 1.0, 0.0)
-        return cloud
 
     o3d = require_open3d()
     mesh = None
@@ -125,64 +149,94 @@ def _load_root_geometry(
             _report_progress(progress_callback, "Reading point cloud", 0.10, None)
             pcd = _read_point_cloud(o3d, path)
             if pcd.has_points():
-                cloud = PointCloudData(
-                    points=_validate_points(np.asarray(pcd.points, dtype=float), path),
-                    source_path=path,
-                    full_points=_validate_points(np.asarray(pcd.points, dtype=float), path),
-                    source_metadata={
-                        "geometry_kind": "point_cloud",
-                        "full_point_count": int(len(pcd.points)),
-                        "analysis_point_count": int(len(pcd.points)),
-                        "analysis_reduced": False,
-                    },
+                return _prepare_geometry(
+                    np.asarray(pcd.points), None, path=path, sample_points=sample_points,
+                    random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
+                    minimum_retained_fraction=minimum_retained_fraction,
+                    input_mode=input_mode, progress_callback=progress_callback,
                 )
-                _report_progress(progress_callback, "Point cloud ready", 1.0, 0.0)
-                return cloud
 
     if mesh is None:
         _report_progress(progress_callback, "Reading mesh", 0.05, None)
         mesh = _read_triangle_mesh(o3d, path)
-    if mesh is None or len(mesh.vertices) == 0:
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
         _report_progress(progress_callback, "Reading point cloud", 0.20, None)
         pcd = _read_point_cloud(o3d, path)
         if not pcd.has_points():
             raise ValueError(f"Could not read point cloud or mesh from {path}")
-        point_values = _validate_points(np.asarray(pcd.points, dtype=float), path)
-        cloud = PointCloudData(
-            points=point_values,
-            source_path=path,
-            full_points=point_values,
-            source_metadata={
-                "geometry_kind": "point_cloud",
-                "full_point_count": int(len(point_values)),
-                "analysis_point_count": int(len(point_values)),
-                "analysis_reduced": False,
-            },
+        return _prepare_geometry(
+            np.asarray(pcd.points), None, path=path, sample_points=sample_points,
+            random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
+            minimum_retained_fraction=minimum_retained_fraction,
+            input_mode=input_mode, progress_callback=progress_callback,
         )
-        _report_progress(progress_callback, "Point cloud ready", 1.0, 0.0)
-        return cloud
 
-    _report_progress(progress_callback, "Preparing mesh", 0.10, None)
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
-    full_points, triangles, sanitization = _sanitize_mesh_arrays(
-        np.asarray(mesh.vertices, dtype=float),
-        np.asarray(mesh.triangles, dtype=np.int64),
-        path=path,
+    return _prepare_geometry(
+        np.asarray(mesh.vertices), np.asarray(mesh.triangles),
+        path=path, sample_points=sample_points, random_seed=random_seed,
+        runtime_limit_seconds=runtime_limit_seconds,
+        minimum_retained_fraction=minimum_retained_fraction,
+        input_mode=input_mode, progress_callback=progress_callback,
     )
+
+
+def _prepare_geometry(
+    original_points: np.ndarray, original_triangles: np.ndarray | None, *,
+    path: Path, sample_points: int | None, random_seed: int | None,
+    runtime_limit_seconds: float, minimum_retained_fraction: float,
+    input_mode: str, progress_callback: ProgressCallback | None,
+) -> PointCloudData:
+    """One preflight and subset policy for every supported input format.
+
+    Finite source vertices retain their order, duplicates and unused vertices,
+    except supported exact STL seams, which have a reversible index mapping.
+    No decimation, surface reconstruction or face repair is performed.
+    Original decoded arrays remain separate even when invalid rows are removed.
+    """
+    original_points = np.asarray(original_points, dtype=float).copy()
+    has_faces = original_triangles is not None and len(original_triangles) > 0
+    contract = input_mode_contract(input_mode, has_triangles=has_faces)
+    if has_faces:
+        original_triangles = np.asarray(original_triangles, dtype=np.int64).copy()
+        full_points, triangles, sanitization = _sanitize_mesh_arrays(original_points, original_triangles, path=path)
+        if not len(triangles):
+            raise ValueError("No usable native triangle faces remain after non-finite vertex exclusion")
+    else:
+        triangles = None
+        full_points = _validate_points(original_points, path)
+        sanitization = {"nonfinite_vertex_count": int(len(original_points) - len(full_points)), "faces_dropped_nonfinite_vertices": 0}
     full_points = _validate_points(full_points, path)
-    _report_progress(progress_callback, "Auditing full-resolution mesh", 0.18, None)
-    audit = _mesh_audit(full_points, triangles)
+    geometry_mapping: dict[str, np.ndarray] = {}
+    stl_report = None
+    analysis_pool = None
+    if has_faces and path.suffix.lower() == ".stl":
+        from .stl_geometry import index_stl_facets
+
+        (full_points, triangles, analysis_pool, finite_to_full, full_to_finite,
+         unresolved, stl_report) = index_stl_facets(full_points, triangles, require_open3d())
+        finite_source = np.flatnonzero(np.all(np.isfinite(original_points), axis=1))
+        source_to_full = np.full(len(original_points), -1, dtype=np.int64)
+        source_to_full[finite_source] = finite_to_full
+        retained_faces = np.all(source_to_full[original_triangles] >= 0, axis=1)
+        face_mapping = np.full(len(original_triangles), -1, dtype=np.int64)
+        face_mapping[retained_faces] = np.arange(int(retained_faces.sum()))
+        geometry_mapping = {
+            "original_to_full": source_to_full,
+            "full_to_original": finite_source[full_to_finite],
+            "original_face_to_full": face_mapping,
+            "unresolved_full_vertex_indices": unresolved,
+        }
+    _report_progress(progress_callback, "Auditing full-resolution geometry", 0.18, None)
+    audit = _mesh_audit(full_points, triangles) if has_faces else {}
+    analysis_source = full_points if analysis_pool is None else full_points[analysis_pool]
     explicit_limit = None if sample_points in (None, 0) else int(sample_points)
     if explicit_limit is not None:
-        target_count = min(len(full_points), explicit_limit)
-        reduction_reason = "explicit_analysis_cap" if target_count < len(full_points) else "none"
+        target_count = min(len(analysis_source), explicit_limit)
+        reduction_reason = "explicit_analysis_cap" if target_count < len(analysis_source) else "none"
         projected_seconds = None
     else:
         target_count, projected_seconds, reduction_reason = _automatic_analysis_target(
-            full_points,
+            analysis_source,
             runtime_limit_seconds=float(runtime_limit_seconds),
             minimum_retained_fraction=float(minimum_retained_fraction),
             graph_k=14,
@@ -190,15 +244,24 @@ def _load_root_geometry(
         )
     _report_progress(progress_callback, "Preparing analysis vertices", 0.30, projected_seconds)
     analysis_indices = _analysis_vertex_indices(
-        full_points,
+        analysis_source,
         target_count=target_count,
         random_seed=random_seed,
     )
+    if analysis_pool is not None:
+        analysis_indices = analysis_pool[analysis_indices]
+        geometry_mapping["analysis_to_full"] = analysis_indices.copy()
     analysis_points = full_points[analysis_indices]
     metadata = {
-        "geometry_kind": "triangle_mesh",
+        "geometry_kind": "triangle_mesh" if has_faces else "point_cloud",
+        **contract,
+        "original_point_count": int(len(original_points)),
+        "original_triangle_count": int(len(original_triangles)) if has_faces else 0,
+        "original_geometry_file": "original_input_geometry.npz",
+        "analysis_cap": explicit_limit,
+        "analysis_cap_definition": "maximum retained finite source vertices; subset only; full geometry preserved",
         "full_point_count": int(len(full_points)),
-        "triangle_count": int(len(triangles)),
+        "triangle_count": int(len(triangles)) if has_faces else 0,
         "analysis_point_count": int(len(analysis_points)),
         "analysis_reduced": bool(len(analysis_points) < len(full_points)),
         "retained_fraction": float(len(analysis_points) / len(full_points)),
@@ -210,11 +273,15 @@ def _load_root_geometry(
         **_source_header_metadata(path),
         **audit,
     }
+    if stl_report is not None:
+        metadata["stl_indexing"] = stl_report
+        metadata["analysis_cap_definition"] = "maximum distinct finite positions; exact STL mapping preserved"
+        metadata["analysis_available_position_count"] = int(len(analysis_source))
     LOGGER.info(
-        "Loaded mesh %s with %d vertices/%d faces; analysing %d vertices (%s)",
+        "Loaded geometry %s with %d vertices/%d faces; analysing %d vertices (%s)",
         path,
         len(full_points),
-        len(triangles),
+        len(triangles) if has_faces else 0,
         len(analysis_points),
         reduction_reason,
     )
@@ -225,6 +292,9 @@ def _load_root_geometry(
         triangles=triangles,
         analysis_indices=analysis_indices,
         source_metadata=metadata,
+        original_points=original_points,
+        original_triangles=original_triangles,
+        geometry_mapping=geometry_mapping,
     )
     _report_progress(progress_callback, "Point cloud ready", 1.0, 0.0)
     return cloud
@@ -643,11 +713,12 @@ def write_labeled_ply(
     vertex_records["root_order"] = root_orders
     vertex_records["assignment_state"] = assignment_states
     face_count = 0 if triangles is None else len(triangles)
+    nodule_comment = ("comment root_id <= -3 identifies separate nodule objects; assignment_state 3=nodule; root_order 255=not_a_root\n" if np.any(root_ids <= -3) else "")
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
         "comment SoyRootBio root_id -2=uncertain -1=unassigned; root_order 254=uncertain 255=unassigned; assignment_state 0=unassigned 1=assigned 2=uncertain\n"
-        f"element vertex {count}\n"
+        f"{nodule_comment}element vertex {count}\n"
         "property double x\nproperty double y\nproperty double z\n"
         "property uchar red\nproperty uchar green\nproperty uchar blue\n"
         "property int root_id\nproperty uchar root_order\nproperty uchar assignment_state\n"

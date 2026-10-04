@@ -8,6 +8,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+from .mesh_geometry import MeshGeometryContext
 from .surface_patches import (
     _polyline_projection_distance_and_arc,
     _segment_radius_profile,
@@ -37,6 +38,7 @@ def cleanup_final_surface(
     d_bar: float,
     triangles: np.ndarray | None = None,
     excluded_mask: np.ndarray | None = None,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Clean unsupported islands and bounded holes using local mesh support.
 
@@ -134,20 +136,25 @@ def cleanup_final_surface(
         report.update(status="skipped_no_mesh", connectivity="no_mesh")
         return result, report
 
-    edges = np.unique(
-        np.sort(
-            np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]),
-            axis=1,
-        ),
-        axis=0,
-    )
-    lengths = np.linalg.norm(source[edges[:, 0]] - source[edges[:, 1]], axis=1)
+    if mesh_context is not None:
+        mesh_context.validate(source, faces)
+        edges, lengths = mesh_context.edges, mesh_context.edge_lengths
+    else:
+        edges = np.unique(
+            np.sort(
+                np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]),
+                axis=1,
+            ),
+            axis=0,
+        )
+        lengths = np.linalg.norm(source[edges[:, 0]] - source[edges[:, 1]], axis=1)
     edges = edges[(edges[:, 0] != edges[:, 1]) & (lengths <= 4.0 * spacing)]
     edges = edges[~excluded[edges[:, 0]] & ~excluded[edges[:, 1]]]
 
     # Phase one: classify every assigned component with the same rule and move
     # only unsupported, compact islands with a clear supported recipient.
-    assigned_partition = _partition(source, result, edges, excluded, include_holes=False)
+    assigned_partition = _partition(source, result, edges, excluded,
+                                    include_holes=False, mesh_context=mesh_context)
     assigned_evidence = _Evidence(source, paths, spacing, assigned_partition)
     assigned_moves: list[tuple[int, int, dict | None]] = []
     demoted = np.zeros(len(source), dtype=bool)
@@ -223,7 +230,8 @@ def cleanup_final_surface(
 
     # Phase two: rebuild components after island transfers, then fill only
     # bounded holes whose touching-root evidence has one clear winner.
-    hole_partition = _partition(source, result, edges, excluded, include_holes=True)
+    hole_partition = _partition(source, result, edges, excluded,
+                                include_holes=True, mesh_context=mesh_context)
     hole_evidence = _Evidence(source, paths, spacing, hole_partition)
     hole_moves: list[tuple[int, int, dict]] = []
     for component in sorted(
@@ -349,21 +357,22 @@ def _partition(
     excluded: np.ndarray,
     *,
     include_holes: bool,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> _Partition:
     active = (~excluded) & ((labels >= 0) | (include_holes & (labels == -1)))
-    same = edges[
-        active[edges[:, 0]]
-        & active[edges[:, 1]]
-        & (labels[edges[:, 0]] == labels[edges[:, 1]])
-    ]
     graph = coo_matrix(
         (np.ones(2 * len(edges)), (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
         shape=(len(points), len(points)),
     ).tocsr()
-    same_graph = coo_matrix(
-        (np.ones(len(same)), (same[:, 0], same[:, 1])), shape=(len(points), len(points))
-    ).tocsr()
-    _, raw = connected_components(same_graph, directed=False)
+    if mesh_context is not None:
+        raw = mesh_context.ownership(labels).components(edges, active)
+    else:
+        same = edges[active[edges[:, 0]] & active[edges[:, 1]] &
+                     (labels[edges[:, 0]] == labels[edges[:, 1]])]
+        same_graph = coo_matrix(
+            (np.ones(len(same)), (same[:, 0], same[:, 1])), shape=(len(points), len(points))
+        ).tocsr()
+        _, raw = connected_components(same_graph, directed=False)
     ids = np.flatnonzero(active)
     if not len(ids):
         return _Partition(labels, edges, graph, [], np.empty(0, int), np.full(len(points), -1, int), [], [], {})

@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+
+from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 from scipy.spatial import cKDTree
 
 from .surface_patches import _polyline_projection_distance_and_arc as project
@@ -94,6 +96,7 @@ def reconcile_parent_contacts(
     roots: list[RootPath], *, triangles: np.ndarray | None, d_bar: float,
     cleanup_report: dict | None = None,
     excluded_mask: np.ndarray | None = None,
+    mesh_context: MeshGeometryContext | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Transfer only a detached, parent-supported contact patch.
 
@@ -126,9 +129,15 @@ def reconcile_parent_contacts(
     if not len(faces):
         return result, report
 
-    edges = _native_edges(p, faces, d_bar)
+    if mesh_context is not None:
+        mesh_context.validate(p, faces)
+        edges = mesh_context.bounded_edges(d_bar)
+    else:
+        edges = _native_edges(p, faces, d_bar)
     edges = edges[~excluded[edges[:, 0]] & ~excluded[edges[:, 1]]]
-    component = _components(before, edges)
+    ownership = (mesh_context.ownership(before) if mesh_context is not None
+                 else OwnershipGeometryGeneration(before, p))
+    component = ownership.components(edges)
     paths = [np.asarray(primary, float)] + [np.asarray(root.points, float) for root in roots]
     by_id = {"primary": 0, **{str(root.root_id): i for i, root in enumerate(roots, 1)}}
     cleanup_rows = {(int(row["source_label"]), int(row["first_vertex"]),
@@ -147,7 +156,7 @@ def reconcile_parent_contacts(
             continue
         child_vertices = np.unique(touching_edges[before[touching_edges] == label])
         contact_components = np.unique(component[child_vertices])
-        owned = np.flatnonzero(before == label)
+        owned = ownership.vertices(label)
         owner_components = np.unique(component[owned])
         body = paths[label][int(root.body_start_index):]
         radius = _path_radius(root, d_bar)

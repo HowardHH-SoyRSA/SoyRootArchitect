@@ -251,3 +251,43 @@ def test_restriction_rolls_back_if_it_splits_stable_child_body():
     np.testing.assert_array_equal(after, labels)
     assert restriction["connectivity_rollbacks"] == ["child"]
     assert restriction["changed_vertex_count"] == 0
+
+
+def test_restriction_does_not_erase_an_entire_child_surface_component():
+    points = np.array([[0., 0., .2], [0., 0., .3],
+                       [0., 0., 2.], [0., 0., 2.1],
+                       [1., 0., .2], [1., 0., 2.]])
+    faces = np.array([[0, 1, 4], [2, 3, 5]])
+    labels = np.array([1, 1, 1, 1, 0, 0])
+    root = RootPath("child", np.array([[0., 0., 0.], [0., 0., 3.]]),
+                    parent_id="primary")
+    report = {"junctions": [{"root_id": "child",
+                            "status": "rejected_oversized_or_elongated",
+                            "patch_vertex_indices": [0, 1],
+                            "radius_evidence": {"stable_arc_start": 1.}}]}
+    after, restriction = restrict_rejected_contacts(
+        labels, report, [root], points, triangles=faces, d_bar=1.)
+    np.testing.assert_array_equal(after, labels)
+    assert restriction["connectivity_rollbacks"] == ["child"]
+    assert restriction["changed_vertex_count"] == 0
+
+
+def test_restriction_keeps_native_contact_for_direct_descendant():
+    points = np.array([[0., 0., .5], [0., 0., 2.],
+                       [.1, 0., .5], [0., .1, .5], [1., 0., .5]])
+    faces = np.array([[0, 2, 3], [0, 1, 4]])
+    labels = np.array([1, 1, 2, 0, 0])
+    parent = RootPath("parent", np.array([[0., 0., 0.], [0., 0., 3.]]),
+                      parent_id="primary")
+    descendant = RootPath("descendant", np.array([[.1, 0., .5], [.2, 0., 1.]]),
+                          order=2, parent_id="parent")
+    report = {"junctions": [{"root_id": "parent",
+                            "status": "rejected_oversized_or_elongated",
+                            "patch_vertex_indices": [0],
+                            "radius_evidence": {"stable_arc_start": 1.}},
+                           {"root_id": "descendant", "status": "accepted"}]}
+    after, restriction = restrict_rejected_contacts(
+        labels, report, [parent, descendant], points, triangles=faces, d_bar=1.)
+    np.testing.assert_array_equal(after, labels)
+    assert restriction["connectivity_rollbacks"] == ["parent"]
+    assert restriction["changed_vertex_count"] == 0

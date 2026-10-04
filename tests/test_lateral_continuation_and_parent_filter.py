@@ -10,6 +10,7 @@ from soyrootbio.lateral import (
     extend_lateral_tip,
     is_parent_tracking_candidate,
     resume_lateral_tip_in_batches,
+    grow_lateral_candidates,
 )
 from soyrootbio.pipeline import (
     _is_parent_owned_basal_connector,
@@ -92,6 +93,21 @@ def _z_tube(centerline: np.ndarray, radius: float = 0.020, ring_points: int = 16
         for center in centerline
     ]
     return np.vstack(rings)
+
+
+def test_default_growth_passes_old_80_step_cutoff_on_supported_tube():
+    points = _x_tube(np.arange(0.005, 0.65, 0.0005))
+    parent = np.array([[0., 0., .3], [0., 0., -.3]])
+    start = LateralStart(0, np.array([.005, 0., 0.]), np.zeros(3), 0,
+                         np.arange(8), direction=np.array([1., 0., 0.]))
+    kwargs = dict(d_bar=.001, step_multipliers=(2.5,), open_angles=(75.,))
+    limited = grow_lateral_candidates(points, [start], parent,
+                                      np.zeros(len(points), bool), max_steps=80, **kwargs)
+    default = grow_lateral_candidates(points, [start], parent,
+                                      np.zeros(len(points), bool), **kwargs)
+    assert max(path.points[-1, 0] for path in limited) < .4
+    assert max(path.points[-1, 0] for path in default) > .6
+    assert all(len(path.points) <= 302 for path in default)
 
 
 def test_tip_continuation_crosses_assignment_halo_and_reaches_supported_tip() -> None:

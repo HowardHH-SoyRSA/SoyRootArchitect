@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -19,6 +20,7 @@ from .runtime import worker_threads
 
 
 MAIN_TRACER_MAX_TURN_DEGREES = 100.0
+MAIN_TRACER_MAX_STEPS = 300
 MAIN_TRACER_TURN_ALIGNMENT_WEIGHT = 0.57
 MAIN_TRACER_LOCAL_DENSITY_WEIGHT = 0.20
 MAIN_TRACER_STEP_DISTANCE_WEIGHT = 0.15
@@ -26,6 +28,8 @@ MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT = 0.08
 MAIN_TRACER_OLD_DIRECTION_WEIGHT = 0.75
 MAIN_TRACER_NEW_DIRECTION_WEIGHT = 0.25
 FORK_HYPOTHESIS_MAX_PER_VARIANT = 2
+FORK_OBSERVATION_WINDOW = 14
+TRACING_PARALLEL_QUERY_MIN_POINTS = 512
 
 
 @dataclass
@@ -55,6 +59,181 @@ class _SupportIndex:
     points: np.ndarray
     tree: cKDTree
     source_indices: np.ndarray
+
+
+def _tracing_query_workers(query_count: int) -> int:
+    """Avoid starting worker threads for small, sequential tracing queries."""
+
+    return 1 if query_count < TRACING_PARALLEL_QUERY_MIN_POINTS else worker_threads()
+
+
+@dataclass(frozen=True)
+class _TraceCheckpoint:
+    """Exact state before a fork step, including packed ownership/visit masks."""
+
+    step_index: int
+    nodes: tuple[np.ndarray, ...]
+    current: np.ndarray
+    direction: np.ndarray
+    covered_bits: np.ndarray
+    selected_bits: np.ndarray
+    covered_members: tuple[int, ...]
+    local_radius: float
+    growth_arc: float
+    support_sum: float
+    turn_squared_sum: float
+    cumulative_turn_degrees: float
+    cumulative_score: float
+    radius_similarity_sum: float
+    radius_observations: int
+    fallback_steps: int
+    covered_recovery_steps: int
+    previous_turn_degrees: float
+    travel_fractions: tuple[float, ...]
+
+
+class _TraceEvidenceCache:
+    """Bounded evidence for one frozen source/support generation.
+
+    Each growth call owns a new cache. Only direction-independent density and
+    neighborhood centering are reused; radius projection is recomputed against
+    the actual trace direction. Nothing is reused after ownership changes.
+    """
+
+    def __init__(
+        self,
+        points: np.ndarray,
+        support_tree: cKDTree,
+        support_points: np.ndarray,
+        support_mask: np.ndarray | None = None,
+        *,
+        max_density_entries: int = 32768,
+        max_neighborhood_entries: int = 4096,
+        max_neighborhood_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        self.points = np.asarray(points, dtype=float)
+        self.support_tree = support_tree
+        self.support_points = np.asarray(support_points, dtype=float)
+        self.support_mask = (
+            None if support_mask is None else np.asarray(support_mask, dtype=bool).copy()
+        )
+        self.max_density_entries = max(0, int(max_density_entries))
+        self.max_neighborhood_entries = max(0, int(max_neighborhood_entries))
+        self.max_neighborhood_bytes = max(0, int(max_neighborhood_bytes))
+        self._density: OrderedDict[tuple[float, int], float] = OrderedDict()
+        self._neighborhoods: OrderedDict[
+            tuple[float, bytes], tuple[np.ndarray, np.ndarray]
+        ] = OrderedDict()
+        self.neighborhood_bytes = 0
+
+    def density(self, indices: np.ndarray, *, radius: float) -> np.ndarray:
+        ids = np.asarray(indices, dtype=int)
+        result = np.empty(len(ids), dtype=float)
+        missing: dict[tuple[float, int], list[int]] = {}
+        for position, index in enumerate(ids):
+            key = (float(radius), int(index))
+            if key in self._density:
+                result[position] = self._density[key]
+                self._density.move_to_end(key)
+            else:
+                missing.setdefault(key, []).append(position)
+        if missing:
+            keys = list(missing)
+            values = _local_support_counts(
+                self.support_tree,
+                self.points[np.asarray([key[1] for key in keys], dtype=int)],
+                radius=radius,
+                support_mask=self.support_mask,
+            )
+            for key, value in zip(keys, values, strict=True):
+                result[missing[key]] = value
+                if self.max_density_entries:
+                    self._density[key] = float(value)
+                    while len(self._density) > self.max_density_entries:
+                        self._density.popitem(last=False)
+        return result
+
+    def neighborhoods(
+        self, query_points: np.ndarray, *, radius: float
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        query = np.asarray(query_points, dtype=float)
+        keys = [(float(radius), point.tobytes()) for point in query]
+        result: list[tuple[np.ndarray, np.ndarray] | None] = [None] * len(query)
+        missing: dict[tuple[float, bytes], list[int]] = {}
+        for position, key in enumerate(keys):
+            if key in self._neighborhoods:
+                result[position] = self._neighborhoods[key]
+                self._neighborhoods.move_to_end(key)
+            else:
+                missing.setdefault(key, []).append(position)
+        if missing:
+            missing_keys = list(missing)
+            positions = [missing[key][0] for key in missing_keys]
+            nearby_batches = self.support_tree.query_ball_point(
+                query[positions], r=float(radius),
+                workers=_tracing_query_workers(len(positions)),
+            )
+            for key, nearby_raw in zip(missing_keys, nearby_batches, strict=True):
+                nearby = np.asarray(nearby_raw, dtype=int)
+                if self.support_mask is not None and len(nearby):
+                    nearby = nearby[self.support_mask[nearby]]
+                if len(nearby) >= 6:
+                    samples = self.support_points[nearby]
+                    centered = samples - np.median(samples, axis=0)
+                else:
+                    centered = np.empty((0, 3), dtype=float)
+                entry = (nearby, centered)
+                for position in missing[key]:
+                    result[position] = entry
+                size = nearby.nbytes + centered.nbytes
+                if (
+                    self.max_neighborhood_entries
+                    and size <= self.max_neighborhood_bytes
+                ):
+                    self._neighborhoods[key] = entry
+                    self.neighborhood_bytes += size
+                    while (
+                        len(self._neighborhoods) > self.max_neighborhood_entries
+                        or self.neighborhood_bytes > self.max_neighborhood_bytes
+                    ):
+                        _, evicted = self._neighborhoods.popitem(last=False)
+                        self.neighborhood_bytes -= sum(array.nbytes for array in evicted)
+        return [entry for entry in result if entry is not None]
+
+
+def _first_fork_alternative(
+    unit: np.ndarray,
+    density: np.ndarray,
+    score: np.ndarray,
+    ranked_positions: np.ndarray,
+    best_position: int,
+    minimum_local_support: int,
+) -> tuple[int, float] | None:
+    """Find the same first eligible alternative with a scalar boundary guard."""
+
+    selected_density = float(density[best_position])
+    selected_score = float(score[best_position])
+    eligible = (
+        (ranked_positions != best_position)
+        & ~(density[ranked_positions] < max(float(minimum_local_support), 0.35 * selected_density))
+        & ~(score[ranked_positions] < selected_score - 0.75)
+    )
+    positions = ranked_positions[eligible]
+    if not len(positions):
+        return None
+    selected_direction = unit[best_position]
+    # Batched angles only eliminate proposals far from the original bounds.
+    # The chosen angle is always computed by the original scalar expression.
+    angles = np.degrees(np.arccos(np.clip(unit[positions] @ selected_direction, -1.0, 1.0)))
+    positions = positions[~((angles < 42.0 - 1e-10) | (angles > 145.0 + 1e-10))]
+    for alternate_position_raw in positions:
+        alternate_position = int(alternate_position_raw)
+        separation = float(np.degrees(np.arccos(np.clip(
+            np.dot(selected_direction, unit[alternate_position]), -1.0, 1.0,
+        ))))
+        if not (separation < 42.0 or separation > 145.0):
+            return alternate_position, separation
+    return None
 
 
 def estimate_parent_radius_profile(
@@ -727,13 +906,14 @@ def grow_lateral_candidates(
     d_bar: float,
     step_multipliers: tuple[float, ...] = (2.5, 4.0, 6.0),
     open_angles: tuple[float, ...] = (35.0, 55.0, 75.0),
-    max_steps: int = 80,
+    max_steps: int = MAIN_TRACER_MAX_STEPS,
     search_radius_factor: float = 2.2,
     cooperate: Callable[[], None] | None = None,
     parent_radius_profile: np.ndarray | None = None,
     ancestor_exclusion_mask: np.ndarray | None = None,
     point_tree: cKDTree | None = None,
     parent_tree: cKDTree | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[RootPath]:
     if not starts:
         return []
@@ -761,8 +941,13 @@ def grow_lateral_candidates(
     # Count only biologically eligible support in SciPy's batched
     # ``return_length`` path, without materialising full-cloud neighbor lists.
     novel_support_index = _build_support_index(points, novel_support_mask)
+    evidence_cache = _TraceEvidenceCache(
+        points, novel_support_index.tree, novel_support_index.points,
+    )
     candidates: list[RootPath] = []
-    for start in starts:
+    for start_position, start in enumerate(starts):
+        if progress_callback is not None:
+            progress_callback(start_position, len(starts))
         if cooperate is not None:
             cooperate()
         outward = (
@@ -822,6 +1007,7 @@ def grow_lateral_candidates(
                         limit_primary_angle_to_insertion=True,
                         density_support_index=novel_support_index,
                         cooperate=cooperate,
+                        evidence_cache=evidence_cache,
                     )
                     hypothesis_group = (
                         f"{start.start_id}:{direction_label}:"
@@ -890,6 +1076,8 @@ def grow_lateral_candidates(
                     (8.0, 10.0),
                     (55.0, 75.0),
                 )
+    if progress_callback is not None:
+        progress_callback(len(starts), len(starts))
     return candidates
 
 
@@ -908,6 +1096,8 @@ def _grow_candidate_hypotheses(
     limit_primary_angle_to_insertion: bool,
     density_support_index: _SupportIndex | None,
     cooperate: Callable[[], None] | None,
+    replay_from_checkpoint: bool = True,
+    evidence_cache: _TraceEvidenceCache | None = None,
 ) -> list[RootPath]:
     """Trace the default route plus one sustained recent-fork alternative.
 
@@ -917,7 +1107,16 @@ def _grow_candidate_hypotheses(
     the proposal score at the fork cannot by itself create a hypothesis.
     """
 
-    observations: list[dict[str, float | int]] = []
+    observations: deque[dict[str, float | int]] = deque()
+    checkpoints: dict[int, _TraceCheckpoint] | None = (
+        {} if replay_from_checkpoint else None
+    )
+    if evidence_cache is None:
+        evidence_cache = _TraceEvidenceCache(
+            points,
+            point_tree if density_support_index is None else density_support_index.tree,
+            points if density_support_index is None else density_support_index.points,
+        )
     base = _grow_one_candidate(
         points=points,
         point_tree=point_tree,
@@ -933,6 +1132,8 @@ def _grow_candidate_hypotheses(
         density_support_index=density_support_index,
         cooperate=cooperate,
         fork_observations=observations,
+        fork_checkpoints=checkpoints,
+        evidence_cache=evidence_cache,
     )
     base_steps = max(0, len(base.points) - 2)
     recent_window = max(6, min(14, int(np.ceil(0.25 * max(base_steps, 1)))))
@@ -963,6 +1164,8 @@ def _grow_candidate_hypotheses(
         if len(retained) >= FORK_HYPOTHESIS_MAX_PER_VARIANT:
             break
         fork_step = int(observation["step_index"])
+        if cooperate is not None:
+            cooperate()
         alternate = _grow_one_candidate(
             points=points,
             point_tree=point_tree,
@@ -980,6 +1183,10 @@ def _grow_candidate_hypotheses(
             forced_step_indices={
                 fork_step: int(observation["alternate_point_index"])
             },
+            resume_checkpoint=(
+                checkpoints.get(fork_step) if checkpoints is not None else None
+            ),
+            evidence_cache=evidence_cache,
         )
         common_prefix = _common_prefix_node_count(
             base.points,
@@ -1009,7 +1216,7 @@ def _grow_candidate_hypotheses(
         alternate_to_base, _ = cKDTree(base.points).query(
             alternate_suffix,
             k=1,
-            workers=worker_threads(),
+            workers=_tracing_query_workers(len(alternate_suffix)),
         )
         departure = (
             float(np.quantile(alternate_to_base, 0.75))
@@ -1119,6 +1326,11 @@ def _grow_candidate_hypotheses(
                         if hypothesis_index == 0
                         else alternate_evidence_score
                     ),
+                    "fork_hypothesis_independent_evidence_score": (
+                        (selected_evidence_score - 0.25 * base_suffix_extent / extent_scale)
+                        if hypothesis_index == 0
+                        else (alternate_evidence_score - 0.25 * suffix_extent / extent_scale)
+                    ) / 0.75,
                 }
             )
         retained.append(alternate)
@@ -1161,7 +1373,10 @@ def _grow_one_candidate(
     density_support_mask: np.ndarray | None = None,
     density_support_index: _SupportIndex | None = None,
     forced_step_indices: dict[int, int] | None = None,
-    fork_observations: list[dict[str, float | int]] | None = None,
+    fork_observations: list[dict[str, float | int]] | deque[dict[str, float | int]] | None = None,
+    fork_checkpoints: dict[int, _TraceCheckpoint] | None = None,
+    resume_checkpoint: _TraceCheckpoint | None = None,
+    evidence_cache: _TraceEvidenceCache | None = None,
 ) -> RootPath:
     """Grow one trace and optionally record or force supported fork choices."""
 
@@ -1188,13 +1403,13 @@ def _grow_one_candidate(
         support_tree = density_support_index.tree
         support_points = density_support_index.points
         support_mask = None
-    local_radius = _estimate_local_radius(
-        support_tree,
-        support_points,
-        current,
-        direction,
-        radius=0.75 * float(search_radius),
-        support_mask=support_mask,
+    local_radius = (
+        resume_checkpoint.local_radius if resume_checkpoint is not None
+        else _estimate_local_radius(
+            support_tree, support_points, current, direction,
+            radius=0.75 * float(search_radius), support_mask=support_mask,
+            evidence_cache=evidence_cache,
+        )
     )
     growth_arc = 0.0
     support_sum = 0.0
@@ -1207,14 +1422,39 @@ def _grow_one_candidate(
     covered_recovery_steps = 0
     previous_turn_degrees = 0.0
     travel_fractions: list[float] = []
+    first_step = 0
+    if resume_checkpoint is not None:
+        state = resume_checkpoint
+        first_step = state.step_index
+        nodes = [node.copy() for node in state.nodes]
+        current = state.current.copy()
+        direction = state.direction.copy()
+        covered_mask = np.unpackbits(state.covered_bits, count=len(points)).astype(bool)
+        selected_mask = np.unpackbits(state.selected_bits, count=len(points)).astype(bool)
+        covered_members = list(state.covered_members)
+        growth_arc = state.growth_arc
+        support_sum = state.support_sum
+        turn_squared_sum = state.turn_squared_sum
+        cumulative_turn_degrees = state.cumulative_turn_degrees
+        cumulative_score = state.cumulative_score
+        radius_similarity_sum = state.radius_similarity_sum
+        radius_observations = state.radius_observations
+        fallback_steps = state.fallback_steps
+        covered_recovery_steps = state.covered_recovery_steps
+        previous_turn_degrees = state.previous_turn_degrees
+        travel_fractions = list(state.travel_fractions)
+        if cooperate is not None:
+            cooperate()
 
-    for step_index in range(max_steps):
+    for step_index in range(first_step, max_steps):
+        pre_step_fallback = fallback_steps
+        pre_step_recovery = covered_recovery_steps
         if cooperate is not None and step_index % 8 == 0:
             cooperate()
         nearby_indices = point_tree.query_ball_point(
             current,
             r=search_radius,
-            workers=worker_threads(),
+            workers=1,
         )
         local = np.asarray(nearby_indices, dtype=int)
         if len(local):
@@ -1303,7 +1543,7 @@ def _grow_one_candidate(
                 ).query(
                     points[local],
                     k=1,
-                    workers=worker_threads(),
+                    workers=_tracing_query_workers(len(local)),
                 )
                 recovery &= np.asarray(prior_distances, dtype=float) >= (
                     0.29 * float(step_length)
@@ -1320,11 +1560,12 @@ def _grow_one_candidate(
         unit = unit[valid]
         distances = distances[valid]
         turn_cos = turn_cos[valid]
-        density = _local_support_counts(
-            support_tree,
-            points[local],
-            radius=0.75 * float(search_radius),
-            support_mask=support_mask,
+        density = (
+            evidence_cache.density(local, radius=0.75 * float(search_radius))
+            if evidence_cache is not None else _local_support_counts(
+                support_tree, points[local],
+                radius=0.75 * float(search_radius), support_mask=support_mask,
+            )
         )
         distance_score = -np.abs(distances - step_length) / max(
             float(step_length),
@@ -1348,6 +1589,7 @@ def _grow_one_candidate(
             unit[shortlist],
             radius=0.75 * float(search_radius),
             support_mask=support_mask,
+            evidence_cache=evidence_cache,
         )
         radius_similarity = np.full(len(local), 0.5, dtype=float)
         radius_similarity[shortlist] = _radius_continuity_scores(
@@ -1358,8 +1600,16 @@ def _grow_one_candidate(
             base_score
             + MAIN_TRACER_RADIUS_CONTINUITY_WEIGHT * radius_similarity
         )
-        ranked_positions = np.argsort(-score, kind="stable")
-        best_position = int(ranked_positions[0])
+        ranked_positions = (
+            np.argsort(-score, kind="stable")
+            if fork_observations is not None else None
+        )
+        # Stable descending sort picks the first maximum. Keep the original
+        # NaN ordering too, even though ordinary trace scores are finite.
+        best_position = int(
+            ranked_positions[0] if ranked_positions is not None else
+            (np.argmax(score) if np.isfinite(score).all() else np.argsort(-score, kind="stable")[0])
+        )
         forced_step = bool(
             forced_step_indices and step_index in forced_step_indices
         )
@@ -1369,42 +1619,36 @@ def _grow_one_candidate(
             )
             if len(forced_matches):
                 best_position = int(forced_matches[0])
-        if fork_observations is not None and len(ranked_positions) > 1:
-            selected_direction = unit[best_position]
+        if fork_observations is not None and ranked_positions is not None and len(ranked_positions) > 1:
             selected_density = float(density[best_position])
             selected_score = float(score[best_position])
-            for alternate_position_raw in ranked_positions:
-                alternate_position = int(alternate_position_raw)
-                if alternate_position == best_position:
-                    continue
-                separation = float(
-                    np.degrees(
-                        np.arccos(
-                            np.clip(
-                                np.dot(
-                                    selected_direction,
-                                    unit[alternate_position],
-                                ),
-                                -1.0,
-                                1.0,
-                            )
-                        )
-                    )
-                )
-                if separation < 42.0 or separation > 145.0:
-                    continue
+            alternative = _first_fork_alternative(
+                unit, density, score, ranked_positions,
+                best_position, minimum_local_support,
+            )
+            if alternative is not None:
+                alternate_position, separation = alternative
                 alternate_density = float(density[alternate_position])
                 alternate_score = float(score[alternate_position])
-                if alternate_density < max(
-                    float(minimum_local_support),
-                    0.35 * selected_density,
-                ):
-                    continue
-                # The turn term alone can differ by 0.57 for a right-angle
-                # fork. Keep the alternate for sustained-window validation;
-                # the one-point tangent preference must not suppress it here.
-                if alternate_score < selected_score - 0.75:
-                    continue
+                if fork_checkpoints is not None:
+                    fork_checkpoints[step_index] = _TraceCheckpoint(
+                        step_index=step_index,
+                        nodes=tuple(node.copy() for node in nodes),
+                        current=current.copy(), direction=direction.copy(),
+                        covered_bits=np.packbits(covered_mask),
+                        selected_bits=np.packbits(selected_mask),
+                        covered_members=tuple(covered_members),
+                        local_radius=local_radius, growth_arc=growth_arc,
+                        support_sum=support_sum, turn_squared_sum=turn_squared_sum,
+                        cumulative_turn_degrees=cumulative_turn_degrees,
+                        cumulative_score=cumulative_score,
+                        radius_similarity_sum=radius_similarity_sum,
+                        radius_observations=radius_observations,
+                        fallback_steps=pre_step_fallback,
+                        covered_recovery_steps=pre_step_recovery,
+                        previous_turn_degrees=previous_turn_degrees,
+                        travel_fractions=tuple(travel_fractions),
+                    )
                 fork_observations.append(
                     {
                         "step_index": int(step_index),
@@ -1441,7 +1685,6 @@ def _grow_one_candidate(
                         else 0.0,
                     }
                 )
-                break
         next_index = int(local[best_position])
         next_point = np.asarray(points[next_index], dtype=float)
         segment = next_point - current
@@ -1494,7 +1737,7 @@ def _grow_one_candidate(
             # points at or behind that section are consumed below; forward
             # points remain available to the ordinary adaptive travel rule.
             r=0.90 * float(search_radius),
-            workers=worker_threads(),
+            workers=1,
         )
         local_covered_array = np.asarray(local_covered, dtype=int)
         if len(local_covered_array):
@@ -1517,6 +1760,19 @@ def _grow_one_candidate(
         cumulative_score += float(score[best_position])
         previous_turn_degrees = turn_angle
         travel_fractions.append(float(travel_fraction))
+        if fork_observations is not None:
+            while (
+                fork_observations
+                and step_index + 1 - int(fork_observations[0]["step_index"])
+                > FORK_OBSERVATION_WINDOW
+            ):
+                oldest = (
+                    fork_observations.popleft()
+                    if isinstance(fork_observations, deque)
+                    else fork_observations.pop(0)
+                )
+                if fork_checkpoints is not None:
+                    fork_checkpoints.pop(int(oldest["step_index"]), None)
 
     steps = max(0, len(nodes) - 2)
     turn_rms = float(
@@ -1618,7 +1874,7 @@ def _adaptive_minimum_travel_fraction(
     return 0.375
 
 
-TIP_EXTENSION_MAX_STEPS = 90
+TIP_EXTENSION_MAX_STEPS = 300
 TIP_EXTENSION_BATCH_STEPS = 30
 
 
@@ -2205,31 +2461,42 @@ def select_non_overlapping_paths(
     selected: list[RootPath] = []
     used: set[int] = set(initial_used or ())
     pool = sorted(candidates, key=lambda p: (p.score, p.length), reverse=True)
+    # Selection is still the same ordered greedy policy. Static duplicate
+    # evidence is evaluated lazily once per directed pair, while support
+    # overlap changes only when a previously unused vertex is claimed.
+    support = {id(path): (path.novel_support_indices
+                         if path.novel_support_indices is not None
+                         else path.covered_indices) for path in pool}
+    growth_lengths = {id(path): float(path.score_components.get("trace_growth_arc", path.length))
+                      for path in pool}
+    overlap_counts = {key: len(vertices & used) for key, vertices in support.items()}
+    subscribers: dict[int, list[int]] = {}
+    for key, vertices in support.items():
+        for vertex in vertices:
+            subscribers.setdefault(vertex, []).append(key)
+    duplicate_evidence: dict[tuple[int, int], bool] = {}
+    retained_trees: dict[int, cKDTree] = {}
+
+    def duplicate(path: RootPath, retained: RootPath) -> bool:
+        key = (id(path), id(retained))
+        if key not in duplicate_evidence:
+            duplicate_evidence[key] = _is_truncated_path_duplicate(
+                path, retained, d_bar=d_bar, retained_trees=retained_trees,
+            )
+        return duplicate_evidence[key]
+
     while pool:
         best_path = None
         best_value = 0.0
         for path in pool:
-            if any(
-                _is_truncated_path_duplicate(
-                    path,
-                    retained,
-                    d_bar=d_bar,
-                )
-                for retained in selected
-            ):
+            if any(duplicate(path, retained) for retained in selected):
                 continue
-            covered = (
-                path.novel_support_indices
-                if path.novel_support_indices is not None
-                else path.covered_indices
-            )
+            covered = support[id(path)]
             if path.novel_support_indices is not None and not covered:
                 continue
-            overlap = len(covered & used)
-            novel = len(covered - used)
-            growth_length = float(
-                path.score_components.get("trace_growth_arc", path.length)
-            )
+            overlap = overlap_counts[id(path)]
+            novel = len(covered) - overlap
+            growth_length = growth_lengths[id(path)]
             longest_path_reward = (
                 0.35 * growth_length / max(float(d_bar), 1e-12)
             )
@@ -2245,11 +2512,10 @@ def select_non_overlapping_paths(
         if best_path is None:
             break
         selected.append(best_path)
-        best_support = (
-            best_path.novel_support_indices
-            if best_path.novel_support_indices is not None
-            else best_path.covered_indices
-        )
+        best_support = support[id(best_path)]
+        for vertex in best_support - used:
+            for key in subscribers.get(vertex, ()):
+                overlap_counts[key] += 1
         used.update(best_support)
         pool = [path for path in pool if path is not best_path]
         if max_paths is not None and len(selected) >= max_paths:
@@ -2265,6 +2531,7 @@ def _is_truncated_path_duplicate(
     retained: RootPath,
     *,
     d_bar: float,
+    retained_trees: dict[int, cKDTree] | None = None,
 ) -> bool:
     """Return whether a short trace stays on the basal prefix of a longer one."""
 
@@ -2276,7 +2543,12 @@ def _is_truncated_path_duplicate(
         np.cos(np.radians(35.0))
     ):
         return False
-    distances, _ = cKDTree(retained.points).query(
+    tree = retained_trees.get(id(retained)) if retained_trees is not None else None
+    if tree is None:
+        tree = cKDTree(retained.points)
+        if retained_trees is not None:
+            retained_trees[id(retained)] = tree
+    distances, _ = tree.query(
         candidate.points,
         k=1,
         workers=worker_threads(),
@@ -2420,7 +2692,7 @@ def _local_support_counts(
             tree.query_ball_point(
                 query,
                 r=float(radius),
-                workers=worker_threads(),
+                workers=_tracing_query_workers(len(query)),
                 return_length=True,
             ),
             dtype=float,
@@ -2428,7 +2700,7 @@ def _local_support_counts(
     neighborhoods = tree.query_ball_point(
         query,
         r=float(radius),
-        workers=worker_threads(),
+        workers=_tracing_query_workers(len(query)),
     )
     mask = np.asarray(support_mask, dtype=bool)
     return np.fromiter(
@@ -2449,6 +2721,7 @@ def _estimate_local_radius(
     *,
     radius: float,
     support_mask: np.ndarray | None,
+    evidence_cache: _TraceEvidenceCache | None = None,
 ) -> float:
     return float(
         _local_radius_estimates(
@@ -2458,6 +2731,7 @@ def _estimate_local_radius(
             np.asarray(direction, dtype=float)[None, :],
             radius=radius,
             support_mask=support_mask,
+            evidence_cache=evidence_cache,
         )[0]
     )
 
@@ -2470,6 +2744,7 @@ def _local_radius_estimates(
     *,
     radius: float,
     support_mask: np.ndarray | None,
+    evidence_cache: _TraceEvidenceCache | None = None,
 ) -> np.ndarray:
     """Estimate a robust local tube scale perpendicular to each trace tangent.
 
@@ -2483,17 +2758,22 @@ def _local_radius_estimates(
         raise ValueError("query_points must have shape (n, 3)")
     if axes.shape != query.shape:
         raise ValueError("directions must match query_points")
-    neighborhoods = tree.query_ball_point(
-        query,
-        r=float(radius),
-        workers=worker_threads(),
+    cached = (
+        evidence_cache.neighborhoods(query, radius=radius)
+        if evidence_cache is not None else None
+    )
+    neighborhoods = (
+        [entry[0] for entry in cached] if cached is not None
+        else tree.query_ball_point(
+            query, r=float(radius), workers=_tracing_query_workers(len(query)),
+        )
     )
     mask = None if support_mask is None else np.asarray(support_mask, dtype=bool)
     estimates = np.full(len(query), np.nan, dtype=float)
     source = np.asarray(points, dtype=float)
     for index, nearby_raw in enumerate(neighborhoods):
         nearby = np.asarray(nearby_raw, dtype=int)
-        if mask is not None and len(nearby):
+        if cached is None and mask is not None and len(nearby):
             nearby = nearby[mask[nearby]]
         if len(nearby) < 6:
             continue
@@ -2502,8 +2782,11 @@ def _local_radius_estimates(
         if axis_norm <= 1e-12:
             continue
         axis = axis / axis_norm
-        samples = source[nearby]
-        centered = samples - np.median(samples, axis=0)
+        if cached is not None:
+            centered = cached[index][1]
+        else:
+            samples = source[nearby]
+            centered = samples - np.median(samples, axis=0)
         axial = centered @ axis
         perpendicular = centered - axial[:, None] * axis
         radial = np.linalg.norm(perpendicular, axis=1)
@@ -2620,7 +2903,3 @@ def _perpendicular_vector(vector: np.ndarray) -> np.ndarray:
         helper = np.array([0.0, 1.0, 0.0])
     perp = helper - np.dot(helper, vector) * vector
     return perp / max(np.linalg.norm(perp), 1e-12)
-
-
-
-
