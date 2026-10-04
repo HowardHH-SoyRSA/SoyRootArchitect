@@ -40,6 +40,7 @@ from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
 from .primary_surface import reconcile_primary_surface_tracks
 from .fork_recovery import recover_unassigned_fork_arms
 from .junction_transections import trim_primary_junctions
+from .junction_tubes import reconcile_parent_owned_tubes
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
     _polyline_projection_distance_and_arc,
@@ -1059,6 +1060,19 @@ def _run_pipeline_impl(
     attachment_constraint_report["final_contact_restriction"] = final_attachment_restriction
     mark_final_attachment_qc(selected, final_attachment)
     mark_higher_order_primary_contact_qc(selected, primary_contact_report)
+    # A connected parent sleeve survives component-based cleanup. Measure
+    # the exposed child's surface independently of its attachment/trace, at
+    # every order, before final labels are used for fitting and measurement.
+    full_root_labels, child_tube_report = reconcile_parent_owned_tubes(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=full_nonroot_mask, mesh_context=mesh_context,
+    )
+    tube_rows = {row['root_id']: row for row in child_tube_report['junctions']}
+    for root in selected:
+        row = tube_rows.get(root.root_id, {})
+        if row.get('proposed_vertex_count', 0) and row.get('status', '').startswith('unresolved_'):
+            root.qc_flags = list(dict.fromkeys([*root.qc_flags, 'parent_owned_tube_unresolved']))
     cleaned_analysis_labels: np.ndarray | None = None
     if analysis_to_full is not None:
         cleaned_analysis_labels = full_root_labels[analysis_to_full]
@@ -1459,6 +1473,7 @@ def _run_pipeline_impl(
         "primary_surface_track_reconciliation": primary_surface_report,
         "final_centerline_fitting": final_centerline_report,
         "branch_facing_transection_trimming": transection_report,
+        "parent_owned_tube_reconciliation": child_tube_report,
         "final_surface_cleanup": final_surface_cleanup_report,
         "joint_root_collar": collar_report,
         "parent_contact_reconciliation": {
@@ -3870,5 +3885,4 @@ def _update_metadata_timings(path: Path, timings: dict[str, float]) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["stage_timings_seconds"] = timings
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-
 
