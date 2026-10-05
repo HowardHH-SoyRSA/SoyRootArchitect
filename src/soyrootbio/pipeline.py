@@ -50,7 +50,7 @@ from .surface_patches import (
 from .surface_patch_audit import audit_discrete_child_patches
 from .export import export_results
 from .centerline import refit_final_centerlines
-from .surface_reference import load_surface_reference, apply_surface_reference
+from .surface_reference import load_surface_reference, apply_surface_reference, tube_claim_limits
 from .primary_guidance import (
     PRIMARY_GUIDANCE_FILENAME,
     PrimaryGuidance,
@@ -1087,6 +1087,8 @@ def _run_pipeline_impl(
         full_normalized, full_root_labels, primary.points, selected,
         d_bar=d_bar, triangles=cloud.triangles,
         excluded_mask=full_nonroot_mask, mesh_context=mesh_context,
+        reference_limits=(tube_claim_limits(surface_reference, full_root_labels, selected, full_nonroot_mask)
+                          if surface_reference is not None else None),
     )
     tube_rows = {row['root_id']: row for row in child_tube_report['junctions']}
     for root in selected:

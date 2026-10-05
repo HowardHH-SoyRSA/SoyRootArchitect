@@ -22,6 +22,7 @@ def reconcile_parent_owned_tubes(
     roots: list[RootPath], *, d_bar: float, triangles: np.ndarray | None,
     excluded_mask: np.ndarray | None = None,
     mesh_context: MeshGeometryContext | None = None,
+    reference_limits: dict[int, dict] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Reclaim a measured child tube from its direct parent at any order.
 
@@ -83,6 +84,26 @@ def reconcile_parent_owned_tubes(
         row['proposed_vertex_count'] = int(len(ids))
         report['junctions'].append(row)
         proposals[label] = row
+        limit = (reference_limits or {}).get(label)
+        if limit is not None:
+            outside = np.asarray(limit['outside_mask'], dtype=bool)
+            if outside.shape != before.shape or limit['expected_vertices'] <= 0:
+                raise ValueError('Reviewed tube limits must match the native surface')
+            additional = int(np.count_nonzero(outside[ids]))
+            fraction = (limit['existing_differences'] + additional) / limit['expected_vertices']
+            row['reference_claim_limit'] = {
+                key: value for key, value in limit.items() if key != 'outside_mask'
+            }
+            row['reference_claim_limit'].update(additional_difference_vertices=additional,
+                                                 proposed_difference_fraction=fraction)
+            if additional and fraction > limit['maximum_difference_fraction']:
+                # Retain the entire original sleeve rather than clipping a
+                # connected proposal to an arbitrary tolerance boundary. The
+                # approved reference can assign its own surface later. Other
+                # proposals still undergo the normal joint connectivity and
+                # primary-contact checks against these retained labels.
+                row['status'] = 'retained_reference_bound'
+                continue
         better = scores < best[ids]
         second[ids] = np.where(better, best[ids], np.minimum(second[ids], scores))
         best[ids] = np.minimum(best[ids], scores)
@@ -159,6 +180,8 @@ def reconcile_parent_owned_tubes(
         retain_connected_claims()
     for label, row in proposals.items():
         row['transferred_vertex_count'] = int(np.sum((before != result) & (result == label)))
+        if row['status'] == 'retained_reference_bound':
+            continue
         if row['transferred_vertex_count']:
             row['status'] = 'reassigned_measured_child_tube'
         elif row['proposed_vertex_count'] and not row['status'].startswith('unresolved_'):

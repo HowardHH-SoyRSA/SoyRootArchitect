@@ -9,7 +9,8 @@ import numpy as np
 from soyrootbio.centerline import refit_final_centerlines
 from soyrootbio.junction_tubes import reconcile_parent_owned_tubes
 from soyrootbio.mesh_geometry import MeshGeometryContext
-from soyrootbio.surface_reference import KEEP, SCHEMA, apply_surface_reference, load_surface_reference
+from soyrootbio.surface_reference import (KEEP, SCHEMA, SurfaceReference, apply_surface_reference,
+                                         load_surface_reference, tube_claim_limits)
 from soyrootbio.topology import validate_root_tree
 from soyrootbio.traits import compute_traits
 from soyrootbio.types import Normalization, RootPath
@@ -124,3 +125,56 @@ def test_tube_then_reference_refit_preserves_unrelated_correction_and_selected_t
                             primary_centerline_assessment=final_report['roots'][0]).set_index('root_id')
     for rid, label in mapping.items():
         assert traits.loc[rid, 'point_count'] == np.count_nonzero(final_labels == label)
+
+
+def test_reviewed_bound_declines_whole_new_tube_without_removing_existing_support():
+    points, before, primary, children, faces, _ = junction()
+    excluded = np.zeros(len(points), bool)
+    automatic, _ = reconcile_parent_owned_tubes(
+        points, before, primary, children, d_bar=.004, triangles=faces)
+    additions = np.flatnonzero((automatic == 1) & (before == 0))
+    assert len(additions) > 0
+    requested = np.full(len(points), KEEP, np.int32)
+    requested[before == 1] = 1
+    anchors = np.where(before == 1, 1, 0).astype(np.int32)
+    reference = SurfaceReference(
+        {'owners': [{'reference_root_id': 'reviewed'}], 'maximum_difference_fraction': .02},
+        requested, anchors, excluded.copy(), 'manifest', 'data')
+    limits = tube_claim_limits(reference, before, children, excluded)
+    limited, report = reconcile_parent_owned_tubes(
+        points, before, primary, children, d_bar=.004, triangles=faces,
+        reference_limits=limits)
+    np.testing.assert_array_equal(limited, before)
+    row = report['junctions'][0]
+    assert row['status'] == 'retained_reference_bound'
+    assert row['proposed_vertex_count'] > 0
+    assert row['transferred_vertex_count'] == 0
+    assert row['reference_claim_limit']['proposed_difference_fraction'] > .02
+
+    # One extra reviewed-owner vertex is within tolerance. All automatic
+    # claims, including that small permitted difference, remain unchanged.
+    requested[automatic == 1] = 1
+    requested[additions[0]] = KEEP
+    accepted, accepted_report = reconcile_parent_owned_tubes(
+        points, before, primary, children, d_bar=.004, triangles=faces,
+        reference_limits=tube_claim_limits(reference, before, children, excluded))
+    np.testing.assert_array_equal(accepted, automatic)
+    assert accepted_report['transferred_vertex_count'] > 0
+
+
+def test_reference_tube_limit_counts_only_extras_that_survive_explicit_scope():
+    roots = [RootPath('child', np.array([[0., 0., 0.], [1., 0., 0.]]))]
+    before = np.array([1, 1, 1, 0, 0, -1])
+    excluded = np.array([False, False, False, False, False, True])
+    reference = SurfaceReference(
+        {'owners': [{'reference_root_id': 'reviewed'}], 'maximum_difference_fraction': .02},
+        np.array([1, 1, -1, 1, KEEP, 1]), np.array([1, 1, 0, 0, 0, 0]),
+        np.zeros(6, bool), 'manifest', 'data')
+    limit = tube_claim_limits(reference, before, roots, excluded)[1]
+    # The explicit release at vertex 2 disappears later. The excluded
+    # requested vertex remains a difference; it cannot be reassigned.
+    assert limit['existing_differences'] == 1
+    assert limit['expected_vertices'] == 4
+    np.testing.assert_array_equal(limit['outside_mask'], [False, False, False, False, True, False])
+    reference.anchors[:] = 0
+    assert tube_claim_limits(reference, before, roots, excluded) == {}

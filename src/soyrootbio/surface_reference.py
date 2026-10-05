@@ -41,6 +41,45 @@ class SurfaceReference:
     data_sha256: str
 
 
+def tube_claim_limits(reference, labels, roots, excluded_mask):
+    """Bound new automatic sleeve claims using frozen reviewed surface anchors.
+
+    This only limits future proposals. Existing ownership is never removed,
+    and uncertain anchor matches are left to the final reference validation.
+    Vertices explicitly assigned by the later reference do not consume the
+    extra-surface allowance; KEEP vertices will retain their automatic owner.
+    """
+    before = np.asarray(labels, dtype=int)
+    excluded = np.asarray(excluded_mask, dtype=bool)
+    if before.shape != reference.requested.shape or excluded.shape != before.shape:
+        raise ValueError("Reference tube limits must match native vertices")
+    owners = reference.manifest["owners"]
+    scores = np.zeros((len(owners), len(roots)), dtype=int)
+    for index in range(len(owners)):
+        values = before[(reference.anchors == index + 1) & ~excluded]
+        scores[index] = np.bincount(values[values > 0], minlength=len(roots) + 1)[1:]
+    assignment = dict(zip(*linear_sum_assignment(-scores))) if len(roots) else {}
+    retained = (reference.requested == KEEP) | excluded
+    limits = {}
+    for index, owner in enumerate(owners):
+        column = assignment.get(index)
+        anchor_count = np.count_nonzero((reference.anchors == index + 1) & ~excluded)
+        if column is None or not anchor_count or scores[index, column] < .5 * anchor_count:
+            continue
+        label = int(column + 1)
+        expected = reference.requested == index + 1
+        outside = retained & ~expected
+        limits[label] = {
+            "reference_root_id": owner["reference_root_id"],
+            "outside_mask": outside,
+            "expected_vertices": int(expected.sum()),
+            "existing_differences": int(np.count_nonzero((before == label) & outside)
+                + np.count_nonzero(expected & excluded & (before != label))),
+            "maximum_difference_fraction": float(reference.manifest.get("maximum_difference_fraction", .02)),
+        }
+    return limits
+
+
 def load_surface_reference(path, source_points, triangles) -> SurfaceReference:
     """Fail closed on different geometry, ordering, duplicates, or data content."""
     path = Path(path)
