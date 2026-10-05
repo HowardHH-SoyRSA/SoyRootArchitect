@@ -171,4 +171,3 @@ def test_parent_cut_rollback_cannot_expose_primary_to_an_accepted_grandchild(mon
     status = {row['root_id']: row['status'] for row in report['junctions']}
     assert status['parent'] == 'unresolved_would_split_parent'
     assert status['child'] == 'unresolved_would_contact_primary'
-
