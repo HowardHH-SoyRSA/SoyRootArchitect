@@ -11,6 +11,21 @@ validation_runs/
 .mypy_cache/
 .ruff_cache/
 .tmp/
+.tmp_batch_*/
+.pnpm-store/
+memory_allocation_validation_*/
+fork_weights_validation_*/
+# Keep local mesh inputs and scientific result bundles out of new commits.
+*.stl
+*.ply
+*.obj
+*.pcd
+*.rsml
+*.npz
+*.npy
+data/
+editor-sessions/
+SoyRootBio_outputs*/
 .coverage
 htmlcov/
 *.egg-info/

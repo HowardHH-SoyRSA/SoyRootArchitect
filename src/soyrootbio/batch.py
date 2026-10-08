@@ -676,6 +676,7 @@ class BatchScheduler:
             max_concurrent_samples=allocation.max_concurrent_samples,
             threads_per_sample=allocation.threads_per_sample,
             timing_history=timing_history,
+            memory_admission=MemoryAdmission() if allocation_options.get("live_memory_admission") else None,
         )
         return scheduler, allocation
 

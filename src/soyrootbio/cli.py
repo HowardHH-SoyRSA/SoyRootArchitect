@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
     run.add_argument("--input-mode", choices=INPUT_MODES, default="auto", help="auto prefers native faces, otherwise assumes surface points. Declare occupied_volume explicitly; no mesh is reconstructed.")
     run.add_argument("--nodule-aware", action="store_true", help="Detect nodule-like mesh bulges and measure them separately; default off.")
+    run.add_argument("--noise-reduction", action=argparse.BooleanOptionalAction, default=True,
+                     help="Exclude small disconnected native mesh fragments before primary selection; default on. Point-only inputs are retained.")
     run.add_argument("--nodule-review-file", type=Path, help="Reviewed nodule decisions exported from the editor; requires --nodule-aware.")
     run.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "Z"), help="Primary-root endpoint in original coordinates.")
     run.add_argument("--end", nargs=3, type=float, metavar=("X", "Y", "Z"), help="Primary-root endpoint in original coordinates.")
@@ -117,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             input_mode=args.input_mode,
             nodule_aware=args.nodule_aware,
+            noise_reduction=args.noise_reduction,
             nodule_review_file=args.nodule_review_file,
             start=tuple(args.start) if args.start else None,
             end=tuple(args.end) if args.end else None,

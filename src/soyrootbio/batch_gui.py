@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable
@@ -32,7 +33,7 @@ from .endpoint_picker import (
 from .hardware import allocate_resources, detect_hardware, format_bytes
 from .pipeline import PipelineConfig
 from .batch_process import run_pipeline_process
-from .memory_budget import MemoryAdmission, estimate_input_memory
+from .memory_budget import MemoryAdmission
 from .primary_guidance import read_primary_guidance
 
 
@@ -71,6 +72,8 @@ class BioInsAlgoBatchApp:
         self.hardware = detect_hardware()
         self.entries: dict[str, SampleEntry] = {}
         self.scheduler: BatchScheduler | None = None
+        self._batch_started_monotonic: float | None = None
+        self._batch_finished_monotonic: float | None = None
         self.job_to_item: dict[str, str] = {}
         # Keep completion acknowledgement scoped to one scheduler instance so
         # the polling loop cannot reopen the dialog every 120 ms.
@@ -82,6 +85,7 @@ class BioInsAlgoBatchApp:
         self.sample_cap_var = tk.StringVar(value="0")
         self.input_mode_var = tk.StringVar(value="auto")
         self.nodule_aware_var = tk.BooleanVar(value=False)
+        self.noise_reduction_var = tk.BooleanVar(value=True)
         self.display_points_var = tk.StringVar(value="30000")
         self.max_order_var = tk.StringVar(value="3")
         self.soil_z_var = tk.StringVar(value="")
@@ -94,6 +98,7 @@ class BioInsAlgoBatchApp:
         self.end_vars = [tk.StringVar(value="") for _ in range(3)]
         self.guide_text_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Drop STL/PLY files here or choose Add files.")
+        self.batch_runtime_var = tk.StringVar(value="Total batch time: --")
         self.hardware_var = tk.StringVar(value=self._hardware_text())
 
         self._configure_window()
@@ -187,6 +192,7 @@ class BioInsAlgoBatchApp:
         ttk.Button(controls, text="Resume selected", command=self.resume_selected).pack(side="left", padx=5)
         ttk.Button(controls, text="Cancel selected", command=self.cancel_selected).pack(side="left", padx=5)
         ttk.Button(controls, text="Cancel all", command=self.cancel_all).pack(side="left", padx=5)
+        ttk.Label(controls, textvariable=self.batch_runtime_var).pack(side="right")
         ttk.Label(outer, textvariable=self.status_var, wraplength=1000).grid(
             row=6, column=0, sticky="ew", pady=(6, 0),
         )
@@ -197,6 +203,7 @@ class BioInsAlgoBatchApp:
         ttk.Label(parent, text="Analysis settings", font=("Segoe UI", 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
         row += 1
         row = self._setting_row(parent, row, "Primary detection", ttk.Combobox(parent, textvariable=self.primary_method_var, values=list(PRIMARY_METHODS), state="readonly"))
+        row = self._setting_row(parent, row, "Noise reduction", ttk.Checkbutton(parent, variable=self.noise_reduction_var, text="Small disconnected mesh fragments"))
         row = self._setting_row(parent, row, "Analysis vertex cap", ttk.Entry(parent, textvariable=self.sample_cap_var))
         ttk.Label(parent, text="0 = automatic preflight for every format; original geometry is preserved", foreground="#5f6368", wraplength=330).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
         row += 1
@@ -464,6 +471,7 @@ class BioInsAlgoBatchApp:
                 sample_points=self._sample_cap() or None,
                 max_display_points=self._positive_int(self.display_points_var.get(), "Display points", 2),
                 title=f"Primary guidance — {entry.input_path.name}",
+                noise_reduction=self.noise_reduction_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("Primary selection", str(exc))
@@ -501,17 +509,14 @@ class BioInsAlgoBatchApp:
             # cKDTree worker threads. Explicit user thread counts still apply.
             if threads is None:
                 threads = min(2, max(1, self.hardware.logical_cpus - 1))
-            # Reducing sample concurrency for RAM must not multiply transient
-            # cKDTree worker threads. Explicit user thread counts still apply.
-            if threads is None:
-                threads = min(2, max(1, self.hardware.logical_cpus - 1))
             allocation = allocate_resources(
                 self.hardware,
                 sample_count=len(selected_items),
                 max_concurrent_samples=concurrency,
                 threads_per_sample=threads,
-                memory_per_sample_bytes=max(estimate_input_memory(entry.input_path)
-                                            for item, entry in self.entries.items() if item in selected_items),
+                # Supervising threads are cheap. MemoryAdmission below gates
+                # each child process using current capacity and its own budget.
+                live_memory_admission=True,
             )
             output_root = self._output_root_default()
             self._refresh_default_outputs(output_root, items=selected_items)
@@ -540,8 +545,12 @@ class BioInsAlgoBatchApp:
                 self.tree.set(item, "status", "Queued")
             if self.scheduler is not None:
                 self.scheduler.shutdown(wait=False)
+            batch_started = time.monotonic()
             new_scheduler.start()
             self.scheduler = new_scheduler
+            self._batch_started_monotonic = batch_started
+            self._batch_finished_monotonic = None
+            self.batch_runtime_var.set("Total batch time: 00:00")
             self.job_to_item.clear()
             self.job_to_item.update(new_job_to_item)
             self.status_var.set(
@@ -610,6 +619,7 @@ class BioInsAlgoBatchApp:
             max_root_order=self._positive_int(self.max_order_var.get(), "Maximum root order", 1),
             input_mode=self.input_mode_var.get(),
             nodule_aware=self.nodule_aware_var.get(),
+            noise_reduction=self.noise_reduction_var.get(),
             nodule_review_file=entry.nodule_review_file if self.nodule_aware_var.get() else None,
             runtime_limit_minutes=self._positive_float(self.runtime_limit_var.get(), "Runtime limit"),
             minimum_retained_fraction=self._percent_fraction(self.minimum_fraction_var.get()),
@@ -667,7 +677,17 @@ class BioInsAlgoBatchApp:
                         item, "runtime",
                         self._format_runtime(job.elapsed_seconds if job.started_at is not None else None),
                     )
-            if self.scheduler.all_done and jobs:
+            all_done = self.scheduler.all_done
+            if self._batch_started_monotonic is not None:
+                # Batch wall time includes queue waits and pauses. Freeze it
+                # before a completion dialog can enter a nested Tk event loop.
+                now = time.monotonic()
+                if all_done and self._batch_finished_monotonic is None:
+                    self._batch_finished_monotonic = now
+                end = self._batch_finished_monotonic
+                elapsed = (now if end is None else end) - self._batch_started_monotonic
+                self.batch_runtime_var.set(f"Total batch time: {self._format_runtime(elapsed)}")
+            if all_done and jobs:
                 completed = sum(job.state == BatchJobState.COMPLETED for job in jobs)
                 failed = sum(job.state == BatchJobState.FAILED for job in jobs)
                 if failed:

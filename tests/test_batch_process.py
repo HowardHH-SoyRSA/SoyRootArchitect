@@ -4,6 +4,7 @@ from functools import partial
 import multiprocessing as mp
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import time
 import threading
 import json
@@ -14,6 +15,50 @@ import pytest
 from soyrootbio.batch import BatchEventType, BatchJobState, BatchScheduler, CooperativeToken, StepTimingHistory
 from soyrootbio.batch_process import ProcessSampleResult, SampleProcessError, _run_sample_process, run_pipeline_process
 from soyrootbio.pipeline import PipelineConfig
+from soyrootbio.hardware import GIB
+from soyrootbio.memory_budget import MEMORY_BUDGET_POLICY, MemoryAdmission, MemorySnapshot
+
+
+def test_observed_private_peak_increases_admission_budget_with_headroom(tmp_path, monkeypatch):
+    from soyrootbio import batch_process
+
+    gate = MemoryAdmission(lambda: MemorySnapshot(11 * GIB, 30 * GIB, 32 * GIB, 64 * GIB))
+    config = PipelineConfig(tmp_path / 'root.ply', tmp_path / 'out', worker_threads=2)
+    with BatchScheduler(run_pipeline_process, memory_admission=gate) as scheduler:
+        job = scheduler.submit(config.input_path, config.output_dir, payload=config)
+        job.memory_estimate_bytes = 1_932_735_284  # Reduced 1.8 GiB initial estimate
+        job._memory_admission = gate
+        assert gate.try_acquire(job.job_id, job.memory_estimate_bytes)
+        info = SimpleNamespace(private=4 * GIB, rss=GIB, peak_pagefile=4 * GIB, peak_wset=GIB)
+        monkeypatch.setattr(psutil, 'Process', lambda pid: SimpleNamespace(memory_info=lambda: info))
+        monkeypatch.setattr(batch_process, 'memory_snapshot', lambda: MemorySnapshot())
+
+        def inspect_worker(config, control, progress, *, resource_callback):
+            monitor = batch_process._ResourceMonitor(config.output_dir, resource_callback)
+            monitor.decoded({'full_vertex_count':101102, 'triangle_count':202202,
+                             'original_vertex_count':101102})
+            monitor.sample(123, force=True)
+            assert monitor.data['memory_budget_policy'] == MEMORY_BUDGET_POLICY
+            assert monitor.data['geometry_estimated_peak_bytes'] == 1_932_735_284
+            assert monitor.data['estimated_peak_bytes'] == 5 * GIB
+            assert job.memory_estimate_bytes == 5 * GIB
+            assert gate.try_acquire('neighbor', 3 * GIB)
+            assert not gate.try_acquire('third', 3 * GIB)
+            # Decreasing current use and re-reporting decoded geometry must
+            # never erase the high-water budget for this active sample.
+            info.private = info.rss = GIB // 2
+            monitor.decoded({'full_vertex_count':101102, 'triangle_count':202202,
+                             'original_vertex_count':101102})
+            monitor.sample(123, force=True)
+            assert monitor.data['estimated_peak_bytes'] == 5 * GIB
+            assert job.memory_estimate_bytes == 5 * GIB
+            monitor.save()
+            saved = json.loads((config.output_dir / 'processing_resources.json').read_text())
+            assert saved['estimated_peak_bytes'] == 5 * GIB
+            return ProcessSampleResult(config.output_dir, 101102, 123)
+
+        monkeypatch.setattr(batch_process, '_run_sample_process', inspect_worker)
+        assert run_pipeline_process(job, CooperativeToken(), lambda *args: None).point_count == 101102
 
 
 def _probe_analyze(config, control, progress):

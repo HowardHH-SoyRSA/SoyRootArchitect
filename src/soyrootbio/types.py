@@ -50,6 +50,8 @@ class PointCloudData:
     original_triangles: np.ndarray | None = None
     # STL provenance: source/full/analysis indices, including unresolved seams.
     geometry_mapping: dict[str, np.ndarray] = field(default_factory=dict)
+    # Full-resolution exclusion, independent of collar and semantic labels.
+    noise_mask: np.ndarray | None = None
 
     @property
     def export_points(self) -> np.ndarray:

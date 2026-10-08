@@ -8,7 +8,6 @@ export type RootColorRgb = readonly [number, number, number];
  * editor, exported PLY, and exported label map from drifting apart.
  */
 export const ROOT_EXPORT_COLORS = {
-  nodule: [255, 244, 179],
   unassigned: [140, 140, 140],
   uncertain: [250, 122, 13],
   primary: [13, 59, 224],

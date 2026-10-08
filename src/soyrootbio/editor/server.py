@@ -78,7 +78,8 @@ def create_editor_app(
     @app.get("/api/mesh")
     def mesh():
         return send_file(
-            session.mesh.path,
+            (session.mesh.path if request.args.get('include_noise') == '1'
+             else session.noise_presentation.mesh_path(session.session_dir)),
             mimetype="application/octet-stream",
             conditional=True,
             etag=True,

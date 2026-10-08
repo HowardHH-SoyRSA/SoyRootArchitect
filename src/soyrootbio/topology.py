@@ -855,23 +855,23 @@ def _fork_review_scores(
 ) -> dict[str, float]:
     """Compare both continuations with a small, bounded length prior.
 
-    Direction contributes 55%, independent fork evidence 35%, and sustained
-    continuation length 10%. Penalize the worst affected parent-child edge
+    Direction contributes 45%, independent fork evidence 35%, and sustained
+    continuation length 20%. Penalize the worst affected parent-child edge
     by at most 0.05. An independent evidence gain is required before the
     length prior can influence either the decision or candidate ranking.
     """
 
     total = max(child_length + suffix_length, 1e-12)
     current_independent = (
-        0.55 * (1.0 - np.clip(short_turn / 180.0, 0.0, 1.0))
+        0.45 * (1.0 - np.clip(short_turn / 180.0, 0.0, 1.0))
         + 0.35 * np.clip(parent_fork_evidence, 0.0, 1.0)
     )
     alternative_independent = (
-        0.55 * (1.0 - np.clip(long_turn / 180.0, 0.0, 1.0))
+        0.45 * (1.0 - np.clip(long_turn / 180.0, 0.0, 1.0))
         + 0.35 * np.clip(child_fork_evidence, 0.0, 1.0)
     )
-    current = current_independent + 0.10 * suffix_length / total
-    alternative = alternative_independent + 0.10 * child_length / total
+    current = current_independent + 0.20 * suffix_length / total
+    alternative = alternative_independent + 0.20 * child_length / total
     current_penalty = max(
         child_parent_length_penalty(child_length, parent_length),
         child_parent_length_penalty(parent_length, supervisor_length),

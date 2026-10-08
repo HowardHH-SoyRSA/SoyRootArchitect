@@ -28,6 +28,7 @@ from ..geometry import (
 )
 from ..hardware import HardwareInfo, detect_hardware
 from ..io import write_labeled_ply
+from ..presentation import NoisePresentation
 from ..traits import compute_traits
 from ..types import Normalization, RootPath
 from .ply import LabeledMesh, read_labeled_ply
@@ -140,6 +141,7 @@ class EditorSession(NoduleReviewMixin):
             self.output_dir / "segmented_root_structure.ply"
         )
         self.mesh_minimum = np.min(self.mesh.positions, axis=0)
+        self.noise_presentation = NoisePresentation(self.output_dir, self.mesh)
         self.mesh_maximum = np.max(self.mesh.positions, axis=0)
         self.render_origin = 0.5 * (self.mesh_minimum + self.mesh_maximum)
         self._baseline_labels = self.mesh.root_labels.copy()
@@ -151,6 +153,9 @@ class EditorSession(NoduleReviewMixin):
             self.tip_vector_window_mesh_units,
             self.gravity,
         ) = self._load_trait_configuration()
+        if self.noise_presentation.mask.any():
+            self._recompute_traits()
+            self._baseline_roots = self._clone_roots(self.roots)
         self._next_numeric_label = max(
             [root.numeric_label for root in self.roots.values()] + [0]
         ) + 1
@@ -200,8 +205,13 @@ class EditorSession(NoduleReviewMixin):
                     key=lambda item: (item.order, item.root_id),
                 )
             ]
+            hidden_labels = self.noise_presentation.hidden_labels()
+            for row in roots:
+                row['presentation_hidden'] = (row['numeric_label'] in hidden_labels
+                                               or 'noise_excluded_root' in row['qc_flags'])
             return {
                 "schema": "soyrootbio.editor-state/v1",
+                "presentation_hidden_vertex_count": int(self.noise_presentation.mask.sum()),
                 "baseline_fingerprint": self.baseline_fingerprint,
                 "source_output_dir": str(self.output_dir),
                 "session_dir": str(self.session_dir),
@@ -218,7 +228,8 @@ class EditorSession(NoduleReviewMixin):
                     "render_origin": self.render_origin.tolist(),
                 },
                 "roots": roots,
-                "root_count": len(roots),
+                "root_count": sum('noise_excluded_root' not in row['qc_flags'] for row in roots),
+                "noise_topology_placeholder_count": sum('noise_excluded_root' in row['qc_flags'] for row in roots),
                 "point_patches": point_patches,
                 "point_patch_count": len(point_patches),
                 "nodule_count": sum(o["status"] == "accepted" for o in self.nodule_objects),
@@ -411,6 +422,9 @@ class EditorSession(NoduleReviewMixin):
                 else self.session_dir / "materialised"
             )
             target.mkdir(parents=True, exist_ok=True)
+            self._validate_state()
+            if self.noise_presentation.mask.any():
+                self._recompute_traits()
             hierarchy = {
                 "schema": "soyrootbio.edited-root-hierarchy/v1",
                 "baseline_fingerprint": self.baseline_fingerprint,
@@ -515,6 +529,14 @@ class EditorSession(NoduleReviewMixin):
                 root_orders=orders,
                 assignment_states=assignment_states,
             )
+            if self.noise_presentation.mask.any():
+                from ..presentation import export_noise_free_presentation
+                export_noise_free_presentation(
+                    target, self.mesh.positions, self.mesh.triangles,
+                    colors=colors / 255., root_ids=self.mesh.root_labels,
+                    root_orders=orders, assignment_states=assignment_states,
+                    excluded_mask=self.noise_presentation.mask,
+                )
 
             primary = self.roots[PRIMARY_ID]
             laterals = self._root_paths()
@@ -1230,6 +1252,7 @@ class EditorSession(NoduleReviewMixin):
             primary_centerline_assessment=primary.centerline_assessment,
             tip_vector_window=self.tip_vector_window_mesh_units,
             gravity=self.gravity,
+            noise_mask=self.noise_presentation.mask,
         )
         for _, row in traits.iterrows():
             root_id = str(row["root_id"])
@@ -1240,6 +1263,9 @@ class EditorSession(NoduleReviewMixin):
                 self.roots[root_id].traits = record
 
     def _validate_state(self) -> None:
+        mask = self.noise_presentation.mask
+        if np.any(self.mesh.root_labels[mask] != -1) or np.any(self.mesh.assignment_states[mask] != 0):
+            raise EditorValidationError('Hidden noise vertices must remain excluded from root assignment.')
         if PRIMARY_ID not in self.roots:
             raise EditorValidationError("The root system must contain a primary root.")
         primary = self.roots[PRIMARY_ID]
@@ -1442,7 +1468,7 @@ class EditorSession(NoduleReviewMixin):
     ) -> np.ndarray:
         """Return unassigned vertices inside an exact radius tube around a path."""
 
-        unassigned = np.flatnonzero(self.mesh.root_labels == -1)
+        unassigned = np.flatnonzero((self.mesh.root_labels == -1) & ~self.noise_presentation.mask)
         return self._indices_near_polyline(
             points,
             radius,
@@ -1463,6 +1489,7 @@ class EditorSession(NoduleReviewMixin):
             candidate_indices = np.arange(self.mesh.vertex_count, dtype=np.int64)
         else:
             candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+        candidate_indices = candidate_indices[~self.noise_presentation.mask[candidate_indices]]
         if not len(candidate_indices):
             return np.empty(0, dtype=np.int64)
         if len(points) == 1:
@@ -1547,6 +1574,8 @@ class EditorSession(NoduleReviewMixin):
         if not len(indices):
             return
         self._validate_vertex_indices(indices)
+        if numeric_label != -1 and np.any(self.noise_presentation.mask[indices]):
+            raise EditorValidationError('Hidden noise vertices cannot be assigned to a root or nodule.')
         if not self._nodule_review_active and np.any(self.mesh.root_labels[indices] <= -3):
             raise EditorValidationError("Review the nodule classification before assigning its surface to a root.")
         self._pending_index_chunks.append(indices.copy())
@@ -1648,7 +1677,7 @@ class EditorSession(NoduleReviewMixin):
         indices_by_id: dict[str, np.ndarray] = {}
         labels = self.mesh.root_labels
         for numeric_label, kind in ((-2, "uncertain"), (-1, "unassigned")):
-            eligible = np.flatnonzero(labels == numeric_label).astype(
+            eligible = np.flatnonzero((labels == numeric_label) & ~self.noise_presentation.mask).astype(
                 np.int64,
                 copy=False,
             )
@@ -1657,8 +1686,8 @@ class EditorSession(NoduleReviewMixin):
             local_index = np.full(self.mesh.vertex_count, -1, dtype=np.int32)
             local_index[eligible] = np.arange(len(eligible), dtype=np.int32)
             valid_edges = (
-                (labels[edge_starts] == numeric_label)
-                & (labels[edge_ends] == numeric_label)
+                (local_index[edge_starts] >= 0)
+                & (local_index[edge_ends] >= 0)
             )
             rows = local_index[edge_starts[valid_edges]]
             columns = local_index[edge_ends[valid_edges]]
@@ -1962,6 +1991,8 @@ class EditorSession(NoduleReviewMixin):
             relatives.append("metadata.json")
         if (self.output_dir / "nodules.json").is_file():
             relatives.append("nodules.json")
+        relatives.extend(name for name in ('presentation_noise_masks.npz', 'noise_reduction_masks.npz')
+                         if (self.output_dir / name).is_file())
         for relative in relatives:
             path = self.output_dir / relative
             digest.update(relative.encode("utf-8"))

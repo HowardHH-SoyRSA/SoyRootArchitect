@@ -65,6 +65,7 @@ def load_root_geometry(
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
     input_mode: str = "auto",
+    noise_reduction: bool = False,
 ) -> PointCloudData:
     """Load a root-only point cloud or mesh and return points in source units.
 
@@ -74,6 +75,10 @@ def load_root_geometry(
     projected runtime or memory would exceed the configured 30-minute policy.
     CSV inputs prefer named x/y/z columns; other text inputs use the first
     three numeric columns.
+
+    This low-level reader defaults to preserving every finite analysis point.
+    The pipeline and file-based primary pickers explicitly enable noise
+    reduction by default, before the analysis cap and primary selection.
     """
     return _load_root_geometry(
         path,
@@ -82,6 +87,7 @@ def load_root_geometry(
         runtime_limit_seconds=runtime_limit_seconds,
         minimum_retained_fraction=minimum_retained_fraction,
         input_mode=input_mode,
+        noise_reduction=noise_reduction,
     )
 
 
@@ -93,6 +99,7 @@ def load_root_geometry_with_progress(
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
     input_mode: str = "auto",
+    noise_reduction: bool = False,
 ) -> PointCloudData:
     """Load any supported geometry with the shared analysis-cap preflight."""
     return _load_root_geometry(
@@ -103,6 +110,7 @@ def load_root_geometry_with_progress(
         runtime_limit_seconds=runtime_limit_seconds,
         minimum_retained_fraction=minimum_retained_fraction,
         input_mode=input_mode,
+        noise_reduction=noise_reduction,
     )
 
 
@@ -114,6 +122,7 @@ def _load_root_geometry(
     runtime_limit_seconds: float = 1800.0,
     minimum_retained_fraction: float = 0.25,
     input_mode: str = "auto",
+    noise_reduction: bool = False,
 ) -> PointCloudData:
     path = Path(path)
     if not path.exists():
@@ -134,6 +143,7 @@ def _load_root_geometry(
             random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
             minimum_retained_fraction=minimum_retained_fraction,
             input_mode=input_mode, progress_callback=progress_callback,
+            noise_reduction=noise_reduction,
         )
 
     o3d = require_open3d()
@@ -154,6 +164,7 @@ def _load_root_geometry(
                     random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
                     minimum_retained_fraction=minimum_retained_fraction,
                     input_mode=input_mode, progress_callback=progress_callback,
+                    noise_reduction=noise_reduction,
                 )
 
     if mesh is None:
@@ -169,6 +180,7 @@ def _load_root_geometry(
             random_seed=random_seed, runtime_limit_seconds=runtime_limit_seconds,
             minimum_retained_fraction=minimum_retained_fraction,
             input_mode=input_mode, progress_callback=progress_callback,
+            noise_reduction=noise_reduction,
         )
 
     return _prepare_geometry(
@@ -177,6 +189,7 @@ def _load_root_geometry(
         runtime_limit_seconds=runtime_limit_seconds,
         minimum_retained_fraction=minimum_retained_fraction,
         input_mode=input_mode, progress_callback=progress_callback,
+        noise_reduction=noise_reduction,
     )
 
 
@@ -185,6 +198,7 @@ def _prepare_geometry(
     path: Path, sample_points: int | None, random_seed: int | None,
     runtime_limit_seconds: float, minimum_retained_fraction: float,
     input_mode: str, progress_callback: ProgressCallback | None,
+    noise_reduction: bool = False,
 ) -> PointCloudData:
     """One preflight and subset policy for every supported input format.
 
@@ -228,6 +242,20 @@ def _prepare_geometry(
         }
     _report_progress(progress_callback, "Auditing full-resolution geometry", 0.18, None)
     audit = _mesh_audit(full_points, triangles) if has_faces else {}
+    from .noise import detect_disconnected_noise, noise_report
+    noise_mask = None
+    reduction_report = noise_report(False)
+    if noise_reduction:
+        _report_progress(progress_callback, "Removing small disconnected fragments", 0.22, None)
+        noise_mask, reduction_report = detect_disconnected_noise(
+            full_points, triangles,
+            unresolved_vertices=geometry_mapping.get("unresolved_full_vertex_indices"),
+        )
+        if noise_mask.any():
+            pool = np.arange(len(full_points)) if analysis_pool is None else analysis_pool
+            analysis_pool = pool[~noise_mask[pool]]
+            if len(analysis_pool) < MIN_POINT_COUNT:
+                raise ValueError("Too few retained points after noise reduction")
     analysis_source = full_points if analysis_pool is None else full_points[analysis_pool]
     explicit_limit = None if sample_points in (None, 0) else int(sample_points)
     if explicit_limit is not None:
@@ -254,6 +282,7 @@ def _prepare_geometry(
     analysis_points = full_points[analysis_indices]
     metadata = {
         "geometry_kind": "triangle_mesh" if has_faces else "point_cloud",
+        "noise_reduction": reduction_report,
         **contract,
         "original_point_count": int(len(original_points)),
         "original_triangle_count": int(len(original_triangles)) if has_faces else 0,
@@ -295,6 +324,7 @@ def _prepare_geometry(
         original_points=original_points,
         original_triangles=original_triangles,
         geometry_mapping=geometry_mapping,
+        noise_mask=noise_mask,
     )
     _report_progress(progress_callback, "Point cloud ready", 1.0, 0.0)
     return cloud

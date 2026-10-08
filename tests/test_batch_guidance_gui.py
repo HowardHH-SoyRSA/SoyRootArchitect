@@ -51,16 +51,20 @@ class Tree:
 def _app(tmp_path: Path) -> BioInsAlgoBatchApp:
     app = BioInsAlgoBatchApp.__new__(BioInsAlgoBatchApp)
     app.scheduler = None
+    app._batch_started_monotonic = None
+    app._batch_finished_monotonic = None
     app.entries = {}
     app.tree = Tree()
     for name, value in {
         "output_root_var": str(tmp_path / "outputs"),
         "primary_method_var": "Scored automatic",
         "status_var": "", "soil_z_var": "", "sample_cap_var": "0",
+        "batch_runtime_var": "Total batch time: --",
         "max_order_var": "3", "runtime_limit_var": "30",
         "minimum_fraction_var": "25", "tip_window_var": "2.0",
         "input_mode_var": "auto",
         "nodule_aware_var": False,
+        "noise_reduction_var": True,
     }.items():
         setattr(app, name, Variable(value))
     return app
@@ -92,10 +96,14 @@ def test_start_batch_dispatches_module_level_process_runner(tmp_path, monkeypatc
     app.scheduler.shutdown(cancel_pending=True)
 
 
-def test_automatic_threads_remain_bounded_when_memory_limits_sample_concurrency(tmp_path, monkeypatch):
+def test_automatic_gui_uses_live_gate_instead_of_startup_ram_slot_limit(tmp_path, monkeypatch):
     from soyrootbio.hardware import GIB, HardwareInfo
     app = _app(tmp_path)
     _add_sample(app, tmp_path)
+    for i in range(5):
+        source = tmp_path / f'root-{i}.ply'
+        source.write_text('ply', encoding='ascii')
+        app.add_files([source])
     app.concurrency_var = Variable('Auto')
     app.threads_var = Variable('Auto')
     app.hardware_var = Variable()
@@ -108,9 +116,10 @@ def test_automatic_threads_remain_bounded_when_memory_limits_sample_concurrency(
     monkeypatch.setattr(batch_gui.messagebox, 'showerror', lambda *args: errors.append(args))
     app.start_batch()
     assert not errors
-    assert app.scheduler.max_concurrent_samples == 1
+    assert app.scheduler.max_concurrent_samples == 6
     assert app.scheduler.threads_per_sample == 2
     assert app.scheduler.memory_admission is not None
+    assert app.scheduler.memory_admission.reserve_bytes == 2 * GIB
     app.scheduler.shutdown(cancel_pending=True)
 
 

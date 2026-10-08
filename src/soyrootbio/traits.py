@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from hashlib import sha256
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,7 @@ def compute_traits(
     primary_qc_flags: list[str] | None = None,
     primary_centerline_assessment: dict | None = None,
     tip_vector_window: float = 2.0,
+    noise_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Measure per-root geometry in source mesh units and requested angles.
 
@@ -46,7 +48,18 @@ def compute_traits(
       column name is retained for export compatibility.
     """
 
-    gravity = np.asarray(gravity, dtype=float)
+    if noise_mask is not None:
+        noise_mask = np.asarray(noise_mask, dtype=bool)
+        if full_points is None or full_root_labels is None or noise_mask.shape != (len(full_points),):
+            raise ValueError('Noise exclusion requires matching full geometry and final labels')
+        if np.any(np.asarray(full_root_labels)[noise_mask] != -1):
+            raise ValueError('Noise-excluded vertices cannot contribute to root measurements')
+        if noise_mask.any() and triangles is not None:
+            from .io import _mesh_audit
+            triangles = np.asarray(triangles)[~np.any(noise_mask[np.asarray(triangles)], axis=1)]
+            mesh_metadata = {**(mesh_metadata or {}), **_mesh_audit(full_points, triangles),
+                             'noise_excluded_from_totals': True}
+    gravity = np.asarray(gravity, dtype=float).copy()
     gravity /= max(np.linalg.norm(gravity), 1e-12)
     mesh_areas = _partition_mesh_surface_areas(
         full_points,
@@ -89,7 +102,7 @@ def compute_traits(
     records[0].update(
         {
             "lateral_start_count": int(lateral_start_count),
-            "selected_lateral_count": int(len(lateral_paths)),
+            "selected_lateral_count": sum('noise_excluded_root' not in root.qc_flags for root in lateral_paths),
             "angle_deg": np.nan,
             "base_parent_angle_deg": np.nan,
             "tip_angle_parent_deg": np.nan,
@@ -274,15 +287,34 @@ def compute_traits(
             record["volume_method"] = "unmeasurable_retained_prior_path"
         if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support", "nodule_obscured"}:
             _mark_unmeasurable(record)
+        if 'noise_excluded_root' in lateral.qc_flags:
+            if len(support):
+                raise ValueError('A noise-only topology placeholder must have no assigned support')
+            for key, value in list(record.items()):
+                if isinstance(value, (int, float, np.number)) and key not in {'root_order', 'point_count'}:
+                    record[key] = np.nan
+                elif key.endswith('_method'):
+                    record[key] = 'excluded_noise'
+            record['point_count'] = 0
+            record['measurement_excluded'] = True
         records.append(record)
 
     frame = pd.DataFrame.from_records(records)
+    if 'measurement_excluded' in frame:
+        frame['measurement_excluded'] = frame['measurement_excluded'].eq(True)
     frame["coordinate_unit"] = "mesh_unit"
     frame.attrs["system_summary"] = _system_summary(
         frame,
         mesh_metadata=mesh_metadata or {},
-        full_root_labels=full_root_labels,
+        full_root_labels=(np.asarray(full_root_labels)[~noise_mask]
+                          if noise_mask is not None else full_root_labels),
     )
+    if noise_mask is not None:
+        frame.attrs['noise_exclusion_sha256'] = sha256(noise_mask.tobytes()).hexdigest()
+        frame.attrs['noise_excluded_vertex_count'] = int(noise_mask.sum())
+        if noise_mask.any():
+            frame.attrs['system_summary']['measurement_vertex_count'] = int(np.sum(~noise_mask))
+            frame.attrs['system_summary']['noise_excluded_vertex_count'] = int(noise_mask.sum())
     return frame
 
 
@@ -307,6 +339,7 @@ def trait_summary_frame(traits: pd.DataFrame) -> pd.DataFrame:
 
 
 def lateral_counts_frame(traits: pd.DataFrame) -> pd.DataFrame:
+    traits = _measured_rows(traits)
     lateral = traits[traits["root_order"] > 0]
     if lateral.empty:
         return pd.DataFrame(columns=["root_order", "lateral_root_count"])
@@ -509,12 +542,17 @@ def _partition_mesh_surface_areas(
     return result
 
 
+def _measured_rows(traits: pd.DataFrame) -> pd.DataFrame:
+    return traits[~traits['measurement_excluded'].eq(True)] if 'measurement_excluded' in traits else traits
+
+
 def _system_summary(
     traits: pd.DataFrame,
     *,
     mesh_metadata: dict,
     full_root_labels: np.ndarray | None,
 ) -> dict:
+    traits = _measured_rows(traits)
     laterals = traits[traits["root_order"] > 0]
     primary = traits[traits["root_order"] == 0]
     mesh_area = mesh_metadata.get("surface_area_source_units2")
@@ -547,6 +585,7 @@ def _system_summary(
     unavailable_volume_count = int(traits["volume"].isna().sum())
     return {
         "root_count_total": int(len(traits)),
+        **({"noise_excluded_from_root_totals": True} if mesh_metadata.get("noise_excluded_from_totals") else {}),
         **({"nodule_vertex_fraction": float(np.mean(labels <= -3)),
             "nodule_excluded_from_root_totals": True,
             "source_surface_area_including_nodules": mesh_area,
@@ -563,7 +602,8 @@ def _system_summary(
         "lateral_root_length_sum": float(laterals["length"].sum()),
         "root_system_surface_area": whole_area,
         "root_system_surface_area_method": (
-            "full_mesh_triangle_area" if exact_surface_available else "sum_per_root_surface_estimates"
+            ("noise_filtered_mesh_triangle_area" if mesh_metadata.get("noise_excluded_from_totals")
+             else "full_mesh_triangle_area") if exact_surface_available else "sum_per_root_surface_estimates"
         ),
         "primary_root_surface_area": float(primary["surface_area"].sum()),
         "lateral_root_surface_area_sum": float(laterals["surface_area"].sum()),

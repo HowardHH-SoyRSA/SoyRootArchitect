@@ -116,14 +116,6 @@ export function RootViewport({
   const setMeshReady = useEditorStore((store) => store.setMeshReady);
   const setClientGpu = useEditorStore((store) => store.setClientGpu);
   const meshReady = useEditorStore((store) => store.meshReady);
-  const showNodules = useEditorStore((store) => store.showNodules);
-  useEffect(() => {
-    const runtime = runtimeRef.current;
-    if (!runtime?.mesh) return;
-    const material = runtime.mesh.material as THREE.MeshStandardMaterial;
-    if (material.userData.noduleVisibility) material.userData.noduleVisibility.value = showNodules ? 1 : 0;
-    runtime.renderRequested = true;
-  }, [showNodules, meshReady]);
 
   const meshUrl = apiUrl(apiBase, state.mesh.url);
   const labelUrl = state.mesh.labels_url;
@@ -344,7 +336,6 @@ export function RootViewport({
         }
       }
       const numericLabel = runtime.labels[vertexIndex];
-      if (numericLabel <= -3 && !useEditorStore.getState().showNodules) return null;
       const root = latestRef.current.state.roots.find(
         (candidate) => candidate.numeric_label === numericLabel,
       );
@@ -669,16 +660,6 @@ export function RootViewport({
       mesh.name = "full-resolution-root-surface";
       (mesh as THREE.Mesh).raycast = acceleratedRaycast;
       runtime.mesh = mesh;
-      const noduleAttribute = new Float32Array(parsed.labels.length);
-      for (let i = 0; i < parsed.labels.length; i++) noduleAttribute[i] = parsed.labels[i] <= -3 ? 1 : 0;
-      geometry.setAttribute("noduleClass", new THREE.BufferAttribute(noduleAttribute, 1));
-      const noduleMaterial = mesh.material as THREE.MeshStandardMaterial;
-      noduleMaterial.userData.noduleVisibility = { value: useEditorStore.getState().showNodules ? 1 : 0 };
-      noduleMaterial.onBeforeCompile = (shader) => {
-        shader.uniforms.noduleVisibility = noduleMaterial.userData.noduleVisibility;
-        shader.vertexShader = "attribute float noduleClass; varying float vNoduleClass;\n" + shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\nvNoduleClass = noduleClass;");
-        shader.fragmentShader = "uniform float noduleVisibility; varying float vNoduleClass;\n" + shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\nif (noduleVisibility < 0.5 && vNoduleClass > 0.5) discard;");
-      };
 
       setLoadProgress({
         phase: "index",
@@ -915,9 +896,7 @@ function makeSurfaceColors(
     let color: readonly [number, number, number];
     if (!root) {
       color =
-        labels[vertex] <= -3
-          ? ROOT_EXPORT_COLORS.nodule
-          : labels[vertex] === -2
+        labels[vertex] === -2
           ? ROOT_EXPORT_COLORS.uncertain
           : ROOT_EXPORT_COLORS.unassigned;
     } else {
@@ -949,11 +928,6 @@ function updateSurfaceColors(
   roots: RootRecord[],
 ) {
   if (!runtime.geometry || !runtime.labels) return;
-  const noduleAttribute = runtime.geometry.getAttribute("noduleClass");
-  if (noduleAttribute) {
-    for (let i = 0; i < runtime.labels.length; i++) noduleAttribute.setX(i, runtime.labels[i] <= -3 ? 1 : 0);
-    noduleAttribute.needsUpdate = true;
-  }
   const colors = makeSurfaceColors(
     runtime.labels,
     roots,
@@ -975,6 +949,7 @@ function rebuildCenterlines(
   draftPoints: Vec3[],
   activeTool: ToolMode,
 ) {
+  roots = roots.filter((root) => !root.presentation_hidden);
   disposeGroup(runtime.lineGroup);
   disposeGroup(runtime.relationGroup);
   runtime.lineMaterials = [];

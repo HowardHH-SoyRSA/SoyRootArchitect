@@ -17,7 +17,9 @@ from typing import Any, Callable
 
 from .batch import BatchCancelled, BatchJob, CooperativeToken, ProgressCallback
 from .pipeline import PipelineConfig, run_pipeline
-from .memory_budget import estimate_decoded_memory, memory_snapshot
+from .memory_budget import (
+    MEMORY_BUDGET_POLICY, estimate_decoded_memory, memory_snapshot, observed_memory_budget,
+)
 
 
 @dataclass(frozen=True)
@@ -129,13 +131,22 @@ class _ResourceMonitor:
         self.output_dir = output_dir
         self.callback = callback
         self.last_sample = 0.0
-        self.data = {"policy": "sample-process-memory-v1", "peak_private_bytes": 0,
+        self.data = {"policy": "sample-process-memory-v2", "memory_budget_policy": MEMORY_BUDGET_POLICY,
+                     "peak_private_bytes": 0,
                      "peak_working_set_bytes": 0}
 
     def decoded(self, values):
         self.data["decoded_geometry"] = values
-        self.data["estimated_peak_bytes"] = estimate_decoded_memory(
+        self.data["geometry_estimated_peak_bytes"] = estimate_decoded_memory(
             values["full_vertex_count"], values["triangle_count"], values["original_vertex_count"])
+        self._update_budget()
+
+    def _update_budget(self):
+        self.data["estimated_peak_bytes"] = max(
+            self.data.get("estimated_peak_bytes", 0),
+            self.data.get("geometry_estimated_peak_bytes", 0),
+            observed_memory_budget(self.data["peak_private_bytes"]),
+        )
 
     def sample(self, pid, *, force=False):
         now = time.monotonic()
@@ -158,6 +169,7 @@ class _ResourceMonitor:
         except Exception:
             # psutil.NoSuchProcess/AccessDenied must not hide the sample error.
             pass
+        self._update_budget()
         try:
             state = memory_snapshot()
             self.data["last_system_memory"] = vars(state)

@@ -220,12 +220,17 @@ def allocate_resources(
     reserve_logical_cpus: int = 1,
     memory_per_sample_bytes: int = DEFAULT_MEMORY_PER_SAMPLE_BYTES,
     reserve_memory_bytes: int = DEFAULT_MEMORY_RESERVE_BYTES,
+    live_memory_admission: bool = False,
 ) -> ResourceAllocation:
     """Choose deterministic batch concurrency while honoring manual overrides.
 
     Automatic selection reserves one logical CPU for the desktop by default,
     aims to leave at least two worker threads per sample, and limits concurrency
-    using a conservative per-sample RAM estimate.  A manual concurrency or
+    using a conservative per-sample RAM estimate. With live_memory_admission,
+    the caller MUST gate every launch using MemoryAdmission: CPU/sample counts
+    determine the slot ceiling and the startup RAM estimate is diagnostic only.
+    This lets new work start as memory becomes available during the batch.
+    A manual concurrency or
     thread value is honored exactly (apart from concurrency never exceeding a
     supplied ``sample_count``); this permits intentional oversubscription.
     """
@@ -267,7 +272,7 @@ def allocate_resources(
             # sample unless the device genuinely only has one worker per sample.
             cpu_limit = max(1, min(hardware.physical_cpus, cpu_budget // 2))
         concurrent = cpu_limit
-        if memory_limit is not None:
+        if memory_limit is not None and not live_memory_admission:
             concurrent = min(concurrent, memory_limit)
 
     if sample_count is not None:
@@ -276,6 +281,8 @@ def allocate_resources(
 
     if threads_per_sample is None:
         selected_threads = max(1, cpu_budget // concurrent)
+        if live_memory_admission:
+            selected_threads = min(2, selected_threads)
     else:
         selected_threads = threads_per_sample
 

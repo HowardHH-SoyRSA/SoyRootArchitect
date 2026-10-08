@@ -55,9 +55,18 @@ def export_results(
     full_root_labels: np.ndarray | None = None,
     topology_report: TopologyReport | None = None,
     nodules: NoduleResult | None = None,
+    noise_mask: np.ndarray | None = None,
 ) -> None:
     """Write measurement, topology, provenance, figure-input, and PLY outputs."""
 
+    if noise_mask is not None and np.any(noise_mask):
+        from hashlib import sha256
+        mask = np.asarray(noise_mask, dtype=bool)
+        labels = full_root_labels if full_root_labels is not None else _analysis_root_labels(primary_mask, lateral_labels)
+        if mask.shape != np.asarray(labels).shape or np.any(np.asarray(labels)[mask] != -1):
+            raise ValueError('Hidden noise must be excluded from final root assignment before export')
+        if traits.attrs.get('noise_exclusion_sha256') != sha256(mask.tobytes()).hexdigest():
+            raise ValueError('Traits must be recomputed with the complete hidden noise mask before export')
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_dir = output_dir / "csv"
@@ -110,6 +119,13 @@ def export_results(
     # viewers that ignore custom scalar properties.
     write_point_cloud(output_dir / "segmented_points.ply", geometry_points, colors=colors)
     _write_class_point_clouds(output_dir, geometry_points, geometry_labels, colors)
+    if noise_mask is not None and np.any(noise_mask):
+        from .presentation import export_noise_free_presentation
+        metadata['noise_presentation'] = export_noise_free_presentation(
+            output_dir, geometry_points, triangles, colors=colors,
+            root_ids=geometry_labels, root_orders=root_orders,
+            assignment_states=assignment_states, excluded_mask=noise_mask,
+        )
     skeleton_overlay_layout = _write_skeleton_overlay(
         output_dir / "skeleton_original_overlay.ply",
         geometry_points,

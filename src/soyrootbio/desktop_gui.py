@@ -32,6 +32,7 @@ class LauncherSettings:
     start: tuple[float, float, float] | None = None
     end: tuple[float, float, float] | None = None
     auto_endpoints: str | None = None
+    noise_reduction: bool = True
 
 
 def validate_launcher_settings(
@@ -42,6 +43,7 @@ def validate_launcher_settings(
     endpoint_mode: str = "interactive",
     start_coordinates: tuple[object, object, object] | list[object] | None = None,
     end_coordinates: tuple[object, object, object] | list[object] | None = None,
+    noise_reduction: bool = True,
 ) -> LauncherSettings:
     """Validate desktop form values without requiring a GUI display."""
     source = Path(str(input_path).strip()).expanduser()
@@ -81,6 +83,7 @@ def validate_launcher_settings(
         start=start,
         end=end,
         auto_endpoints=auto_endpoints,
+        noise_reduction=bool(noise_reduction),
     )
 
 
@@ -171,6 +174,7 @@ class BioInsAlgoDesktopApp:
         self.samples_var = tk.StringVar(value="50000")
         self.display_var = tk.StringVar(value="30000")
         self.endpoint_mode_var = tk.StringVar(value="interactive")
+        self.noise_reduction_var = tk.BooleanVar(value=True)
         self.start_coordinate_vars = [tk.StringVar(value="") for _ in range(3)]
         self.end_coordinate_vars = [tk.StringVar(value="") for _ in range(3)]
         self.status_var = tk.StringVar(value="Choose a root file and output directory.")
@@ -242,6 +246,10 @@ class BioInsAlgoDesktopApp:
         ttk.Label(options, text="Display points").grid(row=0, column=2, sticky="w", padx=(0, 10), pady=6)
         self.display_entry = ttk.Entry(options, textvariable=self.display_var, width=16)
         self.display_entry.grid(row=0, column=3, sticky="ew", pady=6)
+        self.noise_reduction_check = ttk.Checkbutton(
+            options, variable=self.noise_reduction_var,
+            text="Noise reduction before primary selection (small disconnected mesh fragments)")
+        self.noise_reduction_check.grid(row=1, column=0, columnspan=4, sticky="w", pady=6)
 
         endpoint_frame = ttk.LabelFrame(outer, text="Primary-root endpoints", padding=(12, 9))
         endpoint_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 10))
@@ -350,6 +358,7 @@ class BioInsAlgoDesktopApp:
             self.output_button,
             self.samples_entry,
             self.display_entry,
+            self.noise_reduction_check,
             *self.endpoint_mode_buttons,
             *self.coordinate_entries,
         ]
@@ -410,6 +419,7 @@ class BioInsAlgoDesktopApp:
                 endpoint_mode=self.endpoint_mode_var.get(),
                 start_coordinates=[variable.get() for variable in self.start_coordinate_vars],
                 end_coordinates=[variable.get() for variable in self.end_coordinate_vars],
+                noise_reduction=self.noise_reduction_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Check settings", str(exc), parent=self.root)
@@ -449,6 +459,7 @@ class BioInsAlgoDesktopApp:
                     sample_points=settings.sample_points,
                     max_display_points=settings.display_points,
                     title=f"Select endpoints - {settings.input_path.name}",
+                    noise_reduction=settings.noise_reduction,
                     random_seed=42,
                 )
             except Exception as exc:
@@ -472,6 +483,7 @@ class BioInsAlgoDesktopApp:
             end=end,
             auto_endpoints=settings.auto_endpoints,
             sample_points=effective_samples,
+            noise_reduction=settings.noise_reduction,
         )
         self.cancel_event = threading.Event()
         self.close_when_stopped = False

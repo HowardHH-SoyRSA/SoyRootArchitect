@@ -129,6 +129,7 @@ def select_primary_endpoints_from_file_gui(
     max_display_points: int = 30000,
     title: str = "Select primary-root endpoints",
     random_seed: int | None = 42,
+    noise_reduction: bool = True,
 ) -> tuple[PointCloudData, np.ndarray, np.ndarray, int]:
     """Load a root file in the picker and return the chosen endpoints.
 
@@ -139,6 +140,7 @@ def select_primary_endpoints_from_file_gui(
     cloud, start, end, effective_sample_points = _run_endpoint_picker(
         initial_cloud=None,
         input_path=Path(input_path),
+        noise_reduction=noise_reduction,
         sample_points=sample_points,
         max_display_points=max_display_points,
         title=title,
@@ -173,6 +175,7 @@ def _run_endpoint_picker(
     max_display_points: int,
     title: str,
     random_seed: int | None,
+    noise_reduction: bool = True,
 ) -> tuple[PointCloudData | None, np.ndarray, np.ndarray, int]:
     try:
         import matplotlib.pyplot as plt
@@ -422,6 +425,7 @@ def _run_endpoint_picker(
                     requested_samples,
                     progress_callback=report,
                     random_seed=random_seed,
+                    noise_reduction=noise_reduction,
                 )
             except Exception as exc:  # Captured for display on the GUI thread.
                 with lock:
@@ -724,6 +728,7 @@ def select_primary_guidance_from_file_gui(
     max_display_points: int = 30000,
     title: str = "Select primary-root guidance",
     random_seed: int | None = 42,
+    noise_reduction: bool = True,
 ) -> tuple[PointCloudData, PrimaryGuidance, int]:
     """Pick endpoints, optional primary sections, and a horizontal soil line."""
 
@@ -731,6 +736,7 @@ def select_primary_guidance_from_file_gui(
     cloud, start, end, loaded_samples = select_primary_endpoints_from_file_gui(
         path,
         sample_points=max(10, effective_samples) if effective_samples else 50000,
+        noise_reduction=noise_reduction,
         max_display_points=max_display_points,
         title=title,
         random_seed=random_seed,
@@ -752,6 +758,7 @@ def select_soil_guidance_from_file_gui(
     max_display_points: int = 30000,
     title: str = "Select soil line and primary-root sections",
     random_seed: int | None = 42,
+    noise_reduction: bool = True,
 ) -> tuple[PointCloudData, PrimaryGuidance, int]:
     """Select a soil line/sections while leaving endpoints to the scorer."""
 
@@ -760,6 +767,7 @@ def select_soil_guidance_from_file_gui(
     cloud = load_root_geometry_with_progress(
         path,
         sample_points=display_sample_count,
+        noise_reduction=noise_reduction,
         random_seed=random_seed,
     )
     heights = cloud.points[:, 2]

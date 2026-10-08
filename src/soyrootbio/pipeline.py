@@ -100,6 +100,7 @@ from .topology import (
 )
 from .traits import compute_traits
 from .nodules import detect_nodules, quantify_nodules, apply_nodule_review
+from .noise import filter_preloaded_cloud
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
 from .visualize import save_angle_front_views, save_overview_plot
@@ -409,6 +410,7 @@ class PipelineConfig:
     nodule_aware: bool = False
     nodule_review_file: Path | None = None
     surface_reference_file: Path | None = None
+    noise_reduction: bool = True
 
 
 @dataclass
@@ -575,9 +577,10 @@ def _run_pipeline_impl(
             runtime_limit_seconds=config.runtime_limit_minutes * 60.0,
             minimum_retained_fraction=config.minimum_retained_fraction,
             input_mode=config.input_mode,
+            noise_reduction=config.noise_reduction,
         )
     else:
-        cloud = preloaded_cloud
+        cloud = filter_preloaded_cloud(preloaded_cloud, enabled=config.noise_reduction)
         contract = input_mode_contract(config.input_mode, has_triangles=cloud.triangles is not None and len(cloud.triangles) > 0)
         loaded_mode = cloud.source_metadata.get("input_mode")
         if loaded_mode is not None and loaded_mode != contract["input_mode"]:
@@ -585,6 +588,8 @@ def _run_pipeline_impl(
         cloud.source_metadata.update(contract)
         LOGGER.info("Using %d points already loaded by the desktop GUI", len(cloud.points))
     checkpoint("load_geometry", "Point cloud ready", 0.12)
+    full_noise_mask = (np.zeros(len(cloud.export_points), dtype=bool)
+                       if cloud.noise_mask is None else cloud.noise_mask)
     surface_reference = (
         load_surface_reference(config.surface_reference_file, cloud.export_points, cloud.triangles)
         if config.surface_reference_file is not None else None
@@ -712,7 +717,7 @@ def _run_pipeline_impl(
         tolerance=base_tolerance,
     )
     nodules = None
-    full_nonroot_mask = full_above_base_mask
+    full_nonroot_mask = full_above_base_mask | full_noise_mask
     analysis_nonroot_mask = above_base_mask
     if config.nodule_review_file is not None and not config.nodule_aware:
         raise ValueError("Nodule review decisions require nodule-aware analysis")
@@ -721,11 +726,11 @@ def _run_pipeline_impl(
         nodules = detect_nodules(
             cloud.export_points, cloud.triangles,
             primary_path=normalization.inverse_points(primary.points),
-            excluded_mask=full_above_base_mask, cooperate=cooperate,
+            excluded_mask=full_nonroot_mask, cooperate=cooperate,
         )
         if config.nodule_review_file is not None:
-            apply_nodule_review(nodules, config.nodule_review_file, cloud.export_points, full_above_base_mask)
-        full_nonroot_mask = full_above_base_mask | nodules.mask
+            apply_nodule_review(nodules, config.nodule_review_file, cloud.export_points, full_nonroot_mask)
+        full_nonroot_mask = full_nonroot_mask | nodules.mask
         if cloud.analysis_indices is not None:
             analysis_nodules = nodules.mask[cloud.analysis_indices]
         elif len(normalized) == len(full_normalized):
@@ -1369,6 +1374,7 @@ def _run_pipeline_impl(
                 for i, root in enumerate(selected, 1)}},
             normalization.inverse_points(primary_top_reference[None, :])[0], config.gravity,
         )
+    measurement_metadata = cloud.source_metadata
     traits = compute_traits(
         primary.points,
         selected,
@@ -1381,7 +1387,8 @@ def _run_pipeline_impl(
         full_points=cloud.export_points,
         triangles=cloud.triangles,
         full_root_labels=full_root_labels,
-        mesh_metadata=cloud.source_metadata,
+        mesh_metadata=measurement_metadata,
+        noise_mask=full_noise_mask,
         primary_confidence=primary.confidence,
         primary_qc_flags=primary.qc_flags,
         primary_centerline_assessment=final_centerline_report["roots"][0],
@@ -1400,6 +1407,21 @@ def _run_pipeline_impl(
             json.dumps(surface_reference_report, indent=2), encoding="utf-8")
     if np.any(full_root_labels[full_above_base_mask] != -1):
         raise AssertionError("above-collar vertices must remain unassigned")
+    if np.any(full_root_labels[full_noise_mask] != -1):
+        raise AssertionError("noise-excluded vertices must remain unassigned")
+    noise_reduction_report = cloud.source_metadata["noise_reduction"]
+    if config.noise_reduction:
+        noise_reduction_report = {**noise_reduction_report,
+                                 "masks_file": "noise_reduction_masks.npz",
+                                 "report_file": "noise_reduction.json"}
+        np.savez_compressed(config.output_dir / "noise_reduction_masks.npz",
+                            excluded_full_vertices=full_noise_mask,
+                            analysis_to_full=(cloud.analysis_indices if cloud.analysis_indices is not None
+                                              else np.arange(len(cloud.points))
+                                              if np.array_equal(cloud.points, cloud.export_points)
+                                              else np.full(len(cloud.points), -1, dtype=np.int64)))
+        (config.output_dir / "noise_reduction.json").write_text(
+            json.dumps(noise_reduction_report, indent=2, allow_nan=False), encoding="utf-8")
     ownership_ledger_metadata = _write_ownership_evidence_ledger(
         config.output_dir, trace_evidence_ledger,
         ownership_ledgers, ownership_ledger_reports,
@@ -1441,6 +1463,7 @@ def _run_pipeline_impl(
         "physical_unit_conversion_applied": False,
         "gravity_vector": list(config.gravity),
         "source_geometry": cloud.source_metadata,
+        "noise_reduction": noise_reduction_report,
         "point_only_evidence": point_evidence,
         "lateral_start_count": lateral_start_count,
         "candidate_lateral_count": candidate_count,
@@ -1515,9 +1538,9 @@ def _run_pipeline_impl(
             "overlong_child_reexamination_penalty_max": CHILD_PARENT_LENGTH_PENALTY_MAX,
             "overlong_child_reexamination_penalty_formula": "0.05 * max(0, 1 - parent_length / child_length)",
             "junction_review_score_weights": {
-                "direction_continuity": 0.55,
+                "direction_continuity": 0.45,
                 "fork_evidence": 0.35,
-                "sustained_continuation_length": 0.10,
+                "sustained_continuation_length": 0.20,
             },
             "post_fit_length_violation_action": "QC_flag_preserve_final_ownership_and_hierarchy",
             "overlong_child_alternative_parent_resurvey": True,
@@ -1631,6 +1654,7 @@ def _run_pipeline_impl(
         full_root_labels=full_root_labels,
         topology_report=topology_report,
         nodules=nodules,
+        noise_mask=full_noise_mask,
     )
     checkpoint("export", "Finalizing metadata", 0.98)
     timings["total"] = float(time.perf_counter() - pipeline_started)

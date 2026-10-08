@@ -15,8 +15,6 @@ interface EditorUiState {
   patchFocusRequest: { patchId: string; nonce: number } | null;
   loadProgress: LoadProgress;
   meshReady: boolean;
-  showNodules: boolean;
-  setShowNodules: (show: boolean) => void;
   clientGpu: string | null;
   setServerState: (state: EditorState) => void;
   setSelectedRootId: (rootId: string | null) => void;
@@ -46,8 +44,6 @@ export const useEditorStore = create<EditorUiState>((set) => ({
   patchFocusRequest: null,
   loadProgress: { phase: "idle", progress: 0, message: "Waiting for dataset" },
   meshReady: false,
-  showNodules: true,
-  setShowNodules: (showNodules) => set({ showNodules }),
   clientGpu: null,
   setServerState: (serverState) =>
     set((current) => {

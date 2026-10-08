@@ -24,6 +24,35 @@ SOURCE_FILES = (
 )
 
 
+def test_noise_mask_blocks_assignment_creation_and_survives_editor_export(editor_bundle, tmp_path):
+    from soyrootbio.presentation import export_noise_free_presentation
+    mesh = read_labeled_ply(editor_bundle / 'segmented_root_structure.ply')
+    mask = np.zeros(mesh.vertex_count, bool); mask[17] = True
+    export_noise_free_presentation(editor_bundle, mesh.positions, mesh.triangles,
+        colors=mesh.colors/255., root_ids=mesh.root_labels, root_orders=mesh.root_orders,
+        assignment_states=mesh.assignment_states, excluded_mask=mask)
+    session = EditorSession(editor_bundle, session_dir=tmp_path/'noise-session')
+    before = session.mesh.root_labels.copy()
+    for operation, args in (
+        ('assign_points', {'root_id':'root-a','indices':[17]}),
+        ('create_root', {'parent_id':'primary','points':[[0,0,2],[2,2,2]],'indices':[17]}),
+    ):
+        with pytest.raises(EditorValidationError, match='Hidden noise'):
+            session.apply_operation(operation, args)
+        np.testing.assert_array_equal(session.mesh.root_labels, before)
+    assert 17 not in session._indices_near_polyline(np.array([[2.,2,2]]), 10.)
+    session.public_state()
+    assert all(17 not in indices for indices in session._point_patch_indices.values())
+    session.apply_operation('assign_points', {'root_id':'root-a','indices':[18]})
+    session.undo(); session.redo()
+    reloaded = EditorSession(editor_bundle, session_dir=tmp_path/'noise-session')
+    assert reloaded.mesh.root_labels[17] == -1
+    output = reloaded.export_materialised()
+    assert np.load(output/'presentation_noise_masks.npz')['excluded_full_vertices'][17]
+    assert read_labeled_ply(output/'edited_segmented_root_structure.ply').root_labels[17] == -1
+    assert len(read_labeled_ply(output/'presentation_root_structure.ply').positions) == mesh.vertex_count-1
+
+
 def _add_nodule_candidate(bundle, vertices, label=-3):
     from soyrootbio.nodules import geometry_digest
     mesh = read_labeled_ply(bundle / "segmented_root_structure.ply")
