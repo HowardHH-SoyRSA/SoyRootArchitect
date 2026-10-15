@@ -15,6 +15,7 @@ from scipy.sparse.csgraph import connected_components
 from .centerline import _support_edges, refit_final_centerlines
 from .editor.ply import read_labeled_ply
 from .export import export_results
+from .bundle_layout import bundle_file, read_bundle_mesh
 from .presentation import geometry_fingerprint
 from .primary_contact import audit_higher_order_primary_contacts
 from .surface_patch_audit import audit_discrete_child_patches
@@ -34,8 +35,8 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
         raise ValueError('Use a new output directory outside the source bundle')
     files = [p for p in source.rglob('*') if p.is_file() and not any(x.startswith('.') for x in p.relative_to(source).parts)]
     hashes = {str(p.relative_to(source)): sha256(p.read_bytes()).hexdigest() for p in files}
-    mesh = read_labeled_ply(source / 'segmented_root_structure.ply')
-    with np.load(source / 'presentation_noise_masks.npz', allow_pickle=False) as data:
+    mesh = read_bundle_mesh(source)
+    with np.load(bundle_file(source, 'presentation_noise_masks.npz'), allow_pickle=False) as data:
         mask = np.asarray(data['excluded_full_vertices'], bool)
         fingerprint = str(data['source_geometry_sha256'].item())
     if fingerprint != geometry_fingerprint(mesh.positions, mesh.triangles) or mask.shape != (mesh.vertex_count,):
@@ -43,13 +44,17 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
     touched = mask[mesh.triangles].sum(axis=1)
     if np.any((touched != 0) & (touched != 3)):
         raise ValueError('Noise exclusions must contain whole native components')
-    old_meta = json.loads((source / 'metadata.json').read_text(encoding='utf-8'))
+    old_meta = json.loads((bundle_file(source, 'metadata.json')).read_text(encoding='utf-8'))
     meta = deepcopy(old_meta)
-    rows = {r['root_id']: r for r in json.loads((source / 'root_hierarchy.json').read_text())['roots']}
+    rows = {r['root_id']: r for r in json.loads((bundle_file(source, 'root_hierarchy.json')).read_text())['roots']}
     old_label = {r['root_id']: int(r['numeric_label']) for r in meta['root_label_map'] if int(r['numeric_label']) >= 0}
     if np.any(mesh.root_labels <= -3):
         raise ValueError('Bundles with accepted nodules require nodule-aware reanalysis; this saved-bundle helper must not discard nodule exports')
-    norm = Normalization(np.asarray(meta['normalization_minimum']), float(meta['normalization_scale']))
+    if meta.get('coordinate_unit', 'mesh_unit') == 'mm':
+        norm = Normalization(np.asarray(meta['normalization_minimum_mm']),
+                             float(meta['normalization_scale_mm']), mm_per_mesh_unit=1.)
+    else:
+        norm = Normalization(np.asarray(meta['normalization_minimum']), float(meta['normalization_scale']))
     points = norm.transform_points(mesh.positions)
     spacing = float(meta['d_bar_normalized'])
     gravity = np.asarray(meta.get('gravity_vector', [0, 0, -1.]), float)
@@ -142,7 +147,7 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
         full_points=mesh.positions, triangles=mesh.triangles, full_root_labels=labels,
         mesh_metadata=meta.get('source_geometry', {}), primary_confidence=rows['primary'].get('confidence', 1.),
         primary_qc_flags=primary_flags, primary_centerline_assessment=final_fit['roots'][0],
-        gravity=gravity, tip_vector_window=meta['config'].get('tip_vector_window_mesh_units', 2.), noise_mask=mask)
+        gravity=gravity, tip_vector_window=meta['config'].get('tip_vector_window_mm', meta['config'].get('tip_vector_window_mesh_units', 2.)), noise_mask=mask, primary_top_reference=top)
     report = {'policy': 'all-hidden-noise-excluded-v1', 'source_bundle': str(source),
         'excluded_vertex_count': int(mask.sum()), 'hidden_assigned_vertex_count': int(np.sum(labels[mask] != -1)),
         'removed_noise_only_root_ids': sorted(removed), 'unmeasured_topology_placeholder_ids': sorted(placeholders),
@@ -158,21 +163,26 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
         final_surface_patch_audit=patches, selected_lateral_count=len(paths)-len(placeholders),
         selected_order_counts=dict(Counter(r.order for r in paths if r.root_id not in placeholders)),
         inherited_stage_evidence='source_metadata_before_noise_exclusion.json; historical stages are not a new tracing run')
+    context={'coordinate_unit':'analysis_normalized','length_unit':'analysis_normalized',
+             'normalized_length_in_output_units':norm.output_scale,'output_coordinate_unit':norm.coordinate_unit}
+    for key in ('final_centerline_fitting','higher_order_primary_contact','final_surface_patch_audit'):
+        meta[key]['unit_context']=context
+    report['selected_primary_top_coordinate_unit']=norm.coordinate_unit
     assignment.update(primary_assigned_vertex_count=int(np.sum(labels==0)), lateral_assigned_vertex_count=int(np.sum(labels>0)),
         assigned_vertex_count=int(np.sum(labels>=0)), uncertain_vertex_count=int(np.sum(labels==-2)), unassigned_vertex_count=int(np.sum(labels==-1)))
     target.mkdir(parents=True)
-    shutil.copy2(source/'metadata.json', target/'source_metadata_before_noise_exclusion.json')
+    shutil.copy2(bundle_file(source, 'metadata.json'), target/'source_metadata_before_noise_exclusion.json')
     for name in ('original_input_geometry.npz',):
-        if (source/name).exists(): shutil.copy2(source/name, target/name)
+        if bundle_file(source, name).exists(): shutil.copy2(bundle_file(source, name), target/name)
     analysis_indices = np.flatnonzero(~mask)
-    if (source/'noise_reduction_masks.npz').exists():
-        with np.load(source/'noise_reduction_masks.npz') as data:
+    if (bundle_file(source, 'noise_reduction_masks.npz')).exists():
+        with np.load(bundle_file(source, 'noise_reduction_masks.npz')) as data:
             old_map=data['analysis_to_full']
             if np.all(old_map>=0): analysis_indices=old_map[~mask[old_map]]
     np.savez_compressed(target/'noise_reduction_masks.npz', excluded_full_vertices=mask, analysis_to_full=analysis_indices)
     mapping = {}
-    if (source/'input_geometry_mapping.npz').exists():
-        with np.load(source/'input_geometry_mapping.npz') as data:
+    if (bundle_file(source, 'input_geometry_mapping.npz')).exists():
+        with np.load(bundle_file(source, 'input_geometry_mapping.npz')) as data:
             mapping = {key: data[key] for key in data.files}
     mapping['analysis_to_full'] = analysis_indices
     np.savez_compressed(target/'input_geometry_mapping.npz', **mapping)

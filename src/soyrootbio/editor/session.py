@@ -19,12 +19,14 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
-from ..export import order_color, write_rsml
+from ..export import order_color, write_rsml, write_measurement_tables, write_root_point_clouds
+from ..bundle_layout import bundle_file, read_bundle_mesh, save_analysis_geometry, finalize_bundle
 from ..geometry import (
     is_above_primary_top,
     path_length,
     primary_top_excess,
     update_child_length_qc,
+    child_length_exceeds_parent,
 )
 from ..hardware import HardwareInfo, detect_hardware
 from ..io import write_labeled_ply
@@ -34,6 +36,9 @@ from ..types import Normalization, RootPath
 from .ply import LabeledMesh, read_labeled_ply
 from .nodule_review import NoduleReviewMixin
 from ..nodules import NODULE_RGB
+from ..primary_contact import audit_higher_order_primary_contacts
+from ..surface_patch_audit import audit_discrete_child_patches
+from ..geometry import mean_nearest_neighbor_distance
 
 
 PRIMARY_ID = "primary"
@@ -137,9 +142,7 @@ class EditorSession(NoduleReviewMixin):
     ) -> None:
         self.output_dir = Path(output_dir).resolve()
         self._require_bundle()
-        self.mesh: LabeledMesh = read_labeled_ply(
-            self.output_dir / "segmented_root_structure.ply"
-        )
+        self.mesh: LabeledMesh = read_bundle_mesh(self.output_dir)
         self.mesh_minimum = np.min(self.mesh.positions, axis=0)
         self.noise_presentation = NoisePresentation(self.output_dir, self.mesh)
         self.mesh_maximum = np.max(self.mesh.positions, axis=0)
@@ -147,6 +150,7 @@ class EditorSession(NoduleReviewMixin):
         self._baseline_labels = self.mesh.root_labels.copy()
         self._baseline_assignment_states = self.mesh.assignment_states.copy()
         self._baseline_roots = self._load_roots()
+        self._load_unit_context()
         self._load_nodules()
         self.roots = self._clone_roots(self._baseline_roots)
         (
@@ -421,15 +425,19 @@ class EditorSession(NoduleReviewMixin):
                 if target_dir is not None
                 else self.session_dir / "materialised"
             )
+            if target.exists() and any(target.iterdir()):
+                # Never mix a new layout with a previous materialization or
+                # overwrite provenance from an earlier edit/export.
+                target = target.with_name(target.name + "_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:8])
             target.mkdir(parents=True, exist_ok=True)
             self._validate_state()
-            if self.noise_presentation.mask.any():
-                self._recompute_traits()
+            self._recompute_traits()
             hierarchy = {
                 "schema": "soyrootbio.edited-root-hierarchy/v1",
                 "baseline_fingerprint": self.baseline_fingerprint,
                 "coordinate_space": "source_coordinates",
-                "coordinate_unit": "mesh_unit",
+                "coordinate_unit": self.coordinate_unit,
+                "primary_top_reference": self.primary_top_reference.tolist(),
                 "roots": [
                     {
                         "root_id": root.root_id,
@@ -457,14 +465,21 @@ class EditorSession(NoduleReviewMixin):
                     )
                 ],
             }
-            (target / "edited_root_hierarchy.json").write_text(
+            (target / "root_hierarchy.json").write_text(
                 json.dumps(hierarchy, indent=2, ensure_ascii=False, allow_nan=False),
                 encoding="utf-8",
             )
             trait_frame = pd.DataFrame(
                 [root.traits for root in self.roots.values()]
             ).sort_values(["root_order", "root_id"])
-            trait_frame.to_csv(target / "edited_root_traits.csv", index=False)
+            trait_frame.attrs = dict(self._trait_frame.attrs)
+            tables_dir = target / "tables"
+            tables_dir.mkdir(exist_ok=True)
+            pd.DataFrame([dict(root_id=root.root_id, parent_id=root.parent_id, root_order=root.order,
+                               node_id=i, x=p[0], y=p[1], z=p[2], coordinate_unit=self.coordinate_unit,
+                               centerline_region=("parent_connector" if i < root.body_start_index else "exposed_body"))
+                          for root in self.roots.values() for i, p in enumerate(root.points)]).to_csv(
+                              tables_dir / "centerlines.csv", index=False)
             label_rows = [
                 {
                     "numeric_label": -2,
@@ -500,10 +515,6 @@ class EditorSession(NoduleReviewMixin):
                     label_rows.append({"numeric_label": obj["numeric_label"], "root_id": obj["nodule_id"],
                                        "parent_id": "", "root_order": "",
                                        "color_rgb": ",".join(map(str, NODULE_RGB))})
-            pd.DataFrame(label_rows).to_csv(
-                target / "edited_root_label_map.csv",
-                index=False,
-            )
 
             orders = np.full(self.mesh.vertex_count, 255, dtype=np.uint8)
             assignment_states = np.zeros(self.mesh.vertex_count, dtype=np.uint8)
@@ -520,32 +531,23 @@ class EditorSession(NoduleReviewMixin):
             colors[nodule_mask] = NODULE_RGB
             assignment_states[nodule_mask] = 3
             self._export_nodule_review(target)
-            write_labeled_ply(
-                target / "edited_segmented_root_structure.ply",
-                self.mesh.positions,
-                triangles=self.mesh.triangles,
-                colors=colors,
-                root_ids=self.mesh.root_labels,
-                root_orders=orders,
-                assignment_states=assignment_states,
-            )
-            if self.noise_presentation.mask.any():
-                from ..presentation import export_noise_free_presentation
-                export_noise_free_presentation(
-                    target, self.mesh.positions, self.mesh.triangles,
-                    colors=colors / 255., root_ids=self.mesh.root_labels,
-                    root_orders=orders, assignment_states=assignment_states,
-                    excluded_mask=self.noise_presentation.mask,
-                )
+            write_measurement_tables(target, trait_frame, pd.DataFrame(label_rows))
+            save_analysis_geometry(target, self.mesh.positions, self.mesh.triangles,
+                colors / 255., self.mesh.root_labels, orders, assignment_states)
+            write_root_point_clouds(target, self.mesh.positions, self.mesh.root_labels, colors / 255.)
+            from ..presentation import export_noise_free_presentation
+            export_noise_free_presentation(target, self.mesh.positions, self.mesh.triangles,
+                colors=colors / 255., root_ids=self.mesh.root_labels, root_orders=orders,
+                assignment_states=assignment_states, excluded_mask=self.noise_presentation.mask)
 
             primary = self.roots[PRIMARY_ID]
             laterals = self._root_paths()
             write_rsml(
-                target / "edited_root_system.rsml",
+                target / "root_system.rsml",
                 primary.points,
                 laterals,
                 trait_frame,
-                {"source": str(self.output_dir), "editor": True},
+                {"source": str(self.output_dir), "editor": True, "coordinate_unit": self.coordinate_unit},
             )
             if self.log_path.exists():
                 shutil.copy2(self.log_path, target / "operations.jsonl")
@@ -570,6 +572,92 @@ class EditorSession(NoduleReviewMixin):
                 json.dumps(export_manifest, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            # Supply the ordinary bundle names too, so an edited export can be
+            # reopened directly with truthful units and the same immutable top.
+            canonical_hierarchy = {**hierarchy, "schema": "soyrootbio.root-hierarchy/v1"}
+            (target / "root_hierarchy.json").write_text(json.dumps(canonical_hierarchy, indent=2), encoding="utf-8")
+            for filename in ("original_input_geometry.npz", "input_geometry_mapping.npz", "ownership_evidence_masks.npz",
+                             "noise_reduction_masks.npz", "presentation_noise_masks.npz"):
+                if bundle_file(self.output_dir, filename).is_file():
+                    shutil.copy2(bundle_file(self.output_dir, filename), target / filename)
+            source_metadata = bundle_file(self.output_dir, "metadata.json")
+            edited_metadata = json.loads(source_metadata.read_text(encoding="utf-8")) if source_metadata.is_file() else {}
+            if source_metadata.is_file():
+                shutil.copy2(source_metadata, target / "source_metadata_before_editor.json")
+            for historical in ("final_compliance_audit", "topology_report", "higher_order_primary_contact",
+                               "final_surface_patch_audit", "attachment_constraint", "parent_contact_reconciliation",
+                               "final_centerline_fitting", "point_only_evidence", "ownership_evidence_ledger",
+                               "joint_root_collar", "surface_reference"):
+                edited_metadata.pop(historical, None)
+            edited_metadata.update(coordinate_unit=self.coordinate_unit,
+                                   output_length_unit=self.coordinate_unit,
+                                   output_area_unit=f"{self.coordinate_unit}^2",
+                                   output_volume_unit=f"{self.coordinate_unit}^3",
+                                   primary_top_reference_provenance=self.primary_top_reference_provenance,
+                                   editor_materialized=True,
+                                   system_summary=self._system_summary,
+                                   measurement_policy=self._trait_frame.attrs.get("measurement_policy", {}),
+                                   selected_lateral_count=len(self.roots)-1,
+                                   selected_order_counts=trait_frame[trait_frame.root_order > 0].root_order.value_counts().to_dict(),
+                                   root_label_map=label_rows,
+                                   final_compliance_audit={"status": "not_revalidated_after_editor_materialization",
+                                       "requires_correction": True, "compliant": False,
+                                       "above_collar_assigned_vertex_count": int(np.count_nonzero(self.mesh.root_labels[self._protected_collar_mask] != -1)),
+                                       "immutable_top_coordinate_unit": self.coordinate_unit,
+                                       "immutable_top": self.primary_top_reference.tolist()},
+                                   inherited_stage_evidence="source_metadata_before_editor.json; historical automatic evidence is not current edit validation")
+            audit_paths = sorted(self._root_paths(), key=lambda path: self.roots[path.root_id].numeric_label)
+            audit_labels = self.mesh.root_labels.copy()
+            for audit_label, path in enumerate(audit_paths, 1):
+                audit_labels[self.mesh.root_labels == self.roots[path.root_id].numeric_label] = audit_label
+                path.mean_radius = self.roots[path.root_id].traits.get("mean_radius")
+            audit_labels[self.mesh.root_labels == self.roots[PRIMARY_ID].numeric_label] = 0
+            source_spacing = edited_metadata.get("d_bar_mm") if self.coordinate_unit == "mm" else None
+            if source_spacing is None:
+                source_spacing = float(edited_metadata.get("d_bar_normalized", 0.)) * float(edited_metadata.get("normalization_scale", 1.))
+            if not np.isfinite(source_spacing) or source_spacing <= 0:
+                source_spacing = mean_nearest_neighbor_distance(self.mesh.positions)
+            if not np.isfinite(source_spacing) or source_spacing <= 0:
+                positive = np.linalg.norm(np.diff(self.mesh.positions, axis=0), axis=1)
+                positive = positive[positive > 0.]
+                if not len(positive):
+                    raise EditorValidationError("Current geometry has no positive spacing for native audits.")
+                source_spacing = float(np.median(positive))
+            nonroot_labels = tuple(int(label) for label in np.unique(audit_labels[audit_labels <= -3]))
+            contact = audit_higher_order_primary_contacts(self.mesh.positions, audit_labels, audit_paths,
+                triangles=self.mesh.triangles, d_bar=source_spacing, nonroot_labels=nonroot_labels)
+            patches = audit_discrete_child_patches(self.mesh.positions, audit_labels, audit_paths,
+                triangles=self.mesh.triangles, d_bar=source_spacing,
+                excluded_mask=self._protected_collar_mask | self.noise_presentation.mask,
+                nonroot_labels=nonroot_labels)
+            contact["coordinate_unit"] = patches["coordinate_unit"] = self.coordinate_unit
+            origins = [path.root_id for path in audit_paths if is_above_primary_top(
+                path.insertion_point if path.insertion_point is not None else path.points[0],
+                self.primary_top_reference[None, :], gravity=self.gravity)]
+            collar_count = int(np.count_nonzero(self.mesh.root_labels[self._protected_collar_mask] != -1))
+            compliant = (contact["status"] == "clear" and patches["status"] == "clear" and not origins and not collar_count)
+            edited_metadata["higher_order_primary_contact"] = contact
+            edited_metadata["final_surface_patch_audit"] = patches
+            edited_metadata["final_compliance_audit"] = {
+                "policy": "editor-materialized-native-audit-v1",
+                "status": "clear" if compliant else "unresolved_violations_or_missing_native_evidence",
+                "compliant": compliant, "requires_correction": not compliant,
+                "above_collar_assigned_vertex_count": collar_count,
+                "origin_violation_root_ids": origins,
+                "origin_or_hierarchy_error_count": len(origins),
+                "higher_order_primary_contact_status": contact["status"],
+                "discrete_child_patch_status": patches["status"],
+                "coordinate_unit": self.coordinate_unit,
+                "immutable_top": self.primary_top_reference.tolist(),
+                "source_connectivity_status": edited_metadata.get("source_geometry",{}).get("stl_indexing",{}).get("status", "as_supplied"),
+            }
+            if edited_metadata["final_compliance_audit"]["source_connectivity_status"] == "unresolved_stl_connectivity":
+                edited_metadata["final_compliance_audit"].update(compliant=False, requires_correction=True,
+                    status="unresolved_source_connectivity")
+            if self.coordinate_unit == "mm":
+                edited_metadata["primary_top_reference_mm"] = self.primary_top_reference.tolist()
+            (target / "metadata.json").write_text(json.dumps(edited_metadata, indent=2), encoding="utf-8")
+            finalize_bundle(target)
             return target
 
     # ------------------------------------------------------------------
@@ -617,6 +705,7 @@ class EditorSession(NoduleReviewMixin):
                     root.qc_flags = list(dict.fromkeys([*root.qc_flags, "centerline_fit_stale_assignment"]))
             self._refresh_attachments()
             self._validate_changed_lateral_origins(roots_before)
+            self._refresh_changed_length_qc(roots_before)
             self._validate_state()
             self._recompute_traits()
         except Exception:
@@ -1122,7 +1211,7 @@ class EditorSession(NoduleReviewMixin):
     # Loading, validation, traits, and helpers
     # ------------------------------------------------------------------
     def _load_trait_configuration(self) -> tuple[float, np.ndarray]:
-        metadata_path = self.output_dir / "metadata.json"
+        metadata_path = bundle_file(self.output_dir, "metadata.json")
         metadata: dict[str, Any] = {}
         if metadata_path.is_file():
             try:
@@ -1131,7 +1220,7 @@ class EditorSession(NoduleReviewMixin):
                 metadata = {}
         config = metadata.get("config") if isinstance(metadata.get("config"), dict) else {}
         try:
-            tip_window = float(config.get("tip_vector_window_mesh_units", 2.0))
+            tip_window = float(config.get("tip_vector_window_mm", config.get("tip_vector_window_mesh_units", 2.0)))
         except (TypeError, ValueError):
             tip_window = 2.0
         if not math.isfinite(tip_window) or tip_window <= 0:
@@ -1148,16 +1237,53 @@ class EditorSession(NoduleReviewMixin):
             gravity = gravity / np.linalg.norm(gravity)
         return tip_window, gravity
 
+    def _load_unit_context(self) -> None:
+        metadata_path = bundle_file(self.output_dir, "metadata.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+        hierarchy = json.loads((bundle_file(self.output_dir, "root_hierarchy.json")).read_text(encoding="utf-8"))
+        self.coordinate_unit = hierarchy.get("coordinate_unit", metadata.get("coordinate_unit", "mesh_unit"))
+        if self.coordinate_unit not in {"mm", "mesh_unit"}:
+            raise ValueError("Unsupported bundle coordinate unit")
+        if metadata.get("coordinate_unit", self.coordinate_unit) != self.coordinate_unit:
+            raise ValueError("Bundle geometry and hierarchy coordinate units disagree")
+        self.unit_calibration = metadata.get("unit_calibration")
+        top = metadata.get("primary_top_reference_mm") if self.coordinate_unit == "mm" else None
+        reference = metadata.get("final_compliance_audit", {}).get("primary_top_reference_normalized")
+        if top is None and reference is not None:
+            top = np.asarray(reference) * metadata["normalization_scale"] + np.asarray(metadata["normalization_minimum"])
+            if self.coordinate_unit == "mm":
+                if not self.unit_calibration:
+                    raise ValueError("Millimeter reference conversion requires recorded calibration")
+                top = top * self.unit_calibration["mm_per_mesh_unit"]
+        self.primary_top_reference = np.asarray(
+            self._baseline_roots[PRIMARY_ID].points[0] if top is None else top, dtype=float).copy()
+        if self.primary_top_reference.shape != (3,) or not np.all(np.isfinite(self.primary_top_reference)):
+            raise ValueError("Invalid immutable primary top")
+        self.primary_top_reference.setflags(write=False)
+        self.primary_top_reference_provenance = "legacy_fitted_endpoint_fallback" if top is None else "immutable_selection_metadata"
+        self._protected_collar_mask = np.zeros(self.mesh.vertex_count, dtype=bool)
+        masks_path = bundle_file(self.output_dir, "ownership_evidence_masks.npz")
+        if masks_path.is_file():
+            with np.load(masks_path, allow_pickle=False) as masks:
+                self._protected_collar_mask = np.asarray(masks["above_base_excluded"], dtype=bool).copy()
+            if self._protected_collar_mask.shape != (self.mesh.vertex_count,):
+                raise ValueError("Protected collar mask differs from native vertices")
+
     def _load_roots(self) -> dict[str, RootNode]:
         hierarchy = json.loads(
-            (self.output_dir / "root_hierarchy.json").read_text(encoding="utf-8")
+            (bundle_file(self.output_dir, "root_hierarchy.json")).read_text(encoding="utf-8")
         )
-        traits_frame = pd.read_csv(self.output_dir / "root_traits.csv")
+        traits_frame = pd.read_csv(bundle_file(self.output_dir, "root_traits.csv"))
+        inventory_path = bundle_file(self.output_dir, "root_inventory.csv")
+        if inventory_path.is_file():
+            inventory = pd.read_csv(inventory_path)
+            missing = inventory[~inventory.root_id.isin(traits_frame.root_id)]
+            traits_frame = pd.concat([traits_frame, missing], ignore_index=True)
         trait_lookup = {
             str(row["root_id"]): _row_dict(row)
             for _, row in traits_frame.iterrows()
         }
-        label_frame = pd.read_csv(self.output_dir / "csv" / "root_label_map.csv")
+        label_frame = pd.read_csv(bundle_file(self.output_dir, "csv/root_label_map.csv"))
         label_lookup = {
             str(row["root_id"]): int(row["numeric_label"])
             for _, row in label_frame.iterrows()
@@ -1236,7 +1362,8 @@ class EditorSession(NoduleReviewMixin):
                     centerline_assessment=root.centerline_assessment,
                 )
             )
-        identity = Normalization(minimum=np.zeros(3), scale=1.0)
+        identity = Normalization(minimum=np.zeros(3), scale=1.0,
+                                 mm_per_mesh_unit=1. if self.coordinate_unit == "mm" else None)
         traits = compute_traits(
             primary.points,
             root_paths,
@@ -1253,6 +1380,7 @@ class EditorSession(NoduleReviewMixin):
             tip_vector_window=self.tip_vector_window_mesh_units,
             gravity=self.gravity,
             noise_mask=self.noise_presentation.mask,
+            primary_top_reference=self.primary_top_reference,
         )
         for _, row in traits.iterrows():
             root_id = str(row["root_id"])
@@ -1261,8 +1389,28 @@ class EditorSession(NoduleReviewMixin):
                 record["parent_id"] = self.roots[root_id].parent_id
                 record["root_order"] = self.roots[root_id].order
                 self.roots[root_id].traits = record
+        self._system_summary = traits.attrs["system_summary"]
+        self._trait_frame = traits
+
+    def _refresh_changed_length_qc(self, roots_before: dict[str, RootNode]) -> None:
+        """Review only actual path/parent edits; preserve unrelated historical QC."""
+        changed_points = {
+            root_id for root_id, root in self.roots.items()
+            if root_id not in roots_before or not np.array_equal(root.points, roots_before[root_id].points)
+        }
+        for root_id, root in self.roots.items():
+            if root_id == PRIMARY_ID or root.parent_id not in self.roots:
+                continue
+            previous = roots_before.get(root_id)
+            affected = (previous is None or root_id in changed_points
+                        or root.parent_id != previous.parent_id or root.parent_id in changed_points)
+            if affected:
+                update_child_length_qc(root.qc_flags, path_length(root.points),
+                                       path_length(self.roots[root.parent_id].points))
 
     def _validate_state(self) -> None:
+        if np.any(self.mesh.root_labels[self._protected_collar_mask] != -1):
+            raise EditorValidationError("Above-collar vertices must remain unassigned.")
         mask = self.noise_presentation.mask
         if np.any(self.mesh.root_labels[mask] != -1) or np.any(self.mesh.assignment_states[mask] != 0):
             raise EditorValidationError('Hidden noise vertices must remain excluded from root assignment.')
@@ -1303,7 +1451,10 @@ class EditorSession(NoduleReviewMixin):
                 parent = self.roots[root.parent_id]
                 child_length = path_length(root.points)
                 parent_length = path_length(parent.points)
-                update_child_length_qc(root.qc_flags, child_length, parent_length)
+                # A shorter/unsupported final fit cannot discharge frozen junction
+                # review evidence on read or no-op export. Validation only adds.
+                if child_length_exceeds_parent(child_length, parent_length) and "child_longer_than_parent" not in root.qc_flags:
+                    root.qc_flags.append("child_longer_than_parent")
                 if (
                     root.insertion_index is None
                     or not 0 <= int(root.insertion_index) < len(parent.points)
@@ -1380,13 +1531,13 @@ class EditorSession(NoduleReviewMixin):
             )
             if not is_above_primary_top(
                 origin,
-                primary.points,
+                self.primary_top_reference[None, :],
                 gravity=self.gravity,
             ):
                 continue
             excess, _ = primary_top_excess(
                 origin,
-                primary.points,
+                self.primary_top_reference[None, :],
                 gravity=self.gravity,
             )
             raise EditorValidationError(
@@ -1576,6 +1727,8 @@ class EditorSession(NoduleReviewMixin):
         self._validate_vertex_indices(indices)
         if numeric_label != -1 and np.any(self.noise_presentation.mask[indices]):
             raise EditorValidationError('Hidden noise vertices cannot be assigned to a root or nodule.')
+        if numeric_label != -1 and np.any(self._protected_collar_mask[indices]):
+            raise EditorValidationError('Above-collar vertices must remain unassigned.')
         if not self._nodule_review_active and np.any(self.mesh.root_labels[indices] <= -3):
             raise EditorValidationError("Review the nodule classification before assigning its surface to a root.")
         self._pending_index_chunks.append(indices.copy())
@@ -1939,17 +2092,7 @@ class EditorSession(NoduleReviewMixin):
         )
 
     def _hardware_public(self) -> dict[str, Any]:
-        gpus = [
-            {
-                "index": gpu.index,
-                "name": gpu.name,
-                "memory_total_bytes": gpu.memory_total_bytes,
-                "driver_version": gpu.driver_version,
-                "backend": gpu.backend,
-                "is_discrete": True,
-            }
-            for gpu in self.hardware.gpus
-        ]
+        gpus = []  # Compatibility field; this CPU build never identifies host GPUs.
         return {
             "logical_cpus": self.hardware.logical_cpus,
             "physical_cpus": self.hardware.physical_cpus,
@@ -1958,7 +2101,7 @@ class EditorSession(NoduleReviewMixin):
             "gpus": gpus,
             "discrete_gpu_present": bool(gpus),
             "acceleration": {
-                "rendering": "WebGL2 high-performance GPU",
+                "rendering": "WebGL2",
                 "spatial_picking": "BVH worker",
                 "geometry_processing": "multicore CPU",
                 "full_resolution_policy": "retain unless browser/device allocation fails",
@@ -1972,7 +2115,7 @@ class EditorSession(NoduleReviewMixin):
             "root_traits.csv",
             "csv/root_label_map.csv",
         ]
-        missing = [name for name in required if not (self.output_dir / name).is_file()]
+        missing = [name for name in required if not bundle_file(self.output_dir, name).is_file()]
         if missing:
             raise FileNotFoundError(
                 "Not a complete SoyRootBio output directory; missing "
@@ -1987,14 +2130,16 @@ class EditorSession(NoduleReviewMixin):
             "root_traits.csv",
             "csv/root_label_map.csv",
         ]
-        if (self.output_dir / "metadata.json").is_file():
+        if (bundle_file(self.output_dir, "metadata.json")).is_file():
             relatives.append("metadata.json")
-        if (self.output_dir / "nodules.json").is_file():
+        if (bundle_file(self.output_dir, "nodules.json")).is_file():
             relatives.append("nodules.json")
         relatives.extend(name for name in ('presentation_noise_masks.npz', 'noise_reduction_masks.npz')
-                         if (self.output_dir / name).is_file())
+                         if bundle_file(self.output_dir, name).is_file())
+        if bundle_file(self.output_dir, "analysis_geometry.npz").is_file():
+            relatives.append("analysis_geometry.npz")
         for relative in relatives:
-            path = self.output_dir / relative
+            path = bundle_file(self.output_dir, relative)
             digest.update(relative.encode("utf-8"))
             with path.open("rb") as handle:
                 while chunk := handle.read(1024 * 1024):

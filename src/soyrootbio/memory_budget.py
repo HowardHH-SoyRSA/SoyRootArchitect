@@ -9,12 +9,12 @@ import threading
 from .hardware import GIB
 
 
-MEMORY_BUDGET_POLICY = "geometry-private-peak-v3"
+MEMORY_BUDGET_POLICY = "geometry-private-peak-v4"
 
 
 def _initial_memory_budget(baseline_bytes: int) -> int:
-    """Apply the requested 40% cut to initial estimates, rounding up a byte."""
-    return (baseline_bytes * 3 + 4) // 5
+    """Halve v3 estimates: 30% of the v2 baseline, rounded up to a byte."""
+    return (baseline_bytes * 3 + 9) // 10
 
 
 MIN_GEOMETRY_BUDGET_BYTES = _initial_memory_budget(3 * GIB)
@@ -53,11 +53,11 @@ def memory_snapshot() -> MemorySnapshot:
 
 
 def estimate_decoded_memory(vertices: int, faces: int, original_vertices: int = 0) -> int:
-    """Initial admission estimate at 60% of the previous geometry budget.
+    """Initial admission estimate at half the v3 geometry budget.
 
-    The reduction includes the minimum, now 1.8 GiB, and every geometry term.
+    The reduction includes the minimum, now 0.9 GiB, and every geometry term.
     It can fall below historical private peaks; live observations still raise
-    reservations with 25% headroom. This is not a hard allocation bound and
+    reservations with 5% headroom. This is not a hard allocation bound and
     never reduces scientific evidence.
     """
     return max(MIN_GEOMETRY_BUDGET_BYTES,
@@ -66,9 +66,9 @@ def estimate_decoded_memory(vertices: int, faces: int, original_vertices: int = 
 
 
 def observed_memory_budget(peak_private_bytes: int) -> int:
-    """Keep 25% growth headroom above the observed peak, rounded up to bytes."""
+    """Keep 5% growth headroom above the observed peak, rounded up to bytes."""
     peak = max(0, int(peak_private_bytes))
-    return peak + (peak + 3) // 4
+    return peak + (peak + 19) // 20
 
 
 def estimate_input_memory(path: Path) -> int:

@@ -1,3 +1,4 @@
+from soyrootbio.bundle_layout import bundle_file, read_bundle_mesh
 from pathlib import Path
 import json
 
@@ -141,23 +142,25 @@ def test_pipeline_noise_stays_excluded_and_mesh_totals_exclude_its_faces(tmp_pat
         return resolve(points,*args,**kwargs)
     monkeypatch.setattr(pipeline,'_resolve_primary_path',check_primary_points)
     result = run_pipeline(PipelineConfig(source,output,start=(0,0,100),end=(0,0,0),
-                                         max_root_order=1,worker_threads=1,sample_points=len(p)))
+                                         max_root_order=1,worker_threads=1,sample_points=len(p), mm_per_mesh_unit=1.0))
     assert (result.full_root_labels[-4:] == -1).all()
     assert (result.full_root_labels[result.full_above_base_mask] == -1).all()
-    mesh = read_labeled_ply(output/'segmented_root_structure.ply')
+    mesh = read_bundle_mesh(output)
     np.testing.assert_array_equal(mesh.positions,p)
     np.testing.assert_array_equal(mesh.triangles,f)
-    metadata=json.loads((output/'metadata.json').read_text())
+    metadata=json.loads((bundle_file(output, 'metadata.json')).read_text())
     summary=metadata['system_summary']
-    expected_area=.5*np.linalg.norm(np.cross(p[f[:-4,1]]-p[f[:-4,0]],p[f[:-4,2]]-p[f[:-4,0]]),axis=1).sum()
+    eligible_labels = np.flatnonzero(result.traits.measurement_eligible.to_numpy())
+    measured_faces = f[np.all(np.isin(result.full_root_labels[f], eligible_labels), axis=1)]
+    expected_area=.5*np.linalg.norm(np.cross(p[measured_faces[:,1]]-p[measured_faces[:,0]],p[measured_faces[:,2]]-p[measured_faces[:,0]]),axis=1).sum()
     assert summary['root_system_surface_area'] == pytest.approx(expected_area)
-    assert summary['root_system_surface_area_method'] == 'noise_filtered_mesh_triangle_area'
+    assert summary['root_system_surface_area_method'] == 'eligible_segmented_mesh_triangles'
     assert metadata['source_geometry']['surface_area_source_units2'] > expected_area
     assert metadata['noise_reduction']['excluded_vertex_count'] == 4
     presentation = read_labeled_ply(output/'presentation_root_structure.ply')
     assert len(presentation.positions) == len(p)-4
     assert len(presentation.triangles) == len(f)-4
-    with np.load(output/'noise_reduction_masks.npz') as saved:
+    with np.load(bundle_file(output, 'noise_reduction_masks.npz')) as saved:
         assert saved['excluded_full_vertices'][-4:].all()
         np.testing.assert_array_equal(p[saved['analysis_to_full']],p[:-4])
 

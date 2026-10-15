@@ -28,20 +28,19 @@ from .batch import (
 from .endpoint_picker import (
     PrimaryGuidance,
     select_primary_guidance_from_file_gui,
-    select_soil_guidance_from_file_gui,
 )
 from .hardware import allocate_resources, detect_hardware, format_bytes
 from .pipeline import PipelineConfig
 from .batch_process import run_pipeline_process
 from .memory_budget import MemoryAdmission
 from .primary_guidance import read_primary_guidance
+from .unit_dialog import UnitScaleDialog, UnitResolutionCancelled, resolve_batch_units
 
 
 SUPPORTED_INPUTS = {".ply", ".stl", ".obj", ".xyz", ".csv"}
 PRIMARY_METHODS = {
     "Scored automatic": "scored",
     "Z-axis extrema": "z",
-    "Manual soil line + scorer": "soil",
     "Interactive endpoints + sections": "interactive",
     "XYZ endpoints": "coordinates",
 }
@@ -57,6 +56,7 @@ class SampleEntry:
     correction_file: Path | None = None
     custom_output: bool = False
     nodule_review_file: Path | None = None
+    unit_calibration: dict | None = None
 
 
 class BioInsAlgoBatchApp:
@@ -88,8 +88,6 @@ class BioInsAlgoBatchApp:
         self.noise_reduction_var = tk.BooleanVar(value=True)
         self.display_points_var = tk.StringVar(value="30000")
         self.max_order_var = tk.StringVar(value="3")
-        self.soil_z_var = tk.StringVar(value="")
-        self.runtime_limit_var = tk.StringVar(value="30")
         self.minimum_fraction_var = tk.StringVar(value="25")
         self.tip_window_var = tk.StringVar(value="2.0")
         self.concurrency_var = tk.StringVar(value="Auto")
@@ -213,13 +211,11 @@ class BioInsAlgoBatchApp:
         row += 1
         row = self._setting_row(parent, row, "Display points", ttk.Entry(parent, textvariable=self.display_points_var))
         row = self._setting_row(parent, row, "Maximum root order", ttk.Spinbox(parent, from_=1, to=12, textvariable=self.max_order_var))
-        row = self._setting_row(parent, row, "Soil-line Z", ttk.Entry(parent, textvariable=self.soil_z_var))
-        row = self._setting_row(parent, row, "Runtime limit (min)", ttk.Entry(parent, textvariable=self.runtime_limit_var))
         row = self._setting_row(parent, row, "Minimum retained (%)", ttk.Entry(parent, textvariable=self.minimum_fraction_var))
         row = self._setting_row(
             parent,
             row,
-            "Angle vector window (mesh units)",
+            "Angle vector window (mm)",
             ttk.Entry(parent, textvariable=self.tip_window_var),
         )
 
@@ -230,7 +226,7 @@ class BioInsAlgoBatchApp:
 
         ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
         row += 1
-        ttk.Label(parent, text="Manual XYZ base / tip", font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(parent, text="Manual XYZ base / tip (mm)", font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         for label, variables in (("Base XYZ", self.start_vars), ("Tip XYZ", self.end_vars)):
             frame = ttk.Frame(parent)
@@ -247,13 +243,12 @@ class BioInsAlgoBatchApp:
         return row + 1
 
     def _hardware_text(self) -> str:
-        gpu = ", ".join(item.name for item in self.hardware.gpus) or "CPU mode"
         memory = format_bytes(self.hardware.total_memory_bytes)
         if self.hardware.available_memory_bytes is not None:
             memory = f"{format_bytes(self.hardware.available_memory_bytes)} available / {memory}"
         return (
             f"{self.hardware.physical_cpus} physical / {self.hardware.logical_cpus} logical CPUs · "
-            f"{memory} RAM · {gpu} (GPU acceleration optional)"
+            f"{memory} RAM"
         )
 
     def _register_drop_target(self) -> None:
@@ -439,6 +434,8 @@ class BioInsAlgoBatchApp:
             return
         try:
             guidance = read_primary_guidance(value, expected_input=entry.input_path)
+            if not guidance.use_endpoints:
+                raise ValueError("This legacy selection needs new primary endpoints. Configure the selected primary to migrate it.")
         except (OSError, ValueError) as exc:
             messagebox.showerror("Cannot load primary guidance", str(exc))
             return
@@ -446,8 +443,7 @@ class BioInsAlgoBatchApp:
         self.tree.set(
             entry.item_id,
             "primary",
-            f"Loaded endpoints + {len(guidance.guides)} guides"
-            if guidance.use_endpoints else "Loaded soil line + guides",
+            f"Loaded endpoints + {len(guidance.guides)} guides",
         )
         self.status_var.set(f"Loaded saved primary guidance for {entry.input_path.name}.")
 
@@ -461,18 +457,18 @@ class BioInsAlgoBatchApp:
             return
         entry = self.entries[selected[0]]
         try:
-            picker = (
-                select_soil_guidance_from_file_gui
-                if PRIMARY_METHODS[self.primary_method_var.get()] == "soil"
-                else select_primary_guidance_from_file_gui
-            )
-            _, guidance, _ = picker(
+            self._resolve_units((entry.item_id,))
+            _, guidance, _ = select_primary_guidance_from_file_gui(
                 entry.input_path,
                 sample_points=self._sample_cap() or None,
                 max_display_points=self._positive_int(self.display_points_var.get(), "Display points", 2),
                 title=f"Primary guidance — {entry.input_path.name}",
                 noise_reduction=self.noise_reduction_var.get(),
+                mm_per_mesh_unit=entry.unit_calibration["mm_per_mesh_unit"],
             )
+        except UnitResolutionCancelled as exc:
+            self.status_var.set(str(exc))
+            return
         except Exception as exc:
             messagebox.showerror("Primary selection", str(exc))
             return
@@ -480,14 +476,21 @@ class BioInsAlgoBatchApp:
         self.tree.set(
             entry.item_id,
             "primary",
-            "Interactive endpoints + sections"
-            if guidance.use_endpoints
-            else "Interactive soil line + scorer",
+            "Interactive endpoints + sections",
         )
         self.status_var.set(
-            f"Saved {len(guidance.guides)} guide section(s)"
-            + (f" and soil Z {guidance.soil_z:.6g}." if guidance.soil_z is not None else ".")
+            f"Saved {len(guidance.guides)} guide section(s)."
         )
+
+    def _resolve_units(self, items: Iterable[str]) -> None:
+        entries = [self.entries[item] for item in items]
+        resolved = resolve_batch_units(
+            [entry.input_path for entry in entries],
+            lambda path, allow_remaining: UnitScaleDialog(self.root, path, allow_remaining=allow_remaining).show(),
+            existing={entry.input_path: entry.unit_calibration for entry in entries if entry.unit_calibration},
+        )
+        for entry in entries:
+            entry.unit_calibration = resolved[entry.input_path]
 
     def start_batch(self) -> None:
         if not self.entries:
@@ -499,6 +502,7 @@ class BioInsAlgoBatchApp:
         selected_items = self._next_batch_items()
         new_scheduler: BatchScheduler | None = None
         try:
+            self._resolve_units(selected_items)
             # Refresh the memory snapshot at admission time; available RAM can
             # change substantially while the GUI remains open.
             self.hardware = detect_hardware()
@@ -557,6 +561,9 @@ class BioInsAlgoBatchApp:
                 f"Running up to {allocation.max_concurrent_samples} sample process(es), "
                 f"{allocation.threads_per_sample} worker thread(s) each."
             )
+        except UnitResolutionCancelled as exc:
+            self.status_var.set(str(exc))
+            return
         except Exception as exc:
             if new_scheduler is not None:
                 new_scheduler.shutdown(wait=False, cancel_pending=True)
@@ -592,14 +599,18 @@ class BioInsAlgoBatchApp:
         method = PRIMARY_METHODS[self.primary_method_var.get()]
         start = end = None
         guides: tuple[tuple[float, float, float], ...] = ()
-        soil_z = self._optional_float(self.soil_z_var.get(), "Soil-line Z")
+        soil_z = None
+        guidance_unit = "mm"
         if entry.guidance is not None:
-            method = "interactive" if entry.guidance.use_endpoints else "soil"
+            if not entry.guidance.use_endpoints:
+                raise ValueError("Configure primary endpoints for this legacy selection before starting.")
+            method = "interactive"
+            guidance_unit = entry.guidance.coordinate_unit
             if entry.guidance.use_endpoints:
                 start = tuple(float(value) for value in entry.guidance.start)
                 end = tuple(float(value) for value in entry.guidance.end)
             guides = tuple(tuple(float(value) for value in row) for row in entry.guidance.guides)
-            soil_z = entry.guidance.soil_z if entry.guidance.soil_z is not None else soil_z
+            soil_z = entry.guidance.soil_z
         elif method == "coordinates":
             start = self._xyz(self.start_vars, "Base")
             end = self._xyz(self.end_vars, "Tip")
@@ -611,8 +622,10 @@ class BioInsAlgoBatchApp:
             output_dir=entry.output_dir,
             start=start,
             end=end,
-            auto_endpoints=("scored" if method == "soil" else method) if method not in {"interactive", "coordinates"} else None,
-            soil_z=soil_z if method in {"soil", "interactive"} else None,
+            auto_endpoints=method if method not in {"interactive", "coordinates"} else None,
+            soil_z=soil_z,
+            guidance_coordinate_unit=guidance_unit,
+            unit_calibration=entry.unit_calibration,
             primary_guides=guides,
             correction_file=entry.correction_file,
             sample_points=self._sample_cap() or None,
@@ -621,7 +634,6 @@ class BioInsAlgoBatchApp:
             nodule_aware=self.nodule_aware_var.get(),
             noise_reduction=self.noise_reduction_var.get(),
             nodule_review_file=entry.nodule_review_file if self.nodule_aware_var.get() else None,
-            runtime_limit_minutes=self._positive_float(self.runtime_limit_var.get(), "Runtime limit"),
             minimum_retained_fraction=self._percent_fraction(self.minimum_fraction_var.get()),
             tip_vector_window_mesh_units=self._positive_float(
                 self.tip_window_var.get(),

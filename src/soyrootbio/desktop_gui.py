@@ -16,6 +16,7 @@ from .batch import write_processing_error_log
 from .endpoint_picker import select_primary_endpoints_from_file_gui
 from .pipeline import AnalysisCancelled, PipelineConfig, PipelineResult, run_pipeline
 from .types import PointCloudData
+from .unit_dialog import UnitScaleDialog, UnitResolutionCancelled, resolve_batch_units
 
 
 SUPPORTED_INPUTS = {".ply", ".obj", ".stl", ".xyz", ".csv"}
@@ -424,6 +425,12 @@ class BioInsAlgoDesktopApp:
         except ValueError as exc:
             messagebox.showerror("Check settings", str(exc), parent=self.root)
             return
+        try:
+            calibration = resolve_batch_units([settings.input_path],
+                lambda path, allow_remaining: UnitScaleDialog(self.root, path, allow_remaining=False).show())[settings.input_path]
+        except UnitResolutionCancelled as exc:
+            self.status_var.set(str(exc))
+            return
         if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
             proceed = messagebox.askyesno(
                 "Output directory is not empty",
@@ -461,6 +468,7 @@ class BioInsAlgoDesktopApp:
                     title=f"Select endpoints - {settings.input_path.name}",
                     noise_reduction=settings.noise_reduction,
                     random_seed=42,
+                    mm_per_mesh_unit=calibration["mm_per_mesh_unit"],
                 )
             except Exception as exc:
                 self.root.deiconify()
@@ -484,6 +492,8 @@ class BioInsAlgoDesktopApp:
             auto_endpoints=settings.auto_endpoints,
             sample_points=effective_samples,
             noise_reduction=settings.noise_reduction,
+            unit_calibration=calibration,
+            guidance_coordinate_unit="mm",
         )
         self.cancel_event = threading.Event()
         self.close_when_stopped = False

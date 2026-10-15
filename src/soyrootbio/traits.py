@@ -34,8 +34,9 @@ def compute_traits(
     primary_centerline_assessment: dict | None = None,
     tip_vector_window: float = 2.0,
     noise_mask: np.ndarray | None = None,
+    primary_top_reference: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Measure per-root geometry in source mesh units and requested angles.
+    """Measure per-root geometry in calibrated mm (legacy mesh units) and angles.
 
     Ordered paths are stored collar/insertion-to-tip.  The three user-requested
     directional angles are therefore unambiguous and remain in the full
@@ -66,7 +67,14 @@ def compute_traits(
         triangles,
         full_root_labels,
     )
-    primary_original = normalization.inverse_points(primary_path)
+    factor = normalization.mm_per_mesh_unit if normalization.mm_per_mesh_unit is not None else 1.
+    mesh_areas = {label: area * factor**2 for label, area in mesh_areas.items()}
+    mesh_metadata = dict(mesh_metadata or {})
+    for key, exponent in (("surface_area_source_units2", 2), ("signed_volume_source_units3", 3),
+                          ("absolute_volume_source_units3", 3)):
+        if mesh_metadata.get(key) is not None:
+            mesh_metadata[key] = mesh_metadata[key] * factor**exponent
+    primary_original = normalization.to_output_points(primary_path)
     # Use the same final full-resolution ownership as the fitting pass, even
     # when analysis was reduced and a small root has no sampled vertices.
     support_points = points
@@ -75,7 +83,9 @@ def compute_traits(
         support_points = normalization.transform_points(np.asarray(full_points))
         support_labels = np.asarray(full_root_labels)
     primary_support = support_points[support_labels == 0] if support_labels is not None else points[primary_mask]
-    primary_radii = _radius_profile(primary_support, primary_path, normalization)
+    primary_radius_assessment = {}
+    primary_radii = _radius_profile(primary_support, primary_path, normalization,
+                                    assessment=primary_radius_assessment)
     primary_length = path_length(primary_original)
     primary_frustum_area, primary_frustum_volume = _frustum_measurements(
         primary_original,
@@ -90,6 +100,7 @@ def compute_traits(
             length=primary_length,
             chord=primary_chord,
             radii=primary_radii,
+            radius_segment_lengths=np.linalg.norm(np.diff(primary_original, axis=0), axis=1),
             point_count=int(len(primary_support)),
             confidence=float(primary_confidence),
             qc_flags=list(primary_qc_flags or []),
@@ -127,23 +138,34 @@ def compute_traits(
             "gravity_dz": float(gravity[2]),
         }
     )
+    p_tip_start, p_tip_end, p_tip_vector, p_window = _arc_window_vector(
+        primary_original, anchor_index=len(primary_original)-1, requested_window=tip_vector_window, from_start=False)
+    records[0].update(tip_gravity_angle_deg=vector_angle_degrees(p_tip_vector, gravity),
+                      tip_angle_z_deg=vector_angle_degrees(p_tip_vector, gravity),
+                      tip_start_gravity_angle_deg=vector_angle_degrees(primary_original[-1]-primary_original[0], gravity),
+                      tip_vector_requested_window=float(tip_vector_window), tip_vector_arc_window=float(p_window),
+                      tip_vector_window_unit=normalization.coordinate_unit,
+                      **_vector_columns("tip_vector", p_tip_start, p_tip_end),
+                      **_vector_columns("tip_start_vector", primary_original[0], primary_original[-1]))
     primary_unmeasurable = any(flag in (primary_qc_flags or []) for flag in ("centerline_no_support", "centerline_insufficient_support", "centerline_nodule_obscured"))
     records[0]["centerline_fit_status"] = (primary_centerline_assessment or {}).get("status", "insufficient_support" if primary_unmeasurable else "not_assessed")
     if primary_unmeasurable:
         _mark_unmeasurable(records[0])
+    _record_radius_quality(records[0], primary_radius_assessment, normalization, primary_centerline_assessment)
 
     primary_tree = cKDTree(primary_path)
     for lateral_index, lateral in enumerate(lateral_paths, start=1):
         parent_path = lateral.parent_points if lateral.parent_points is not None and len(lateral.parent_points) else primary_path
         parent_tree = cKDTree(parent_path)
-        original = normalization.inverse_points(lateral.points)
+        original = normalization.to_output_points(lateral.points)
         body_index = int(lateral.body_start_index)
         body = lateral.points[body_index:]
         body_original = original[body_index:]
-        parent_original = normalization.inverse_points(parent_path)
+        parent_original = normalization.to_output_points(parent_path)
         label_mask = lateral_labels == lateral_index
         support = support_points[support_labels == lateral_index] if support_labels is not None else points[label_mask]
-        radii = _radius_profile(support, body, normalization)
+        radius_assessment = {}
+        radii = _radius_profile(support, body, normalization, assessment=radius_assessment)
         length = path_length(original)
         chord = _chord_length(original)
         frustum_area, frustum_volume = _frustum_measurements(body_original, radii)
@@ -203,6 +225,7 @@ def compute_traits(
             length=length,
             chord=chord,
             radii=radii,
+            radius_segment_lengths=np.linalg.norm(np.diff(body_original, axis=0), axis=1),
             point_count=int(len(support)),
             confidence=float(lateral.confidence),
             qc_flags=qc_flags,
@@ -287,6 +310,7 @@ def compute_traits(
             record["volume_method"] = "unmeasurable_retained_prior_path"
         if lateral.centerline_assessment.get("status") in {"no_support", "insufficient_support", "nodule_obscured"}:
             _mark_unmeasurable(record)
+        _record_radius_quality(record, radius_assessment, normalization, lateral.centerline_assessment)
         if 'noise_excluded_root' in lateral.qc_flags:
             if len(support):
                 raise ValueError('A noise-only topology placeholder must have no assigned support')
@@ -302,13 +326,52 @@ def compute_traits(
     frame = pd.DataFrame.from_records(records)
     if 'measurement_excluded' in frame:
         frame['measurement_excluded'] = frame['measurement_excluded'].eq(True)
-    frame["coordinate_unit"] = "mesh_unit"
+    unit = normalization.coordinate_unit
+    frame["coordinate_unit"] = unit
+    frame["length_unit"] = unit
+    frame["area_unit"] = f"{unit}^2"
+    frame["volume_unit"] = f"{unit}^3"
+    for column in ("tip_vector_window_unit", "base_vector_window_unit"):
+        if column in frame:
+            frame[column] = unit
+    from .architecture_traits import eligible_mask
+    frame["measurement_eligible"] = eligible_mask(frame)
     frame.attrs["system_summary"] = _system_summary(
         frame,
         mesh_metadata=mesh_metadata or {},
         full_root_labels=(np.asarray(full_root_labels)[~noise_mask]
                           if noise_mask is not None else full_root_labels),
     )
+    frame.attrs["system_summary"].update(length_unit=unit, area_unit=f"{unit}^2", volume_unit=f"{unit}^3")
+    from dataclasses import replace
+    from .architecture_traits import add_architecture_traits
+    output_paths = [replace(root, points=normalization.to_output_points(root.points),
+                            insertion_point=None if root.insertion_point is None else
+                            normalization.to_output_points(np.asarray(root.insertion_point)[None])[0])
+                    for root in lateral_paths]
+    output_points = (normalization.source_to_output_points(full_points) if full_points is not None
+                     else normalization.to_output_points(points))
+    output_labels = (np.asarray(full_root_labels) if full_root_labels is not None else
+                     np.where(primary_mask, 0, np.where(lateral_labels > 0, lateral_labels, -1)))
+    top = normalization.to_output_points(np.asarray(primary_top_reference if primary_top_reference is not None
+                                                     else primary_path[0])[None])[0]
+    add_architecture_traits(frame, primary_original, output_paths, output_points, output_labels,
+                            triangles, top, gravity, unit)
+    if primary_top_reference is None:
+        frame.attrs["measurement_policy"]["primary_top_source"] = "path_start_fallback_no_explicit_reference"
+    system = frame.attrs["architecture_summary"][0]
+    measured = frame[frame.measurement_eligible]
+    frame.attrs["system_summary"].update(
+        root_count_total=len(measured), lateral_root_count_total=int((measured.root_order > 0).sum()),
+        excluded_root_count=len(frame)-len(measured), root_system_length=system["length_sum"],
+        root_system_surface_area=system["mesh_surface_area"],
+        root_system_surface_area_method="eligible_segmented_mesh_triangles",
+        root_system_volume=system["volume_frustum"], root_system_volume_method="eligible_centerline_frustum_estimates",
+        root_system_mesh_volume=system["mesh_volume"], root_system_frustum_volume=system["volume_frustum"],
+        root_system_mesh_volume_reliable=system["mesh_volume_reliable"],
+        root_system_volume_reliable=False)
+    for name in ("source_surface_area_including_nodules", "source_volume_including_nodules"):
+        frame.attrs["system_summary"].pop(name, None)
     if noise_mask is not None:
         frame.attrs['noise_exclusion_sha256'] = sha256(noise_mask.tobytes()).hexdigest()
         frame.attrs['noise_excluded_vertex_count'] = int(noise_mask.sum())
@@ -398,11 +461,32 @@ def _base_record(
     surface_method: str,
     volume: float,
     volume_method: str,
+    radius_segment_lengths: np.ndarray | None = None,
 ) -> dict:
     radii = np.asarray(radii, dtype=float)
     valid = radii[np.isfinite(radii) & (radii >= 0)]
-    mean_radius = float(np.mean(valid)) if len(valid) else 0.0
-    median_radius = float(np.median(valid)) if len(valid) else 0.0
+    mean_radius = float(np.mean(valid)) if len(valid) else np.nan
+    median_radius = float(np.median(valid)) if len(valid) else np.nan
+    statistics_method = "station_statistics_insufficient_arc_support"
+    if radius_segment_lengths is not None and len(radii) >= 2:
+        lengths = np.asarray(radius_segment_lengths, dtype=float)
+        supported = (np.isfinite(radii[:-1]) & np.isfinite(radii[1:]) & (radii[:-1] >= 0)
+                     & (radii[1:] >= 0) & np.isfinite(lengths) & (lengths > 0))
+        weights = lengths[supported]
+        if len(weights):
+            first, second = radii[:-1][supported], radii[1:][supported]
+            mean_radius = float(np.dot(weights, .5*(first+second))/weights.sum())
+            low, high = np.minimum(first,second), np.maximum(first,second)
+            left,right = float(low.min()),float(high.max())
+            for _ in range(64):
+                middle = .5*(left+right)
+                fraction = np.where(high > low, np.clip((middle-low)/np.maximum(high-low,1e-30),0,1), middle >= low)
+                if np.dot(weights,fraction) < .5*weights.sum():
+                    left=middle
+                else:
+                    right=middle
+            median_radius = .5*(left+right)
+            statistics_method = "arc-weighted-piecewise-linear-radius-v1"
     return {
         "root_id": root_id,
         "parent_id": parent_id,
@@ -411,10 +495,11 @@ def _base_record(
         "chord_length": float(chord),
         "tortuosity": float(length / chord) if chord > 1e-12 else np.nan,
         "mean_radius": mean_radius,
+        "diameter_statistics_method": statistics_method,
         "mean_diameter": 2.0 * mean_radius,
         "median_diameter": 2.0 * median_radius,
-        "minimum_diameter": 2.0 * float(np.min(valid)) if len(valid) else 0.0,
-        "maximum_diameter": 2.0 * float(np.max(valid)) if len(valid) else 0.0,
+        "minimum_diameter": 2.0 * float(np.min(valid)) if len(valid) else np.nan,
+        "maximum_diameter": 2.0 * float(np.max(valid)) if len(valid) else np.nan,
         "surface_area": float(surface_area),
         "surface_area_method": surface_method,
         "volume": float(volume),
@@ -428,65 +513,166 @@ def _base_record(
     }
 
 
-def _radius_profile(
-    assigned_points: np.ndarray,
-    path: np.ndarray,
-    normalization: Normalization,
-) -> np.ndarray:
+def _positive_support_spacing(points: np.ndarray) -> float | None:
+    """Estimate local positive sampling on a private evidence copy."""
+    if len(points) < 2:
+        return None
+    tree = cKDTree(points)
+    sample = points[np.linspace(0, len(points)-1, min(4096, len(points)), dtype=int)]
+    distances, _ = tree.query(sample, k=min(8, len(points)), workers=worker_threads())
+    positive = np.where(np.asarray(distances) > 0., distances, np.inf).min(axis=1)
+    if np.count_nonzero(np.isfinite(positive)) < .5 * len(sample):
+        # Duplicate facet positions can exhaust k8; source rows stay untouched.
+        distinct = np.unique(points, axis=0)
+        if len(distinct) < 2:
+            return None
+        sample = distinct[np.linspace(0, len(distinct)-1, min(4096,len(distinct)), dtype=int)]
+        distances, _ = cKDTree(distinct).query(sample, k=2, workers=worker_threads())
+        positive = np.asarray(distances)[:,1]
+    positive = positive[np.isfinite(positive) & (positive > 0.)]
+    return float(np.median(positive)) if len(positive) else None
+
+
+def _record_radius_quality(record: dict, assessment: dict, normalization: Normalization,
+                           centerline_assessment: dict | None = None) -> None:
+    coverage = bool(assessment.get("body_coverage_complete", False))
+    complete = (coverage and assessment.get("outside_body_support_count",0) == 0
+                and assessment.get("admissible_support_count",0) >= 3
+                and assessment.get("positive_radius_support_count",0) >= 3
+                and not assessment.get("global_radius_fallback", True))
+    fitting = centerline_assessment or {}
+    fit_incomplete = (fitting.get("status") in {"partial_support", "qc_rejected_prior_retained", "attachment_preserving_prior_retained",
+                         "no_support", "insufficient_support", "nodule_obscured"}
+                      or fitting.get("parent_connector_mode") in {"unsupported_gap", "preserved_topology", "retained_prior"}
+                      or fitting.get("exposed_body_supported") is False or fitting.get("fit_qc_passed") is False
+                      or str(fitting.get("traits_geometry_source", "")).startswith(("retained_prior", "unmeasurable_support")))
+    complete = complete and not fit_incomplete
+    complete = complete and np.isfinite(record["mean_radius"]) and np.isfinite(record["mean_diameter"])
+    flags = [flag for flag in str(record.get("qc_flags", "")).split(";") if flag]
+    if assessment.get("outside_body_support_count",0):
+        flags.append("radius_outside_fitted_body_support_excluded")
+    if assessment.get("admissible_support_count",0) < 3 or assessment.get("positive_radius_support_count",0) < 3:
+        flags.append("radius_insufficient_body_support")
+    if not coverage:
+        flags.append("radius_endpoint_support_incomplete")
+    if assessment.get("undersampled_station_count",0):
+        flags.append("radius_profile_interpolated_stations")
+    if assessment.get("global_radius_fallback", True):
+        flags.append("radius_global_fallback_insufficient_local_stations")
+    if fit_incomplete:
+        flags.append("final_centerline_measurement_support_incomplete")
+    record.update(radius_profile_method="terminal-transverse-body-support-v1",
+                  radius_admissible_support_count=assessment.get("admissible_support_count",0),
+                  radius_outside_body_support_count=assessment.get("outside_body_support_count",0),
+                  radius_undersampled_station_count=assessment.get("undersampled_station_count",0),
+                  radius_sampling_spacing=(normalization.to_output_length(assessment["sampling_spacing"])
+                                           if assessment.get("sampling_spacing") is not None else np.nan),
+                  radius_sampling_spacing_unit=normalization.coordinate_unit,
+                  body_coverage_complete=coverage,
+                  radius_profile_complete=complete,
+                  radius_global_fallback=assessment.get("global_radius_fallback", True),
+                  centerline_measurement_support_complete=not fit_incomplete,
+                  length_estimate_complete=complete and np.isfinite(record["length"]),
+                  volume_estimate_complete=complete and np.isfinite(record["volume"]),
+                  qc_flags=";".join(dict.fromkeys(flags)))
+
+
+def _radius_profile(assigned_points: np.ndarray, path: np.ndarray,
+                    normalization: Normalization, *, assessment: dict | None = None) -> np.ndarray:
+    """Measure transverse radius on supported fitted body, excluding axial overflow.
+
+    A two-local-spacing terminal slab is independent of centerline node density.
+    Global quantile fallback is restricted to admissible body support and never
+    certifies unsupported centerline gaps or a cropped full-root measurement.
+    """
     path = np.asarray(path, dtype=float)
+    assigned_points = np.asarray(assigned_points, dtype=float)
+    spacing = _positive_support_spacing(assigned_points)
+    if assessment is None:
+        assessment = {}
+    assessment.update(sampling_spacing=spacing, assigned_support_count=len(assigned_points),
+                      admissible_support_count=0, outside_body_support_count=0,
+                      undersampled_station_count=len(path), positive_radius_support_count=0,
+                      body_coverage_complete=False, global_radius_fallback=True)
     if len(path) == 0:
         return np.empty(0, dtype=float)
     if len(assigned_points) == 0:
-        return np.zeros(len(path), dtype=float)
+        return np.full(len(path), np.nan, dtype=float)
     if len(path) == 1:
-        distances = np.linalg.norm(np.asarray(assigned_points, dtype=float) - path[0], axis=1)
+        distances = np.linalg.norm(assigned_points-path[0], axis=1)
         nearest = np.zeros(len(distances), dtype=int)
     else:
         segment_start = path[:-1]
-        segment_vectors = path[1:] - path[:-1]
+        segment_vectors = np.diff(path, axis=0)
         segment_length2 = np.sum(segment_vectors**2, axis=1)
-        segment_midpoints = 0.5 * (path[:-1] + path[1:])
-        tree = cKDTree(segment_midpoints)
-        query_k = min(8, len(segment_midpoints))
-        all_distances: list[np.ndarray] = []
-        all_nearest: list[np.ndarray] = []
-        assigned_points = np.asarray(assigned_points, dtype=float)
-        for chunk_start in range(0, len(assigned_points), 50000):
-            chunk = assigned_points[chunk_start : chunk_start + 50000]
-            _, candidates = tree.query(chunk, k=query_k, workers=worker_threads())
+        segment_lengths = np.sqrt(segment_length2)
+        cumulative = np.r_[0., np.cumsum(segment_lengths)]
+        tree = cKDTree(.5*(path[:-1]+path[1:]))
+        query_k = min(8, len(segment_start))
+        all_distances, all_nearest, all_arcs = [], [], []
+        for chunk_start in range(0,len(assigned_points),50000):
+            chunk = assigned_points[chunk_start:chunk_start+50000]
+            _, candidates = tree.query(chunk,k=query_k,workers=worker_threads())
             if query_k == 1:
-                candidates = np.asarray(candidates, dtype=int)[:, None]
-            candidate_start = segment_start[candidates]
-            candidate_vectors = segment_vectors[candidates]
-            denominator = np.maximum(segment_length2[candidates], 1e-20)
-            offsets = chunk[:, None, :] - candidate_start
-            parameters = np.clip(
-                np.einsum("nkj,nkj->nk", offsets, candidate_vectors) / denominator,
-                0.0,
-                1.0,
-            )
-            projections = candidate_start + parameters[..., None] * candidate_vectors
-            candidate_distances = np.linalg.norm(chunk[:, None, :] - projections, axis=2)
-            best_position = np.argmin(candidate_distances, axis=1)
+                candidates = np.asarray(candidates,dtype=int)[:,None]
+            offsets = chunk[:,None,:]-segment_start[candidates]
+            vectors = segment_vectors[candidates]
+            unbounded_parameters = np.einsum("nkj,nkj->nk",offsets,vectors)/np.maximum(segment_length2[candidates],1e-20)
+            parameters = np.clip(unbounded_parameters,0.,1.)
+            projections = segment_start[candidates]+parameters[...,None]*vectors
+            candidate_distances = np.linalg.norm(chunk[:,None,:]-projections,axis=2)
+            best = np.argmin(candidate_distances,axis=1)
             rows = np.arange(len(chunk))
-            best_segments = candidates[rows, best_position]
-            best_parameters = parameters[rows, best_position]
-            all_distances.append(candidate_distances[rows, best_position])
-            all_nearest.append(best_segments + (best_parameters >= 0.5).astype(int))
+            segments = candidates[rows,best]
+            clipped = parameters[rows,best]
+            unbounded = unbounded_parameters[rows,best]
+            terminal = ((segments==0)&(unbounded<0.))|((segments==len(segment_start)-1)&(unbounded>1.))
+            overflow = np.abs(unbounded-clipped)*segment_lengths[segments]
+            admissible = ~terminal | (overflow <= (2.*spacing if spacing is not None else 0.))
+            best_distances = candidate_distances[rows,best].copy()
+            transverse = offsets[rows,best]-unbounded[:,None]*segment_vectors[segments]
+            best_distances[terminal&admissible] = np.linalg.norm(transverse[terminal&admissible],axis=1)
+            assessment["outside_body_support_count"] += int(np.count_nonzero(~admissible))
+            all_distances.append(best_distances[admissible])
+            all_nearest.append((segments+(clipped>=.5).astype(int))[admissible])
+            all_arcs.append((cumulative[segments]+clipped*segment_lengths[segments])[admissible])
         distances = np.concatenate(all_distances)
         nearest = np.concatenate(all_nearest)
-    global_radius = float(np.percentile(distances, 65)) if len(distances) else 0.0
-    radii = np.full(len(path), global_radius, dtype=float)
+        arcs = np.concatenate(all_arcs)
+        assessment["body_coverage_complete"] = bool(len(arcs) and spacing is not None
+            and arcs.min() <= 2.*spacing and cumulative[-1]-arcs.max() <= 2.*spacing)
+        assessment["start_coverage_complete"] = bool(len(arcs) and spacing is not None and arcs.min() <= 2.*spacing)
+        assessment["end_coverage_complete"] = bool(len(arcs) and spacing is not None and cumulative[-1]-arcs.max() <= 2.*spacing)
+        assessment["minimum_supported_arc"] = float(arcs.min()) if len(arcs) else None
+        assessment["maximum_supported_arc"] = float(arcs.max()) if len(arcs) else None
+    assessment["admissible_support_count"] = len(distances)
+    assessment["positive_radius_support_count"] = int(np.count_nonzero(distances>0.))
+    radii = np.full(len(path),np.nan,dtype=float)
+    measured_stations = []
     for index in np.unique(nearest):
-        local = distances[nearest == index]
-        if len(local) >= 3:
-            radii[int(index)] = float(np.percentile(local, 65))
-    if len(radii) > 2:
+        local = distances[nearest==index]
+        if len(local)>=3:
+            measured_stations.append(int(index))
+            radii[int(index)] = float(np.percentile(local,65))
+    assessment["undersampled_station_count"] = len(path)-len(measured_stations)
+    if len(measured_stations) >= 2:
+        station_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(path,axis=0),axis=1))]
+        radii = np.interp(station_arc,station_arc[measured_stations],radii[measured_stations])
+        if not assessment.get("start_coverage_complete",False):
+            radii[station_arc < station_arc[measured_stations[0]]] = np.nan
+        if not assessment.get("end_coverage_complete",False):
+            radii[station_arc > station_arc[measured_stations[-1]]] = np.nan
+        assessment["global_radius_fallback"] = False
+    else:
+        radii[:] = float(np.percentile(distances,65)) if len(distances) else np.nan
+    if len(radii)>2:
         for _ in range(2):
             smoothed = radii.copy()
-            smoothed[1:-1] = (radii[:-2] + 2.0 * radii[1:-1] + radii[2:]) / 4.0
-            radii = smoothed
-    return radii * normalization.scale
+            local = (radii[:-2]+2.*radii[1:-1]+radii[2:])/4.
+            supported = np.isfinite(local)
+            smoothed[1:-1][supported] = local[supported]
+            radii=smoothed
+    return radii*normalization.output_scale
 
 
 def _frustum_measurements(points: np.ndarray, radii: np.ndarray) -> tuple[float, float]:
@@ -502,7 +688,8 @@ def _frustum_measurements(points: np.ndarray, radii: np.ndarray) -> tuple[float,
     slant = np.sqrt(segment_lengths**2 + (r1 - r0) ** 2)
     area = np.pi * (r0 + r1) * slant
     volume = np.pi * segment_lengths * (r0**2 + r0 * r1 + r1**2) / 3.0
-    return float(np.sum(area)), float(np.sum(volume))
+    supported = np.isfinite(area) & np.isfinite(volume)
+    return (float(np.sum(area[supported])),float(np.sum(volume[supported]))) if np.any(supported) else (np.nan,np.nan)
 
 
 def _partition_mesh_surface_areas(
@@ -543,6 +730,8 @@ def _partition_mesh_surface_areas(
 
 
 def _measured_rows(traits: pd.DataFrame) -> pd.DataFrame:
+    if "measurement_eligible" in traits:
+        return traits[traits.measurement_eligible.eq(True)]
     return traits[~traits['measurement_excluded'].eq(True)] if 'measurement_excluded' in traits else traits
 
 
@@ -552,6 +741,7 @@ def _system_summary(
     mesh_metadata: dict,
     full_root_labels: np.ndarray | None,
 ) -> dict:
+    quality_rows = traits[~traits.measurement_excluded.eq(True)] if "measurement_excluded" in traits else traits
     traits = _measured_rows(traits)
     laterals = traits[traits["root_order"] > 0]
     primary = traits[traits["root_order"] == 0]
@@ -561,13 +751,13 @@ def _system_summary(
     whole_area = (
         float(mesh_area)
         if exact_surface_available
-        else float(traits["surface_area"].sum())
+        else float(traits["surface_area"].sum(min_count=1))
     )
     exact_volume_available = bool(mesh_metadata.get("volume_reliable", False)) and mesh_volume is not None
     whole_volume = (
         float(mesh_volume)
         if exact_volume_available
-        else float(traits["volume"].sum())
+        else float(traits["volume"].sum(min_count=1))
     )
     labels = None if full_root_labels is None else np.asarray(full_root_labels, dtype=int)
     contains_nodules = labels is not None and bool(np.any(labels <= -3))
@@ -581,8 +771,10 @@ def _system_summary(
     assigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels >= 0))
     uncertain_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -2))
     unassigned_fraction = np.nan if labels is None or not len(labels) else float(np.mean(labels == -1))
-    unavailable_length_count = int(traits["length"].isna().sum())
-    unavailable_volume_count = int(traits["volume"].isna().sum())
+    unavailable_length_count = int(quality_rows["length"].isna().sum())
+    unavailable_volume_count = int(quality_rows["volume"].isna().sum())
+    partial_length_count = int((~quality_rows["length_estimate_complete"].eq(True) & quality_rows["length"].notna()).sum()) if "length_estimate_complete" in traits else 0
+    partial_volume_count = int((~quality_rows["volume_estimate_complete"].eq(True) & quality_rows["volume"].notna()).sum()) if "volume_estimate_complete" in traits else 0
     return {
         "root_count_total": int(len(traits)),
         **({"noise_excluded_from_root_totals": True} if mesh_metadata.get("noise_excluded_from_totals") else {}),
@@ -595,28 +787,31 @@ def _system_summary(
         "length_unit": "mesh_unit",
         "area_unit": "mesh_unit^2",
         "volume_unit": "mesh_unit^3",
-        "root_system_length": float(traits["length"].sum()),
-        "root_system_length_complete": unavailable_length_count == 0,
+        "root_system_length": float(traits["length"].sum(min_count=1)),
+        "root_system_length_complete": unavailable_length_count == 0 and partial_length_count == 0,
         "root_system_length_unavailable_root_count": unavailable_length_count,
-        "primary_root_length": float(primary["length"].sum()),
-        "lateral_root_length_sum": float(laterals["length"].sum()),
+        "root_system_length_partial_root_count": partial_length_count,
+        "primary_root_length": float(primary["length"].sum(min_count=1)),
+        "lateral_root_length_sum": float(laterals["length"].sum(min_count=1)) if len(laterals) else 0.,
         "root_system_surface_area": whole_area,
         "root_system_surface_area_method": (
             ("noise_filtered_mesh_triangle_area" if mesh_metadata.get("noise_excluded_from_totals")
              else "full_mesh_triangle_area") if exact_surface_available else "sum_per_root_surface_estimates"
         ),
-        "primary_root_surface_area": float(primary["surface_area"].sum()),
-        "lateral_root_surface_area_sum": float(laterals["surface_area"].sum()),
+        "primary_root_surface_area": float(primary["surface_area"].sum(min_count=1)),
+        "lateral_root_surface_area_sum": float(laterals["surface_area"].sum(min_count=1)) if len(laterals) else 0.,
         "root_system_volume": whole_volume,
-        "root_system_volume_estimate_complete": exact_volume_available or unavailable_volume_count == 0,
+        "root_system_volume_estimate_complete": unavailable_volume_count == 0 and partial_volume_count == 0,
         "root_system_volume_estimate_unavailable_root_count": unavailable_volume_count,
+        "root_system_volume_estimate_partial_root_count": partial_volume_count,
+        "radius_profile_method": "terminal-transverse-body-support-v1" if "radius_profile_method" in traits else "legacy_segment_distance",
         "root_system_volume_method": (
             "closed_manifold_component_volume" if exact_volume_available else "sum_centerline_frustum_estimates"
         ),
         "root_system_volume_reliable": bool(exact_volume_available),
         "root_system_volume_reliability_reason": mesh_metadata.get("volume_reliability_reason", "frustum_estimate"),
-        "primary_root_volume_estimate": float(primary["volume"].sum()),
-        "lateral_root_volume_estimate_sum": float(laterals["volume"].sum()),
+        "primary_root_volume_estimate": float(primary["volume"].sum(min_count=1)),
+        "lateral_root_volume_estimate_sum": float(laterals["volume"].sum(min_count=1)) if len(laterals) else 0.,
         "assigned_vertex_fraction": assigned_fraction,
         "uncertain_vertex_fraction": uncertain_fraction,
         "unassigned_vertex_fraction": unassigned_fraction,
@@ -634,7 +829,7 @@ def _arc_window_vector(
     requested_window: float,
     from_start: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Return a sampling-invariant vector over a source mesh-unit window.
+    """Return a sampling-invariant vector over a window in output coordinates.
 
     Long roots use the requested mesh-unit window. For a root shorter than four
     windows, the final quarter of its arc is used so a local tip direction is

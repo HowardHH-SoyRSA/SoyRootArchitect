@@ -7,14 +7,14 @@ The project prioritizes the measurement objectives in this repository over exact
 ## Capabilities
 
 - Reads STL and PLY meshes while preserving their vertices and faces. OBJ meshes and XYZ/CSV point clouds are also supported.
-- Uses a ranked automatic primary-root detector by default, with manual endpoints, a soil-line constraint, and optional guide sections as overrides.
+- Uses a ranked automatic primary-root detector by default, with manual endpoints and optional guide sections as overrides.
 - Represents the primary as order 0, its children as order 1, and recursively assigns every descendant `parent order + 1`.
 - A child longer than its parent receives a QC warning and triggers junction re-examination. Both continuations are compared using direction (45%), independent fork evidence (35%), and sustained continuation length (20%), with a slight overlength penalty `0.05 * max(0, 1 - parent_length / child_length)`, capped at 0.05 across the affected hierarchy edges. A swap requires an independent improvement in direction or fork evidence as well as a better penalized score. Length alone never removes a child or its descendants or rejects an otherwise valid manual edit; ambiguous branches and any excess measured after final fitting remain available with explicit QC.
 - Produces an oriented centreline tree, stable root IDs, insertion locations, confidence values, and QC flags.
 - Measures per-root length, diameter, tortuosity, surface area, volume estimate, hierarchy, and three explicitly directional angles.
 - Writes CSV, multi-sheet XLSX, hierarchy-preserving RSML, editable JSON, labelled full-resolution PLY files, skeleton overlays, and separate 600-dpi angle figures.
 - Provides a batch-first Windows desktop GUI with drag/drop, per-sample outputs and reusable primary guidance, elapsed run time/progress, hardware-aware concurrency, pause/resume, and cancellation.
-- Provides a local, GPU-accelerated 3D result viewer and graph editor with per-root inspection, nine topology/geometry tools, durable undo/redo, and non-destructive materialisation.
+- Provides a local WebGL 3D result viewer and graph editor with per-root inspection, nine topology/geometry tools, durable undo/redo, and non-destructive materialisation.
 - Preserves original geometry separately and applies the same analysis cap/runtime preflight to every input format; the default runtime threshold is 30 minutes.
 
 ## Input representation and evidence
@@ -87,25 +87,26 @@ The GUI supports these primary-root modes:
 
 - **Scored automatic**: the measurement default.
 - **Z-axis extrema**: a simple fallback for consistently oriented, clean roots.
-- **Manual soil line + scorer**: constrains the collar search around a supplied soil-surface Z value.
-- **Interactive endpoints + sections**: configure a selected sample in the 3D picker; select collar/tip endpoints and optional sections that the primary centreline must cross. The picker can also record a horizontal soil line, and the mouse wheel zooms both the endpoint and primary-section views.
+- **Interactive endpoints + sections**: configure a selected sample in the 3D picker; select collar/tip endpoints and optional sections that the primary centreline must cross. Endpoint and section coordinates are displayed in millimeters; the mouse wheel zooms both views.
 - **XYZ endpoints**: enter collar/base and tip coordinates, with an optional semicolon-separated guide list (`x,y,z; x,y,z`).
+
+The GUI removes soil-line and runtime-limit inputs. Automatic runtime/memory preflight retains its established 30-minute policy; elapsed-time displays, pause, and cancellation remain available.
 
 Add multiple STL/PLY files with **Add files** or drag/drop them onto the queue. Each sample receives a unique output directory, which can be changed individually. Select one sample and use **Open output folder** to open that directory. The queue/status table has both vertical and horizontal scrollbars for long paths and status messages. Automatic resource allocation reserves a logical CPU for the desktop, considers physical/logical CPU counts and available RAM, and assigns concurrent samples and threads per sample. Both values can be overridden.
 
-To reuse a previous collar/tip selection, add the geometry, select its row, and choose **Load endpoints + guides…**. Open that sample's exported `primary_guidance.json`. The file stores the original source-coordinate endpoints, ordered guides, optional soil-line Z, and source sample name; it does not depend on the previous output folder or any external guide file. Loading checks the sample filename and coordinates before replacing its per-sample guidance. The loaded selection overrides the global primary method for that row.
+To reuse a previous collar/tip selection, add the geometry, select its row, and choose **Load endpoints + guides…**. Open that sample's exported `primary_guidance.json`. New files store millimeter endpoints, ordered guides, calibration provenance, and the source sample name; version-1 source-coordinate files are converted exactly once after calibration. Legacy selections without endpoints require a new primary selection. It does not depend on the previous output folder or any external guide file. Loading checks the sample filename and coordinates before replacing its per-sample guidance. The loaded selection overrides the global primary method for that row.
 
 Runs with manual endpoints automatically save `primary_guidance.json` in the output directory before geometry processing begins, including runs with no optional guides. This keeps the selected points available even if processing later fails. The **Total run time** column updates throughout processing and retains the final duration; queued time and deliberate pauses are excluded. ETA and thread-count columns are no longer shown; **Threads / sample** remains an analysis setting.
 
 If a sample fails, its output directory contains `processing_error.log` with the failure time, input/output paths, exception, traceback, and non-sensitive pipeline configuration. Cancelled jobs are not reported as processing failures. GUI batch clustering avoids nested HDBSCAN worker pools, so sample-level concurrency remains within the scheduler's resource allocation.
 
-The displayed memory summary distinguishes currently available RAM from installed RAM. In the batch GUI, automatic concurrency uses CPU capacity as an upper limit and checks live memory before every sample starts. The free RAM observed at batch startup no longer fixes a one-worker limit for the entire run. Queued workers retry admission as capacity changes, using each sample's own geometry estimate. Initial budgets are reduced by 40% from the previous calibration: `ceil(0.60 * max(3 GiB, 2 GiB + 8 KiB per full vertex + 192 bytes per face + 48 bytes per original vertex))`, rounded up to bytes. The minimum is 1.8 GiB and unknown input counts use a 2.4 GiB fallback. Admission checks physical RAM and Windows commit headroom, reserves future growth of active samples, and keeps a shared 2 GiB desktop reserve. Active budgets grow to at least 125% of the private-memory peak observed during that run and never shrink during a sample. The lower initial estimates can fall below historical peaks; simultaneous growth can exhaust memory before live monitoring reacts. These are planning heuristics, not guaranteed bounds; see the [memory allocation report](docs/benchmarks/memory_admission/README.md). Manual concurrency is an upper limit, subject to the same memory admission checks. Jobs waiting for capacity remain queued and can be paused or cancelled. A sample whose estimate exceeds total capacity fails clearly before launch instead of silently reducing scientific evidence. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
+The displayed memory summary distinguishes currently available RAM from installed RAM. In the batch GUI, automatic concurrency uses CPU capacity as an upper limit and checks live memory before every sample starts. The free RAM observed at batch startup no longer fixes a one-worker limit for the entire run. Queued workers retry admission as capacity changes, using each sample's own geometry estimate. Initial budgets are halved again from v3, making them 30% of the v2 calibration: `ceil(0.30 * max(3 GiB, 2 GiB + 8 KiB per full vertex + 192 bytes per face + 48 bytes per original vertex))`, rounded up to bytes. The minimum is 0.9 GiB and unknown input counts use a 1.2 GiB fallback. Admission checks physical RAM and Windows commit headroom, reserves future growth of active samples, and keeps a shared 2 GiB desktop reserve. Active budgets grow to at least 105% of the private-memory peak observed during that run and never shrink during a sample. The lower initial estimates can fall below historical peaks; simultaneous growth can exhaust memory before live monitoring reacts, especially with the narrower 5% headroom. These are planning heuristics, not guaranteed bounds; see the [memory allocation report](docs/benchmarks/memory_admission/README.md). Manual concurrency is an upper limit, subject to the same memory admission checks. Jobs waiting for capacity remain queued and can be paused or cancelled. A sample whose estimate exceeds total capacity fails clearly before launch instead of silently reducing scientific evidence. Each queued output directory must be absent or empty when its run starts. Automatically generated names are suffixed when a path is already present; a manually selected non-empty directory is rejected so stale files cannot be mixed into a new result.
 
 Automatic batch thread allocation uses at most two worker threads per sample, so reducing concurrency for RAM does not multiply transient spatial-query threads. Explicit thread counts remain available. Lateral tracing reports progress within each root order. Batch workers write `processing_resources.json` with decoded geometry counts, estimated and peak private memory, peak working set, system commit observations and shutdown diagnostics. A received worker exception and traceback take precedence over a later cleanup timeout; both are retained in failure diagnostics. Resource logs are diagnostic and do not certify biological compliance.
 
 Each active batch sample runs in its own spawned Python process, so independent analyses can use separate CPU cores. The GUI supervises these processes and receives progress and compact result summaries; geometry arrays stay in the sample process. Each process exits after its sample to release memory. The existing concurrency/RAM allocation and manual overrides still apply. Worker threads per sample controls supported spatial searches and caps supported native numerical thread pools within that process.
 
-Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Pause stops work at checkpoints and excludes paused time from the displayed runtime. Cancellation wakes paused workers; if a cancelled process has not exited within 10 seconds, it is terminated and reaped, including when closing the application. Cancelled output directories can contain partial files and must not be reused as completed results. A worker exception preserves its original traceback in `processing_error.log`; an unexpected process exit reports its exit code and allows other samples to continue. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` for timing history. GPU hardware is detected and displayed when available, but the current analysis pipeline is CPU based; there is no required CUDA path.
+Pause and cancel are cooperative. A running numerical stage may finish its current operation before it observes the request. Pause stops work at checkpoints and excludes paused time from the displayed runtime. Cancellation wakes paused workers; if a cancelled process has not exited within 10 seconds, it is terminated and reaped, including when closing the application. Cancelled output directories can contain partial files and must not be reused as completed results. A worker exception preserves its original traceback in `processing_error.log`; an unexpected process exit reports its exit code and allows other samples to continue. Step timings are stored under the batch output root in `.soyrootbio_step_timings.json` for timing history. The analysis pipeline uses CPU workers. GPU identification and hardware/status displays are disabled.
 
 ## Interactive 3D result editor
 
@@ -115,7 +116,7 @@ Open any completed SoyRootBio output bundle with one command:
 soyrootbio editor --output "D:\results\sample"
 ```
 
-The command starts a loopback-only local server and opens the editor in the browser. The viewer downloads and parses `segmented_root_structure.ply` off the UI thread, retains every vertex and face, requests the browser's high-performance GPU, computes smooth normals in a worker, and builds a background BVH for fast picking. It does not downsample the result. The status area reports the detected host GPU, the browser WebGL renderer, vertex/face counts, and full-resolution state.
+The command starts a loopback-only local server and opens the editor in the browser. The viewer downloads and parses `segmented_root_structure.ply` off the UI thread, retains every vertex and face, uses WebGL, computes smooth normals in a worker, and builds a background BVH for fast picking. It does not downsample the result. The status area reports vertex/face counts and full-resolution state.
 
 Hovering the surface shows root ID, length, mean diameter, and tip–gravity angle. Selecting a root from the surface or hierarchy highlights its complete centreline, direct parent, direct children, insertion point, and tip, then frames the full path in the 3D view. The hierarchy also lists every triangle-connected uncertain and unassigned mesh patch for direct highlighting, framing, and patch-level inspection. The inspector shows path and chord length, all three directional angles, mean diameter, surface area, volume, tortuosity, parent ID, and a direct-children list that is collapsed by default.
 
@@ -147,7 +148,7 @@ The automatic output files are opened read-only in memory. By default, editor st
   materialised\
 ```
 
-`operations.jsonl` is append-only; large point selections use hashed NumPy sidecar blobs so the log remains compact and replayable. Undo and redo are also recorded as events. **Export edits** writes an edited hierarchy, traits, numeric-label map, full-resolution labelled PLY, nested RSML, operation log, and manifest under the session directory. It never overwrites the automatic hierarchy, traits, label map, or PLY.
+`operations.jsonl` is append-only; large point selections use hashed NumPy sidecar blobs so the log remains compact and replayable. Undo and redo are also recorded as events. **Export edits** writes an edited hierarchy, traits, numeric-label map, full-resolution labelled PLY, nested RSML, operation log, and manifest under the session directory. It never overwrites the automatic hierarchy, traits, label map, or PLY. Materializations also provide normal bundle names for direct reopening, keep the immutable selected top and collar exclusions, and run fresh native contact/child-patch audits. Historical automatic stage evidence is saved separately; missing mesh evidence or unresolved violations are not reported compliant.
 
 Use a separate session location when desired:
 
@@ -166,6 +167,7 @@ The scored automatic detector and automatic input-mode detection are the default
 ```powershell
 soyrootbio run `
   --input "D:\roots\sample.ply" `
+  --mm-per-mesh-unit 1 `
   --output "D:\results\sample"
 ```
 
@@ -187,6 +189,7 @@ Use endpoints in original input coordinates and force the centreline through gui
 ```powershell
 soyrootbio run `
   --input "D:\roots\sample.ply" `
+  --mm-per-mesh-unit 1 `
   --output "D:\results\sample_manual" `
   --start 3.7 59.2 94.6 `
   --end -19.7 67.3 -55.3 `
@@ -200,13 +203,14 @@ Re-run after editing the exported hierarchy:
 ```powershell
 soyrootbio run `
   --input "D:\roots\sample.ply" `
+  --mm-per-mesh-unit 1 `
   --output "D:\results\sample_corrected" `
   --correction-file "D:\results\sample\root_hierarchy.json"
 ```
 
 In `root_hierarchy.json`, change `parent_id`, edit a `polyline`, or set `"valid": false` on a lateral root. Corrections with missing parents, cycles, invalid polylines, or inconsistent topology are rejected. An overlong child is retained with a QC warning for junction review. Root order is recalculated from the corrected parent links.
 
-The primary row is immutable in a correction file; change the primary with endpoints, soil line, or guide sections instead. Lateral root IDs are treated as immutable provenance keys while corrections are applied: deleting a root does not renumber the survivors or reuse the deleted ID. Unknown/stale IDs, duplicate IDs, and stale geometry fingerprints are rejected. If a lateral's parent or polyline is actually changed, its automatic attachment confidence is set to `0` and the QC flags `manual_correction`, `attachment_confidence_invalidated`, and `low_confidence` are added pending review.
+The primary row is immutable in a correction file; change the primary with endpoints or guide sections instead. Lateral root IDs are treated as immutable provenance keys while corrections are applied: deleting a root does not renumber the survivors or reuse the deleted ID. Unknown/stale IDs, duplicate IDs, and stale geometry fingerprints are rejected. If a lateral's parent or polyline is actually changed, its automatic attachment confidence is set to `0` and the QC flags `manual_correction`, `attachment_confidence_invalidated`, and `low_confidence` are added pending review.
 
 Useful options include:
 
@@ -217,7 +221,7 @@ Useful options include:
 - `--graph-k N` (default 14)
 - `--runtime-limit-minutes M` (default 30)
 - `--minimum-retained-fraction F` (default 0.25)
-- `--tip-window-mesh-units W` (default 2.0), the source-mesh arc-length window used for local tip, lateral-start, and primary-reference directions
+- `--tip-window-mm W` (default 2.0), the millimeter arc-length window used for local tip, lateral-start, and primary-reference directions
 
 Run `soyrootbio run --help` for the authoritative option list.
 
@@ -272,35 +276,58 @@ Gravity is fixed to the directional vector **g = (0, 0, -1)**. Angles use normal
 
 For an oriented lateral centreline `p[0] ... p[n-1]`:
 
-- **Tip–gravity** (`tip_gravity_angle_deg`): angle between the lateral tip tangent and **g**. The tangent points toward `p[n-1]` and is interpolated over the final source-mesh arc-length window selected by `--tip-window-mesh-units`.
+- **Tip–gravity** (`tip_gravity_angle_deg`): angle between the lateral tip tangent and **g**. The tangent points toward `p[n-1]` and is interpolated over the final millimeter arc-length window selected by `--tip-window-mm`.
 - **Tip-start–gravity** (`tip_start_gravity_angle_deg`): angle between the vector `p[n-1] - p[0]` and **g**.
-- **Lateral-start–primary** (`tip_primary_angle_deg`, historical column name): angle between the lateral tangent over the first mesh-unit window from `p[0]` and the ordered primary-root tangent interpolated around the lateral insertion location.
+- **Lateral-start–primary** (`tip_primary_angle_deg`, historical column name): angle between the lateral tangent over the first millimeter window from `p[0]` and the ordered primary-root tangent interpolated around the lateral insertion location.
 
-The requested mesh-unit window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_*` records the lateral-tip window and `base_vector_*` records the lateral-start window; both use `mesh_unit`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in source mesh units, the local primary reference vector, and gravity components.
+The requested millimeter window is capped at 25% of the referenced path's total length on short paths, making the direction independent of centreline sampling density. `tip_vector_*` records the lateral-tip window and `base_vector_*` records the lateral-start window; both use `mm`. The CSV/XLSX vector table also includes root start/tip, vector start/end XYZ coordinates, vector components in millimeters, the local primary reference vector, and gravity components.
 
-Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Order-1 laterals shorter than 3.5 mesh units and order-2 laterals shorter than 1.3 mesh units remain visible as segmented roots, but their angle labels, indicatrices, and related vectors are omitted from all angle figures; the numerical traits and vector tables remain unchanged. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, `Start`, and `Primary` as applicable. In the lateral-start–primary view, both rays originate at the lateral insertion; the name and angle label remains connected to the root tip. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
+Each requested angle has its own 600-dpi X–Z front-view PNG. Every lateral uses the compact `oN-NNN angle°` pattern without the storage-only `root-` prefix. Order-1 laterals shorter than 3.5 mm and order-2 laterals shorter than 1.3 mm remain visible as segmented roots, but their angle labels, indicatrices, and related vectors are omitted from all angle figures; the numerical traits and vector tables remain unchanged. Labels are vertically distributed in side columns and connected to their corresponding tips by ordered, three-segment polyline indicatrices routed through two outside rails to avoid leader-line crossings. Label font size adapts independently to the density of each side so adjacent text remains separated without unnecessarily shrinking the sparser column. The measured rays and arrowheads remain shortened, and the compact legends use `Tip`, `S–T`, `Start`, and `Primary` as applicable. In the lateral-start–primary view, both rays originate at the lateral insertion; the name and angle label remains connected to the root tip. The gravity reference is intentionally omitted from the two gravity-angle images, while its numerical vector and angles remain in the CSV/XLSX exports and metadata. Figure height grows for large hierarchies, but a front projection can still compress Y-directed geometry. Use the numeric 3D vector table as the measurement record.
 
 ## Trait definitions and units
 
-Physical calibration is temporarily disabled. Output lengths, coordinates, and vector components use the source mesh coordinate unit (`mesh_unit`); area uses `mesh_unit^2` and volume uses `mesh_unit^3`. Internal unit-box normalization is only a numerical transform and is reversed before reporting. No millimetre/voxel conversion value is accepted by the current CLI or GUI, and no physical distance is used for a threshold.
+New runs report lengths, coordinates, diameters, and vector components in `mm`, areas in `mm^2`, volumes in `mm^3`, and linear densities in `mm^-1`. Explicit supported binary-STL header declarations establish the source scale. Other inputs require a positive millimeters-per-mesh-unit value: the GUI prompts before selection or launch, and noninteractive runs require `--mm-per-mesh-unit`. A batch rule applies only to remaining unresolved inputs; known headers retain their own scale. Cancelling unit selection starts no samples. Conflicting explicit/header scales are rejected. Internal unit-box tracing arithmetic and existing normalized assignment defaults are preserved. Raw decoded arrays, duplicates, vertex order, faces, and mappings remain separately preserved in `original_input_geometry.npz`; technical normalized evidence has explicit local unit context. Legacy bundles retain truthful `mesh_unit` labels when reopened without calibration. See [the physical unit contract](docs/physical-units.md).
 
 | Trait | Method | Interpretation / limitation |
 |---|---|---|
 | Root length | Sum of consecutive centreline segment lengths | Per primary and lateral root. Accuracy depends on centreline and resolution. |
-| Lateral count | Count of validated hierarchy nodes grouped by order | Deliberate `--max-laterals` caps make this a selected count, not a complete biological count. |
+| Lateral count | Count of finite positive-length lateral roots grouped by order | Excluded topology identities remain in QC; caps and measurement coverage can limit the biological count. |
 | Tortuosity | Centreline length / endpoint chord length | Undefined when the chord is effectively zero. |
-| Diameter | Twice a smoothed local radius from assigned surface-to-centreline distances | A geometric estimate; touching roots and assignment errors can bias it. Mean, median, minimum, and maximum are reported. |
-| Per-root surface area | Mesh-triangle area partitioned by majority vertex label | Falls back to a centreline-frustum estimate for point clouds or roots lacking assigned faces. |
-| Whole-system surface area | Sum of original mesh triangle areas, or sum of per-root estimates when no mesh area is available | `root_system_surface_area_method` records `full_mesh_triangle_area` or `sum_per_root_surface_estimates`; biological accuracy still depends on reconstruction quality. |
-| Per-root volume | Consecutive centreline frustums using the estimated radius profile | Always labelled `centerline_frustum_estimate`; per-root values are not guaranteed to sum to the whole-mesh volume. |
-| Whole-system volume | Sum of absolute component-centred tetrahedral volumes for an edge-clean, consistently oriented closed mesh; otherwise the sum of per-root centreline-frustum estimates | The exact mesh value is used only when there are no boundary, non-manifold, degenerate, or orientation-inconsistent faces. `root_system_volume_method`, `root_system_volume_reliable`, and its reason distinguish the two cases. |
+| Diameter | Twice a smoothed local radius from assigned surface-to-centreline distances | A geometric estimate; touching roots and assignment errors can bias it. Mean and median are weighted by measured arc length; minimum and maximum are finite profile extrema. |
+| Per-root surface area | Triangle area partitioned by the fraction of vertices owned by the root | Falls back to a centerline-frustum surface estimate for point clouds or roots without assigned faces. |
+| Whole-system surface area | Sum of eligible segmented native triangle areas | All corners must belong to eligible roots. Mesh area is missing for point-only input; per-root surface estimates remain available. |
+| Per-root volume | Consecutive centreline frustums using the estimated radius profile | Labelled `centerline_frustum_estimate` with explicit support/completeness fields; per-root values are not guaranteed to sum to whole-mesh volume. Axial support beyond cropped endpoints cannot inflate radius. Missing local stations interpolate measured radii in arc length; retained/unsupported final paths remain incomplete. |
+| Whole-system volume | Separate eligible segmented mesh integral and exposed-body frustum sum | Both methods are exported; open/invalid patches remain provisional. root_system_volume is the frustum compatibility alias. |
 | Confidence and QC | Attachment, tangent continuity, length/support, and tracing evidence | Review aids, not calibrated biological probabilities. |
 
 Disconnected components, boundary/non-manifold edges, degenerate faces, signed/absolute volume, retained fraction, and reduction reason are recorded in `metadata.json`.
 
 ## Outputs
 
-Every run writes a self-contained output directory. Class-specific PLY files are omitted only when that class has no points.
+New bundles use **layout version 2**: all tables are in `tables/`, and JSON, RSML, NPZ, logs and provenance are in `support/`. PNG figures and PLY views remain at the bundle root. The bundled editor reads both layouts; earlier bundles are not rewritten. External scripts must adopt the new paths or use `soyrootbio.bundle_layout.bundle_file`.
+
+The canonical `presentation_root_structure.ply` replaces `segmented_root_structure.ply` and the combined compatibility point cloud. It physically removes scientifically excluded disconnected noise. Separate `primary_points.ply` and `lateral_points.ply` exports are retained when their classes contain points, with the original full-resolution assigned coordinates and colors; the lateral cloud includes every root order. `support/analysis_geometry.npz` preserves complete indexed output-unit geometry and labels for editor reload; `support/original_input_geometry.npz` preserves decoded source geometry. Source-index mappings and noise masks are retained.
+
+Measurements include the primary and **all detected orders**, restricted to finite positive-length roots. Excluded roots remain in topology and QC; this filter never deletes roots or descendants. Whole-system, all-lateral and per-order summaries are separate. Partial finite measurements retain their completeness flags. Depth uses the immutable primary top, not a shortened fitted endpoint.
+
+Both `volume_frustum` and `mesh_volume` are exported. Frusta use the supported exposed body. Mesh integrals include only triangles whose three corners belong to eligible segmented roots in the selected scope, excluding unassigned, uncertain, nodule, noise and ineligible-root surfaces. Per-root mesh patches require one owner at all corners; system unions can retain interfaces between eligible roots, so their integrals need not equal summed per-root integrals. No caps or geometry repair are introduced. Open/invalid mesh estimates carry boundary/winding diagnostics and an origin-sensitivity range. Solidity inherits these limitations.
+
+The tables are consolidated by subject: `root_traits.csv` (eligible roots), `root_inventory.csv` (all topology identities and QC), `architecture_summary.csv` (scopes), `branch_positions.csv`, `branch_spacing.csv`, `diameter_distribution.csv`, `system_summary.csv`, `root_label_map.csv`, and `centerlines.csv` (primary and laterals together). `trait_dictionary.csv` describes the fields. One `traits.xlsx` mirrors these CSV tables with one sheet each; overlapping per-trait slices are no longer written. Nodule tables are included when enabled.
+
+Architecture summaries include parent-length branching density, spacing and CV, distinct-site spacing sensitivity, depth/width and their ratio, relative horizontal reach, convex-hull volume, envelope length density, both solidity estimates, form/direction means, and diameter mean/median/P10/P90/IQR/CV. Diameter distributions describe equally weighted per-root mean diameters, not longitudinal radius stations. Quantiles use linear interpolation (R type 7). Density counts each eligible recorded parent length once; unavailable parent lengths produce missing density. Geometry extents use eligible assigned vertices only. A scope containing only excluded roots retains missing totals, not biological zeros.
+
+### Illustrated trait guide and export verification
+
+`scripts/create_trait_guide.py` generates an illustrated PDF and complete field dictionary from a selected millimeter-calibrated version-2 bundle. Generate the plots with the program's Python environment, then build the PDF in an environment with ReportLab and Pillow installed (the current template uses Windows Arial fonts):
+
+```powershell
+python scripts/create_trait_guide.py "path/to/bundle" --assets ".tmp/trait-guide" --plots
+python scripts/create_trait_guide.py "path/to/bundle" --assets ".tmp/trait-guide" --pdf "output/pdf/trait-guide.pdf"
+```
+
+`scripts/validate_trait_bundle.py` checks table/workbook and RSML agreement, source/presentation mappings, an independent mesh-volume integral, and editor export/reopen preservation. The example data, rendered PDF, figures, point clouds, workbooks and validation outputs remain local and are not part of the source release.
+
+The following legacy inventory documents older bundles. In version 2, hierarchy/RSML/metadata/guidance files move to `support/`; the former trait slices and separate skeleton CSVs are merged as described above.
 
 ### Measurements and topology
 
@@ -318,11 +345,11 @@ Every run writes a self-contained output directory. Class-specific PLY files are
 - `csv/root_topology.csv`
 - `csv/root_qc.csv`
 - `csv/root_label_map.csv`: numeric PLY labels mapped to stable root IDs, parent IDs, orders, and colours, including `-2` uncertain and `-1` unassigned rows.
-- `primary_skeleton.csv` and `lateral_skeletons.csv`: centreline nodes with source-mesh `x,y,z` coordinates and explicit `mesh_unit` labels.
+- `primary_skeleton.csv` and `lateral_skeletons.csv`: centreline nodes with millimeter `x,y,z` coordinates and explicit `mm` labels.
 - `root_hierarchy.json`: editable topology and polylines.
-- `root_system.rsml`: nested, hierarchy-preserving RSML with source-mesh geometry, `mesh_unit` labels, and selected properties.
+- `root_system.rsml`: nested, hierarchy-preserving RSML with millimeter geometry, `mm` labels, availability, method, and completeness properties.
 - `metadata.json`: configuration, provenance, primary candidates, mesh audit, topology report, stage timings, system summary, and output inventory.
-- `primary_guidance.json` (manual-endpoint runs): standalone source-coordinate collar/tip endpoints, ordered guides, and optional soil-line Z for reuse in the GUI.
+- `primary_guidance.json` (manual-endpoint runs): versioned millimeter collar/tip endpoints, ordered guides, and calibration provenance for reuse.
 
 ### Geometry and validation figures
 

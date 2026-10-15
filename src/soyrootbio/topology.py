@@ -2707,7 +2707,7 @@ def hierarchy_frame(
     if primary_path is not None and len(primary_path):
         insertion = np.asarray(primary_path, dtype=float)[0]
         if normalization is not None:
-            insertion = normalization.inverse_points(insertion[None, :])[0]
+            insertion = normalization.to_output_points(insertion[None, :])[0]
         rows.append(
             {
                 "root_id": PRIMARY_ID,
@@ -2717,7 +2717,7 @@ def hierarchy_frame(
                 "insertion_x": float(insertion[0]),
                 "insertion_y": float(insertion[1]),
                 "insertion_z": float(insertion[2]),
-                "coordinate_unit": "mesh_unit" if normalization is not None else "analysis_normalized",
+                "coordinate_unit": normalization.coordinate_unit if normalization is not None else "analysis_normalized",
                 "confidence": float(primary_confidence),
                 "qc_flags": ";".join(primary_qc_flags),
             }
@@ -2725,7 +2725,7 @@ def hierarchy_frame(
     for path in paths:
         insertion = np.asarray(path.insertion_point if path.insertion_point is not None else path.points[0])
         if normalization is not None:
-            insertion = normalization.inverse_points(insertion[None, :])[0]
+            insertion = normalization.to_output_points(insertion[None, :])[0]
         rows.append(
             {
                 "root_id": path.root_id,
@@ -2735,7 +2735,7 @@ def hierarchy_frame(
                 "insertion_x": float(insertion[0]),
                 "insertion_y": float(insertion[1]),
                 "insertion_z": float(insertion[2]),
-                "coordinate_unit": "mesh_unit" if normalization is not None else "analysis_normalized",
+                "coordinate_unit": normalization.coordinate_unit if normalization is not None else "analysis_normalized",
                 "confidence": float(path.confidence),
                 "qc_flags": ";".join(path.qc_flags),
             }
@@ -2751,6 +2751,7 @@ def write_editable_hierarchy(
     primary_confidence: float = 1.0,
     primary_qc_flags: Iterable[str] = (),
     primary_centerline_assessment: dict | None = None,
+    coordinate_unit: str = "mesh_unit",
 ) -> Path:
     """Write the complete topology contract as editable JSON."""
 
@@ -2791,8 +2792,8 @@ def write_editable_hierarchy(
     payload = {
         "schema": "soyrootbio.root-hierarchy/v1",
         "coordinate_space": "source_coordinates",
-        "coordinate_unit": "mesh_unit",
-        "instructions": "Coordinates are in source_coordinates. The primary row is immutable; override it with GUI endpoints/soil/guides. For lateral rows, edit parent_id, valid, or polyline and pass this file back as a correction file.",
+        "coordinate_unit": coordinate_unit,
+        "instructions": f"Coordinates are in {coordinate_unit}. The primary row is immutable; override it with GUI endpoints/guides. For lateral rows, edit parent_id, valid, or polyline and pass this file back as a correction file.",
         "roots": roots,
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
@@ -2828,6 +2829,13 @@ def apply_hierarchy_corrections(
     coordinate_space = str(payload.get("coordinate_space", "source_coordinates"))
     if coordinate_space not in {"source_coordinates", "analysis_normalized"}:
         raise ValueError(f"Unsupported hierarchy coordinate_space: {coordinate_space}")
+    coordinate_unit = payload.get("coordinate_unit", "mesh_unit")
+    if coordinate_space == "source_coordinates" and coordinate_unit not in {"mm", "mesh_unit"}:
+        raise ValueError(f"Unsupported hierarchy coordinate_unit: {coordinate_unit}")
+    to_normalized = (normalization.from_mm_points if coordinate_unit == "mm"
+                     else normalization.transform_points) if normalization is not None else None
+    from_normalized = (normalization.to_mm_points if coordinate_unit == "mm"
+                       else normalization.inverse_points) if normalization is not None else None
     primary_rows = [row for row in rows if str(row.get("root_id")) == PRIMARY_ID]
     for primary_row in primary_rows:
         if primary_row.get("valid", True) is False:
@@ -2848,7 +2856,7 @@ def apply_hierarchy_corrections(
                     # primary.  Without a transform it cannot be verified.
                     edited_primary = None
                 else:
-                    edited_primary = normalization.transform_points(edited_primary)
+                    edited_primary = to_normalized(edited_primary)
             if edited_primary is not None and (
                 edited_primary.shape != np.asarray(primary_path).shape
                 or not np.allclose(edited_primary, primary_path, rtol=1e-7, atol=1e-9)
@@ -2876,7 +2884,7 @@ def apply_hierarchy_corrections(
             else:
                 expected_input = str(expected_fingerprint)
             if not fitted_export and coordinate_space == "source_coordinates" and normalization is not None:
-                current_polyline = normalization.inverse_points(current_polyline)
+                current_polyline = from_normalized(current_polyline)
             if not fitted_export:
                 current_fingerprint = _polyline_fingerprint(current_polyline)
             if current_fingerprint != expected_input:
@@ -2898,7 +2906,7 @@ def apply_hierarchy_corrections(
                     raise ValueError(
                         "A Normalization is required to import source-coordinate hierarchy polylines."
                     )
-                edited = normalization.transform_points(edited)
+                edited = to_normalized(edited)
             current_points = np.asarray(path.points, dtype=float)
             geometry_changed = geometry_changed or (
                 edited.shape != current_points.shape

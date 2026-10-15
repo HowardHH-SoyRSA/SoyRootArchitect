@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from soyrootbio.pipeline import PipelineConfig, run_pipeline
+from soyrootbio.bundle_layout import bundle_file
 
 
 def main() -> None:
@@ -19,7 +20,7 @@ def main() -> None:
         raise ValueError("output must be separate from the source bundle")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"refusing to overwrite an existing output: {output}")
-    source = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+    source = json.loads(bundle_file(bundle, "metadata.json").read_text(encoding="utf-8"))
     config = dict(source["config"])
     config["input_path"] = Path(config["input_path"])
     config["output_dir"] = output

@@ -69,20 +69,30 @@ def export_results(
             raise ValueError('Traits must be recomputed with the complete hidden noise mask before export')
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_dir = output_dir / "csv"
+    csv_dir = output_dir / "tables"
     csv_dir.mkdir(parents=True, exist_ok=True)
-    original_primary_path = normalization.inverse_points(primary_path)
+    original_primary_path = normalization.to_output_points(primary_path)
     _write_skeleton_csv(
-        output_dir / "primary_skeleton.csv",
+        csv_dir / "primary_skeleton.csv",
         "primary",
         original_primary_path,
+        coordinate_unit=normalization.coordinate_unit,
     )
     lateral_skeletons = _lateral_skeleton_frame(lateral_paths, normalization)
-    lateral_skeletons.to_csv(output_dir / "lateral_skeletons.csv", index=False)
+    primary_skeleton = pd.read_csv(csv_dir / "primary_skeleton.csv")
+    primary_skeleton["root_order"] = 0
+    primary_skeleton["parent_id"] = ""
+    primary_skeleton["centerline_region"] = "exposed_body"
+    centerlines = pd.concat([primary_skeleton, lateral_skeletons], ignore_index=True)
+    centerlines = centerlines[["root_id", "parent_id", "root_order", "node_id", "x", "y", "z", "coordinate_unit",
+                               "confidence", "qc_flags", "centerline_region"]]
+    centerlines.to_csv(csv_dir / "centerlines.csv", index=False)
+    (csv_dir / "primary_skeleton.csv").unlink()
 
     tables = _trait_tables(traits, lateral_paths, normalization, primary_path)
     if nodules is not None:
-        nodules.evidence["geometry_sha256"] = geometry_digest(full_points if full_points is not None else original_points)
+        nodules.evidence["geometry_sha256"] = geometry_digest(normalization.source_to_output_points(full_points if full_points is not None else original_points))
+        nodules.evidence["geometry_coordinate_unit"] = normalization.coordinate_unit
         nodule_traits, nodule_summary, nodule_depth = export_nodules(output_dir, nodules)
         tables.update({"nodule_traits.csv": nodule_traits, "nodule_summary.csv": nodule_summary,
                        "nodule_depth_distribution.csv": nodule_depth})
@@ -92,12 +102,11 @@ def export_results(
                                    for o in nodules.objects if o["status"] == "accepted"])
         if len(nodule_map):
             tables["root_label_map.csv"] = pd.concat([tables["root_label_map.csv"], nodule_map], ignore_index=True)
-    traits.to_csv(output_dir / "root_traits.csv", index=False)
-    for filename, frame in tables.items():
-        frame.to_csv(csv_dir / filename, index=False)
-    _write_trait_workbook(output_dir / "traits.xlsx", traits, tables)
+    write_measurement_tables(output_dir, traits, tables["root_label_map.csv"],
+                             topology=tables["root_topology.csv"])
 
-    geometry_points = np.asarray(full_points if full_points is not None else original_points, dtype=float)
+    geometry_points = normalization.source_to_output_points(
+        np.asarray(full_points if full_points is not None else original_points, dtype=float))
     geometry_labels = (
         np.asarray(full_root_labels, dtype=int)
         if full_root_labels is not None
@@ -106,26 +115,16 @@ def export_results(
     if len(geometry_labels) != len(geometry_points):
         raise ValueError("Full-resolution root labels do not match export vertices.")
     colors, root_orders, assignment_states = _label_properties(geometry_labels, lateral_paths)
-    write_labeled_ply(
-        output_dir / "segmented_root_structure.ply",
-        geometry_points,
-        triangles=triangles,
-        colors=colors,
-        root_ids=geometry_labels,
-        root_orders=root_orders,
+    from .bundle_layout import save_analysis_geometry, finalize_bundle
+    from .presentation import export_noise_free_presentation
+    save_analysis_geometry(output_dir, geometry_points, triangles, colors, geometry_labels, root_orders, assignment_states)
+    write_root_point_clouds(output_dir, geometry_points, geometry_labels, colors)
+    metadata['noise_presentation'] = export_noise_free_presentation(
+        output_dir, geometry_points, triangles, colors=colors,
+        root_ids=geometry_labels, root_orders=root_orders,
         assignment_states=assignment_states,
+        excluded_mask=np.zeros(len(geometry_points), bool) if noise_mask is None else noise_mask,
     )
-    # Compatibility point-cloud output used by the original MVP and simple PLY
-    # viewers that ignore custom scalar properties.
-    write_point_cloud(output_dir / "segmented_points.ply", geometry_points, colors=colors)
-    _write_class_point_clouds(output_dir, geometry_points, geometry_labels, colors)
-    if noise_mask is not None and np.any(noise_mask):
-        from .presentation import export_noise_free_presentation
-        metadata['noise_presentation'] = export_noise_free_presentation(
-            output_dir, geometry_points, triangles, colors=colors,
-            root_ids=geometry_labels, root_orders=root_orders,
-            assignment_states=assignment_states, excluded_mask=noise_mask,
-        )
     skeleton_overlay_layout = _write_skeleton_overlay(
         output_dir / "skeleton_original_overlay.ply",
         geometry_points,
@@ -139,11 +138,11 @@ def export_results(
     editable_paths = [
         replace(
             root,
-            points=normalization.inverse_points(root.points),
+            points=normalization.to_output_points(root.points),
             insertion_point=(
                 None
                 if root.insertion_point is None
-                else normalization.inverse_points(np.asarray(root.insertion_point)[None, :])[0]
+                else normalization.to_output_points(np.asarray(root.insertion_point)[None, :])[0]
             ),
         )
         for root in lateral_paths
@@ -162,6 +161,7 @@ def export_results(
         primary_confidence=primary_confidence,
         primary_qc_flags=primary_qc_flags,
         primary_centerline_assessment=next((row for row in metadata.get("final_centerline_fitting", {}).get("roots", []) if row.get("root_id") == "primary"), None),
+        coordinate_unit=normalization.coordinate_unit,
     )
     write_rsml(
         output_dir / "root_system.rsml",
@@ -176,6 +176,7 @@ def export_results(
             json.dump(_json_safe(metadata["joint_root_collar"]), handle,
                       indent=2, ensure_ascii=False, allow_nan=False)
     metadata["system_summary"] = traits.attrs.get("system_summary", {})
+    metadata["measurement_policy"] = traits.attrs.get("measurement_policy", {})
     metadata["root_label_map"] = tables["root_label_map.csv"].to_dict(orient="records")
     metadata["skeleton_original_overlay_layout"] = skeleton_overlay_layout
     if topology_report is not None:
@@ -187,6 +188,45 @@ def export_results(
     )
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(_json_safe(metadata), handle, indent=2, ensure_ascii=False, allow_nan=False)
+    finalize_bundle(output_dir)
+
+
+def write_measurement_tables(output_dir, traits, label_map, *, topology=None):
+    """One canonical table per subject, plus one consolidated Excel workbook."""
+    from .architecture_traits import eligible_mask
+    directory = Path(output_dir) / "tables"
+    directory.mkdir(parents=True, exist_ok=True)
+    for path in Path(output_dir).glob("*.csv"):
+        path.replace(directory / path.name)
+    keep = eligible_mask(traits)
+    # QC retains every topology identity; biological summaries use eligible roots.
+    inventory_columns = [c for c in traits if c in {"root_id", "parent_id", "root_order", "confidence", "point_count",
+        "qc_flags", "measurement_eligible", "measurement_exclusion_reason", "measurement_excluded", "centerline_fit_status"}
+        or c.endswith("_complete") or c.startswith("radius_")]
+    inventory = traits[inventory_columns].copy()
+    if topology is not None:
+        extra = [c for c in topology if c not in inventory or c == "root_id"]
+        inventory = inventory.merge(topology[extra], on="root_id", how="left", validate="one_to_one")
+    data = {"root_traits": traits.loc[keep].copy(), "root_inventory": inventory,
+            "root_label_map": label_map, "system_summary": trait_summary_frame(traits)}
+    for name in ("architecture_summary", "branch_positions", "branch_spacing", "diameter_distribution"):
+        columns = {"branch_positions": ["root_id", "parent_id", "root_order", "insertion_arc", "parent_eligible", "insertion_source", "length_unit"],
+                   "branch_spacing": ["scope", "parent_id", "proximal_root_id", "distal_root_id", "distance", "coincident", "length_unit"],
+                   "diameter_distribution": ["scope", "mean_diameter", "root_count", "cumulative_fraction", "length_unit"]}.get(name)
+        data[name] = pd.DataFrame(traits.attrs.get(name, []), columns=columns)
+    for name, table in data.items():
+        table.to_csv(directory / f"{name}.csv", index=False)
+    # Include existing centerline/nodule tables once, without repeated per-trait slices.
+    for path in directory.glob("*.csv"):
+        if path.stem not in data and path.stem != "trait_dictionary":
+            data[path.stem] = pd.read_csv(path)
+    from .trait_catalog import catalog_tables
+    data["trait_dictionary"] = catalog_tables(data)
+    data["trait_dictionary"].to_csv(directory / "trait_dictionary.csv", index=False)
+    with pd.ExcelWriter(directory / "traits.xlsx", engine="openpyxl") as writer:
+        for name, table in data.items():
+            table.to_excel(writer, sheet_name=name[:31], index=False)
+        _style_trait_workbook(writer.book)
 
 
 def write_rsml(
@@ -196,14 +236,15 @@ def write_rsml(
     traits: pd.DataFrame,
     metadata: dict,
 ) -> Path:
-    """Export a hierarchy-preserving RSML 1.x document in mesh units."""
+    """Export hierarchy and measurement quality in the recorded output unit."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rsml = ET.Element("rsml")
     metadata_element = ET.SubElement(rsml, "metadata")
     ET.SubElement(metadata_element, "version").text = "1"
-    ET.SubElement(metadata_element, "unit").text = "mesh_unit"
+    unit = metadata.get("coordinate_unit", "mesh_unit")
+    ET.SubElement(metadata_element, "unit").text = unit
     ET.SubElement(metadata_element, "resolution").text = "1"
     ET.SubElement(metadata_element, "last-modified").text = datetime.now(timezone.utc).isoformat()
     ET.SubElement(metadata_element, "software").text = "SoyRootBio"
@@ -213,15 +254,23 @@ def write_rsml(
     for name, value_type, unit in (
         ("root_order", "integer", "none"),
         ("confidence", "real", "none"),
-        ("length", "real", "mesh_unit"),
-        ("mean_diameter", "real", "mesh_unit"),
+        ("length", "real", unit),
+        ("mean_diameter", "real", unit),
         ("tortuosity", "real", "none"),
+        ("volume_frustum", "real", f"{unit}^3"),
+        ("mesh_volume", "real", f"{unit}^3"),
+        ("mesh_volume_reliable", "boolean", "none"),
+        ("measurement_eligible", "boolean", "none"),
         ("body_start_index", "integer", "none"),
-        ("exposed_body_length", "real", "mesh_unit"),
-        ("parent_connector_length", "real", "mesh_unit"),
-        ("preserved_topology_length", "real", "mesh_unit"),
-        ("topology_path_length", "real", "mesh_unit"),
+        ("exposed_body_length", "real", unit),
+        ("parent_connector_length", "real", unit),
+        ("preserved_topology_length", "real", unit),
+        ("topology_path_length", "real", unit),
         ("parent_connector_mode", "string", "none"),
+        ("length_estimate_complete", "boolean", "none"),
+        ("radius_profile_complete", "boolean", "none"),
+        ("radius_profile_method", "string", "none"),
+        ("qc_flags", "string", "none"),
     ):
         definition = ET.SubElement(property_definitions, "property-definition")
         ET.SubElement(definition, "label").text = name
@@ -265,6 +314,13 @@ def write_rsml(
     return path
 
 
+def _rsml_completeness(value, measurement) -> bool:
+    """Only an actual true boolean with an available metric certifies completeness."""
+    available = (isinstance(measurement, (int, float, np.number))
+                 and not isinstance(measurement, (bool, np.bool_)) and np.isfinite(measurement))
+    return isinstance(value, (bool, np.bool_)) and bool(value) and bool(available)
+
+
 def _rsml_root_element(
     parent: ET.Element,
     *,
@@ -284,15 +340,26 @@ def _rsml_root_element(
         "length": np.nan if trait is None else trait.get("length", np.nan),
         "mean_diameter": np.nan if trait is None else trait.get("mean_diameter", np.nan),
         "tortuosity": np.nan if trait is None else trait.get("tortuosity", np.nan),
+        "volume_frustum": np.nan if trait is None else trait.get("volume_frustum", np.nan),
+        "mesh_volume": np.nan if trait is None else trait.get("mesh_volume", np.nan),
+        "mesh_volume_reliable": False if trait is None else _rsml_completeness(trait.get("mesh_volume_reliable", False), trait.get("mesh_volume")),
+        "measurement_eligible": False if trait is None else bool(trait.get("measurement_eligible", False)),
         "body_start_index": body_start_index,
         "exposed_body_length": np.nan if trait is None else trait.get("exposed_body_length", np.nan),
         "parent_connector_length": np.nan if trait is None else trait.get("parent_connector_length", np.nan),
         "preserved_topology_length": np.nan if trait is None else trait.get("preserved_topology_length", np.nan),
         "topology_path_length": np.nan if trait is None else trait.get("topology_path_length", np.nan),
         "parent_connector_mode": "not_assessed" if trait is None else trait.get("parent_connector_mode", "not_assessed"),
+        "length_estimate_complete": False if trait is None else _rsml_completeness(trait.get("length_estimate_complete", False), trait.get("length")),
+        "radius_profile_complete": False if trait is None else _rsml_completeness(trait.get("radius_profile_complete", False), trait.get("mean_diameter")),
+        "radius_profile_method": "not_assessed" if trait is None else trait.get("radius_profile_method", "legacy_segment_distance"),
+        "qc_flags": "" if trait is None else trait.get("qc_flags", ""),
     }
     for name, value in values.items():
-        ET.SubElement(properties, name, {"value": str(value)})
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            ET.SubElement(properties, name, {"available": "false"})
+        else:
+            ET.SubElement(properties, name, {"value": str(value).lower() if isinstance(value, (bool, np.bool_)) else str(value)})
     geometry = ET.SubElement(root, "geometry")
     polyline = ET.SubElement(geometry, "polyline")
     for point in points:
@@ -397,6 +464,19 @@ def _trait_tables(
         )
     label_map = pd.DataFrame.from_records(label_rows)
     qc = traits[identity + ["confidence", "point_count", "qc_flags"]].copy()
+    radius_columns = [column for column in ("radius_profile_method", "radius_profile_complete", "body_coverage_complete",
+                       "diameter_statistics_method", "centerline_measurement_support_complete", "radius_global_fallback",
+                       "radius_admissible_support_count", "radius_outside_body_support_count", "radius_undersampled_station_count",
+                       "radius_sampling_spacing", "radius_sampling_spacing_unit") if column in traits]
+    for table in (volume, diameter, qc):
+        for column in radius_columns:
+            table[column] = traits[column]
+    for table in (length, qc):
+        if "length_estimate_complete" in traits:
+            table["length_estimate_complete"] = traits["length_estimate_complete"]
+    for table in (volume, qc):
+        if "volume_estimate_complete" in traits:
+            table["volume_estimate_complete"] = traits["volume_estimate_complete"]
     return {
         "system_summary.csv": trait_summary_frame(traits),
         "root_lengths.csv": length,
@@ -465,7 +545,7 @@ def _style_trait_workbook(workbook) -> None:
 def _lateral_skeleton_frame(paths: list[RootPath], normalization: Normalization) -> pd.DataFrame:
     rows = []
     for path in paths:
-        original = normalization.inverse_points(path.points)
+        original = normalization.to_output_points(path.points)
         for node_id, xyz in enumerate(original):
             rows.append(
                 {
@@ -476,7 +556,7 @@ def _lateral_skeleton_frame(paths: list[RootPath], normalization: Normalization)
                     "x": xyz[0],
                     "y": xyz[1],
                     "z": xyz[2],
-                    "coordinate_unit": "mesh_unit",
+                    "coordinate_unit": normalization.coordinate_unit,
                     "confidence": path.confidence,
                     "qc_flags": ";".join(path.qc_flags),
                     "centerline_region": (
@@ -511,6 +591,7 @@ def _write_skeleton_csv(
     path: Path,
     root_id: str,
     points: np.ndarray,
+    *, coordinate_unit: str = "mesh_unit",
 ) -> None:
     rows = [
         {
@@ -519,7 +600,7 @@ def _write_skeleton_csv(
             "x": p[0],
             "y": p[1],
             "z": p[2],
-            "coordinate_unit": "mesh_unit",
+            "coordinate_unit": coordinate_unit,
         }
         for i, p in enumerate(points)
     ]
@@ -558,13 +639,11 @@ def _label_properties(labels: np.ndarray, paths: list[RootPath]) -> tuple[np.nda
     return colors, orders, states
 
 
-def _write_class_point_clouds(output_dir: Path, points: np.ndarray, labels: np.ndarray, colors: np.ndarray) -> None:
+def write_root_point_clouds(output_dir: Path, points: np.ndarray, labels: np.ndarray, colors: np.ndarray) -> None:
+    """Retain the full-resolution assigned primary and all-order lateral clouds."""
     masks = {
         "primary_points.ply": labels == 0,
         "lateral_points.ply": labels > 0,
-        "unassigned_points.ply": labels == -1,
-        "uncertain_points.ply": labels == -2,
-        "nodule_points.ply": labels <= -3,
     }
     for filename, mask in masks.items():
         if np.any(mask):
@@ -591,7 +670,7 @@ def _write_skeleton_overlay(
     has_original_faces = triangles is not None and len(triangles) > 0
     if has_original_faces:
         faces.append(np.asarray(triangles, dtype=np.int32))
-    source_spacing = d_bar * float(normalization.scale)
+    source_spacing = d_bar * normalization.output_scale
     source_span = float(np.max(np.ptp(np.asarray(original_points, dtype=float), axis=0)))
     tube_radius = max(0.85 * source_spacing, 0.0006 * source_span, 1e-7)
     skeleton_points: list[np.ndarray] = []
@@ -601,7 +680,7 @@ def _write_skeleton_overlay(
     skeleton_states: list[np.ndarray] = []
     skeleton_faces: list[np.ndarray] = []
 
-    primary_original = normalization.inverse_points(resample_polyline(primary_path, skeleton_spacing))
+    primary_original = normalization.to_output_points(resample_polyline(primary_path, skeleton_spacing))
     primary_vertices, primary_faces = _polyline_tube_mesh(primary_original, tube_radius)
     if len(primary_vertices):
         skeleton_points.append(primary_vertices)
@@ -613,7 +692,7 @@ def _write_skeleton_overlay(
         skeleton_orders.append(np.zeros(len(primary_vertices), dtype=np.uint8))
         skeleton_states.append(np.ones(len(primary_vertices), dtype=np.uint8))
     for label, lateral in enumerate(lateral_paths, start=1):
-        lateral_original = normalization.inverse_points(resample_polyline(lateral.points, skeleton_spacing))
+        lateral_original = normalization.to_output_points(resample_polyline(lateral.points, skeleton_spacing))
         lateral_vertices, lateral_faces = _polyline_tube_mesh(lateral_original, tube_radius)
         if not len(lateral_vertices):
             continue
@@ -679,7 +758,7 @@ def _write_skeleton_overlay(
         "arrangement": "side_by_side_x",
         "original_structure_side": "left",
         "skeleton_side": "right",
-        "coordinate_unit": "mesh_unit",
+        "coordinate_unit": normalization.coordinate_unit,
         "original_translation": [0.0, 0.0, 0.0],
         "skeleton_translation": [float(skeleton_shift_x), 0.0, 0.0],
         "minimum_gap": float(comparison_gap),
@@ -697,7 +776,7 @@ def _write_skeleton_overlay(
             else "point_cloud_vertices"
         ),
         "note": (
-            "The original structure retains source coordinates; the skeleton "
+            "The original structure retains canonical output coordinates; the skeleton "
             "translation is visualization-only."
         ),
     }

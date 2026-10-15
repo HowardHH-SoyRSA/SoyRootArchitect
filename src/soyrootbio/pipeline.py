@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
 from collections import OrderedDict
 import hashlib
@@ -55,6 +55,7 @@ from .primary_guidance import (
     PRIMARY_GUIDANCE_FILENAME,
     PrimaryGuidance,
     write_primary_guidance,
+    read_primary_guidance,
 )
 from .geometry import (
     CHILD_PARENT_LENGTH_PENALTY_MAX,
@@ -103,6 +104,7 @@ from .nodules import detect_nodules, quantify_nodules, apply_nodule_review
 from .noise import filter_preloaded_cloud
 from .types import Normalization, PointCloudData, PrimaryCandidate, RootPath, TopologyReport
 from .runtime import worker_thread_limit, worker_threads
+from .units import UnitCalibration, resolve_unit_calibration
 from .visualize import save_angle_front_views, save_overview_plot
 
 
@@ -411,6 +413,12 @@ class PipelineConfig:
     nodule_review_file: Path | None = None
     surface_reference_file: Path | None = None
     noise_reduction: bool = True
+    mm_per_mesh_unit: float | None = None
+    unit_calibration: dict | None = None
+    guidance_coordinate_unit: str = "mesh_unit"
+    analysis_assignment_floor_mm: float | None = None
+    full_assignment_floor_mm: float | None = None
+    assignment_ambiguity_floor_mm: float | None = None
 
 
 @dataclass
@@ -558,15 +566,11 @@ def _run_pipeline_impl(
 
     cooperate()
     _report_progress(progress_callback, "Preparing analysis", 0.02)
-    # Snapshot external selection files once, then save and use exactly those
-    # same source-coordinate values even if the original files later move.
+    # Snapshot external selection files once; resolve their recorded space after loading.
     manual_guidance = _manual_primary_guidance(config)
     if manual_guidance is not None:
-        write_primary_guidance(
-            config.output_dir / PRIMARY_GUIDANCE_FILENAME,
-            manual_guidance,
-            input_path=config.input_path,
-        )
+        write_primary_guidance(config.output_dir / PRIMARY_GUIDANCE_FILENAME,
+                               manual_guidance, input_path=config.input_path)
     np.random.seed(config.random_seed)
     LOGGER.info("Loading input geometry: %s", config.input_path)
     if preloaded_cloud is None:
@@ -587,11 +591,23 @@ def _run_pipeline_impl(
             raise ValueError("Preloaded geometry input mode differs from the pipeline input mode")
         cloud.source_metadata.update(contract)
         LOGGER.info("Using %d points already loaded by the desktop GUI", len(cloud.points))
+    supplied_calibration = UnitCalibration(**config.unit_calibration) if config.unit_calibration else None
+    if supplied_calibration and supplied_calibration.source == "stl_header" and cloud.source_metadata.get("declared_mm_per_mesh_unit") is None:
+        raise ValueError("The source unit declaration changed after preflight; resolve the sample units again.")
+    calibration = resolve_unit_calibration(
+        config.input_path,
+        supplied_calibration.mm_per_mesh_unit if supplied_calibration else config.mm_per_mesh_unit,
+        source=supplied_calibration.source if supplied_calibration else "cli",
+        metadata=cloud.source_metadata,
+    )
+    cloud.source_metadata = {**cloud.source_metadata, "unit_calibration": calibration.to_dict(),
+                             "coordinate_unit": "mesh_unit", "original_coordinate_unit": "mesh_unit"}
     checkpoint("load_geometry", "Point cloud ready", 0.12)
     full_noise_mask = (np.zeros(len(cloud.export_points), dtype=bool)
                        if cloud.noise_mask is None else cloud.noise_mask)
     surface_reference = (
-        load_surface_reference(config.surface_reference_file, cloud.export_points, cloud.triangles)
+        load_surface_reference(config.surface_reference_file, cloud.export_points, cloud.triangles,
+                               mm_per_mesh_unit=calibration.mm_per_mesh_unit)
         if config.surface_reference_file is not None else None
     )
     if resource_callback is not None:
@@ -604,10 +620,19 @@ def _run_pipeline_impl(
     if len(cloud.points) < MIN_PIPELINE_POINTS:
         raise ValueError(f"Too few points for skeletonization: found {len(cloud.points)}, need at least {MIN_PIPELINE_POINTS}")
     normalized, base_normalization = normalize_unit_box(cloud.points)
-    # Geometry is normalized internally for numerical stability, then restored
-    # to the source mesh coordinate system for every reported trait.  Physical
-    # calibration is intentionally disabled until its contract is reinstated.
-    normalization = Normalization(base_normalization.minimum, base_normalization.scale)
+    # Raw normalization arithmetic stays identical; physical conversion is explicit at outputs.
+    normalization = Normalization(base_normalization.minimum, base_normalization.scale,
+                                  calibration.mm_per_mesh_unit)
+    assignment_floors = (
+        .006 if config.analysis_assignment_floor_mm is None else config.analysis_assignment_floor_mm / normalization.output_scale,
+        .008 if config.full_assignment_floor_mm is None else config.full_assignment_floor_mm / normalization.output_scale,
+        .001 if config.assignment_ambiguity_floor_mm is None else config.assignment_ambiguity_floor_mm / normalization.output_scale,
+    )
+    if manual_guidance is not None:
+        manual_guidance = manual_guidance.in_unit("mesh_unit", calibration.mm_per_mesh_unit)
+        write_primary_guidance(config.output_dir / PRIMARY_GUIDANCE_FILENAME,
+                               manual_guidance.in_unit("mm", calibration.mm_per_mesh_unit),
+                               input_path=config.input_path, unit_calibration=calibration.to_dict())
     # Analysis coordinates do not change during segmentation or tracing. Reuse
     # their spatial index while allowing every mask/path-dependent result to be
     # recomputed at its own semantic checkpoint.
@@ -729,7 +754,13 @@ def _run_pipeline_impl(
             excluded_mask=full_nonroot_mask, cooperate=cooperate,
         )
         if config.nodule_review_file is not None:
-            apply_nodule_review(nodules, config.nodule_review_file, cloud.export_points, full_nonroot_mask)
+            review_payload = json.loads(Path(config.nodule_review_file).read_text(encoding="utf-8"))
+            review_unit = review_payload.get("coordinate_unit", "mesh_unit")
+            if review_unit not in {"mm", "mesh_unit"}:
+                raise ValueError("Unsupported nodule review coordinate unit")
+            review_points = (normalization.source_to_output_points(cloud.export_points)
+                             if review_unit == "mm" else cloud.export_points)
+            apply_nodule_review(nodules, config.nodule_review_file, review_points, full_nonroot_mask)
         full_nonroot_mask = full_nonroot_mask | nodules.mask
         if cloud.analysis_indices is not None:
             analysis_nodules = nodules.mask[cloud.analysis_indices]
@@ -766,6 +797,7 @@ def _run_pipeline_impl(
         point_tree=analysis_tree,
         segment_index_cache=segment_index_cache,
         evidence_ledger=trace_evidence_ledger,
+        assignment_floors=assignment_floors,
         mesh_context=mesh_context,
         progress_callback=lambda label, fraction: _report_progress(
             progress_callback, label, 0.46 + 0.23 * fraction),
@@ -815,6 +847,7 @@ def _run_pipeline_impl(
             full_normalized, primary.points, selected, d_bar=d_bar,
             excluded_mask=full_nonroot_mask,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[1], ambiguity_floor=assignment_floors[2],
         )
         attachment_constraint_report["after_topology_repair"] = assess_attachment_footprints(
             full_normalized, topology_mesh_labels, primary.points, selected,
@@ -833,6 +866,7 @@ def _run_pipeline_impl(
         excluded_mask=analysis_nonroot_mask,
         return_competing_labels=True,
         segment_index_cache=segment_index_cache,
+        assignment_floor=assignment_floors[0], ambiguity_floor=assignment_floors[2],
     )
     analysis_root_labels = _analysis_root_labels(
         segmented_primary_mask,
@@ -844,8 +878,8 @@ def _run_pipeline_impl(
         primary.points,
         selected,
         d_bar=d_bar,
-        assignment_radius=max(4.0 * d_bar, 0.006),
-        ambiguity_margin=max(0.75 * d_bar, 0.001),
+        assignment_radius=max(4.0 * d_bar, assignment_floors[0]),
+        ambiguity_margin=max(0.75 * d_bar, assignment_floors[2]),
         competing_labels=analysis_competing_labels,
     )
     # The lateral-label representation reserves zero for "not lateral", so
@@ -866,6 +900,7 @@ def _run_pipeline_impl(
         excluded_mask=full_nonroot_mask,
         return_competing_labels=True,
         segment_index_cache=segment_index_cache,
+        assignment_floor=assignment_floors[1], ambiguity_floor=assignment_floors[2],
     )
     selected, fork_recovery_report = recover_unassigned_fork_arms(
         full_normalized, full_root_labels, primary.points, selected,
@@ -880,12 +915,14 @@ def _run_pipeline_impl(
             normalized, selected, segmented_primary_mask, d_bar,
             excluded_mask=analysis_nonroot_mask, return_competing_labels=True,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[0], ambiguity_floor=assignment_floors[2],
         )
         analysis_root_labels = _analysis_root_labels(segmented_primary_mask, lateral_labels)
         full_root_labels, full_competing_labels = _assign_full_root_labels(
             full_normalized, primary.points, selected, d_bar=d_bar,
             excluded_mask=full_nonroot_mask, return_competing_labels=True,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[1], ambiguity_floor=assignment_floors[2],
         )
     (
         internal_o1_contact_changed_ids,
@@ -925,6 +962,7 @@ def _run_pipeline_impl(
             excluded_mask=analysis_nonroot_mask,
             return_competing_labels=True,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[0], ambiguity_floor=assignment_floors[2],
         )
         analysis_root_labels = _analysis_root_labels(
             segmented_primary_mask,
@@ -939,8 +977,8 @@ def _run_pipeline_impl(
             primary.points,
             selected,
             d_bar=d_bar,
-            assignment_radius=max(4.0 * d_bar, 0.006),
-            ambiguity_margin=max(0.75 * d_bar, 0.001),
+            assignment_radius=max(4.0 * d_bar, assignment_floors[0]),
+            ambiguity_margin=max(0.75 * d_bar, assignment_floors[2]),
             competing_labels=analysis_competing_labels,
         )
         primary_mask = analysis_root_labels == 0
@@ -957,6 +995,7 @@ def _run_pipeline_impl(
             excluded_mask=full_nonroot_mask,
             return_competing_labels=True,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[1], ambiguity_floor=assignment_floors[2],
         )
     analysis_to_full: np.ndarray | None = None
     if cloud.analysis_indices is not None and len(cloud.analysis_indices) == len(normalized):
@@ -974,8 +1013,8 @@ def _run_pipeline_impl(
         primary.points,
         selected,
         d_bar=d_bar,
-        assignment_radius=max(5.0 * d_bar, 0.008),
-        ambiguity_margin=max(0.75 * d_bar, 0.001),
+        assignment_radius=max(5.0 * d_bar, assignment_floors[1]),
+        ambiguity_margin=max(0.75 * d_bar, assignment_floors[2]),
         competing_labels=full_competing_labels,
     )
     # Earlier committed topology swaps/joins also postdate lateral tracing;
@@ -1368,12 +1407,17 @@ def _run_pipeline_impl(
     checkpoint("final_centerline_fitting", "Computing root traits", 0.84)
     if nodules is not None:
         quantify_nodules(
-            nodules, cloud.export_points, cloud.triangles, full_root_labels,
-            {0: {"root_id": "primary", "order": 0, "points": normalization.inverse_points(primary.points)},
-             **{i: {"root_id": root.root_id, "order": root.order, "points": normalization.inverse_points(root.points)}
+            nodules, normalization.source_to_output_points(cloud.export_points), cloud.triangles, full_root_labels,
+            {0: {"root_id": "primary", "order": 0, "points": normalization.to_mm_points(primary.points)},
+             **{i: {"root_id": root.root_id, "order": root.order, "points": normalization.to_mm_points(root.points)}
                 for i, root in enumerate(selected, 1)}},
-            normalization.inverse_points(primary_top_reference[None, :])[0], config.gravity,
+            normalization.to_mm_points(primary_top_reference[None, :])[0], config.gravity,
+            coordinate_unit="mm",
         )
+        nodules.evidence["detection_coordinate_unit"] = "mesh_unit"
+        nodules.evidence["mm_per_mesh_unit"] = calibration.mm_per_mesh_unit
+        for obj in nodules.objects:
+            obj["evidence"]["coordinate_unit"] = "mesh_unit"
     measurement_metadata = cloud.source_metadata
     traits = compute_traits(
         primary.points,
@@ -1390,6 +1434,7 @@ def _run_pipeline_impl(
         mesh_metadata=measurement_metadata,
         noise_mask=full_noise_mask,
         primary_confidence=primary.confidence,
+        primary_top_reference=primary_top_reference,
         primary_qc_flags=primary.qc_flags,
         primary_centerline_assessment=final_centerline_report["roots"][0],
         tip_vector_window=config.tip_vector_window_mesh_units,
@@ -1431,14 +1476,18 @@ def _run_pipeline_impl(
     if nodules is not None:
         display_labels = lateral_labels.copy()
         display_labels[analysis_nodules] = -2  # display-only sentinel, separate from root labels
-    save_overview_plot(config.output_dir / "overview.png", normalized, primary_mask, display_labels, primary.points, selected)
+    figure_points = normalization.to_mm_points(normalized)
+    figure_primary = normalization.to_mm_points(primary.points)
+    figure_laterals = [replace(root, points=normalization.to_mm_points(root.points)) for root in selected]
+    save_overview_plot(config.output_dir / "overview.png", figure_points, primary_mask, display_labels,
+                       figure_primary, figure_laterals, coordinate_unit="mm")
     save_angle_front_views(
         config.output_dir,
-        normalized,
+        figure_points,
         primary_mask,
         display_labels,
-        primary.points,
-        selected,
+        figure_primary,
+        figure_laterals,
         traits,
         gravity=np.asarray(config.gravity, dtype=float),
     )
@@ -1454,13 +1503,20 @@ def _run_pipeline_impl(
         "point_count": len(normalized),
         "full_resolution_point_count": len(cloud.export_points),
         "d_bar_normalized": d_bar,
+        "d_bar_mm": normalization.to_mm_length(d_bar),
         "normalization_minimum": normalization.minimum,
         "normalization_scale": normalization.scale,
-        "coordinate_unit": "mesh_unit",
-        "output_length_unit": "mesh_unit",
-        "output_area_unit": "mesh_unit^2",
-        "output_volume_unit": "mesh_unit^3",
-        "physical_unit_conversion_applied": False,
+        "normalization_coordinate_unit": "mesh_unit",
+        "normalization_minimum_mm": normalization.source_to_output_points(normalization.minimum),
+        "normalization_scale_mm": normalization.output_scale,
+        "coordinate_unit": "mm",
+        "output_length_unit": "mm",
+        "output_area_unit": "mm^2",
+        "output_volume_unit": "mm^3",
+        "physical_unit_conversion_applied": True,
+        "unit_calibration": calibration.to_dict(),
+        "evidence_coordinate_unit": "analysis_normalized",
+        "primary_top_reference_mm": normalization.to_mm_points(primary_top_reference[None, :])[0],
         "gravity_vector": list(config.gravity),
         "source_geometry": cloud.source_metadata,
         "noise_reduction": noise_reduction_report,
@@ -1597,7 +1653,7 @@ def _run_pipeline_impl(
         "point_assignment": _point_assignment_summary(
             full_root_labels,
             full_above_base_mask,
-            base_point_source=normalization.inverse_points(selected_base[None, :])[0],
+            base_point_source=normalization.to_mm_points(selected_base[None, :])[0],
             base_tipward_direction=base_tipward_direction,
             gravity=np.asarray(config.gravity, dtype=float),
             collar_neighborhood_radius=base_collar_neighborhood_radius,
@@ -1608,11 +1664,35 @@ def _run_pipeline_impl(
             full_junction_report=full_junction_report,
             surface_patch_report=surface_patch_report,
             final_surface_cleanup_report=final_surface_cleanup_report,
+            assignment_floors=assignment_floors,
+            output_scale=normalization.output_scale,
         ),
         "primary_candidates": [_candidate_metadata(candidate, normalization) for candidate in primary_candidates],
         "topology_report": topology_report.__dict__,
         "stage_timings_seconds": timings,
     }
+    # Technical evidence remains in its original numerical space and is locally
+    # labelled. Canonical phenotype/geometry tables above are always millimeters.
+    for name in ("lateral_origin_constraint", "internal_o1_contact_decisions", "unassigned_fork_recovery",
+                 "recovered_descendants", "primary_surface_track_reconciliation", "final_centerline_fitting",
+                 "branch_facing_transection_trimming", "parent_owned_tube_reconciliation", "final_surface_cleanup",
+                 "joint_root_collar", "parent_contact_reconciliation", "attachment_constraint",
+                 "higher_order_primary_contact", "final_surface_patch_audit", "topology_report"):
+        report = metadata.get(name)
+        if isinstance(report, dict):
+            report["unit_context"] = {"coordinate_unit": "analysis_normalized", "length_unit": "analysis_normalized",
+                                      "area_unit": "analysis_normalized^2", "normalized_length_in_mm": normalization.output_scale}
+    metadata["config"]["tip_vector_window_mm"] = config.tip_vector_window_mesh_units
+    metadata["config"].pop("tip_vector_window_mesh_units", None)
+    metadata["source_geometry"]["unit_context"] = {"coordinate_unit": "mesh_unit", "mm_per_mesh_unit": calibration.mm_per_mesh_unit}
+    for raw_name, physical_name, power in (("surface_area_source_units2", "surface_area_mm2", 2),
+                                            ("signed_volume_source_units3", "signed_volume_mm3", 3),
+                                            ("absolute_volume_source_units3", "absolute_volume_mm3", 3)):
+        if metadata["source_geometry"].get(raw_name) is not None:
+            metadata["source_geometry"][physical_name] = metadata["source_geometry"][raw_name] * calibration.mm_per_mesh_unit**power
+    metadata["noise_reduction"]["unit_context"] = metadata["source_geometry"]["unit_context"]
+    metadata["original_input_geometry"] = {"file": "original_input_geometry.npz", "coordinate_unit": "mesh_unit",
+                                           "array_policy": "decoded_source_order_duplicates_and_faces_preserved"}
     if config.correction_file is not None:
         correction_payload = json.loads(Path(config.correction_file).read_text(encoding="utf-8"))
         correction_rows = correction_payload.get("roots", [])
@@ -1658,7 +1738,7 @@ def _run_pipeline_impl(
     )
     checkpoint("export", "Finalizing metadata", 0.98)
     timings["total"] = float(time.perf_counter() - pipeline_started)
-    _update_metadata_timings(config.output_dir / "metadata.json", timings)
+    _update_metadata_timings(config.output_dir / "support" / "metadata.json", timings)
     cooperate()
     _report_progress(progress_callback, "Analysis complete", 1.0)
     return PipelineResult(
@@ -1727,6 +1807,7 @@ def _trace_lateral_orders(
     evidence_ledger: ProvisionalTraceEvidenceLedger | None = None,
     mesh_context: MeshGeometryContext | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
+    assignment_floors: tuple[float, float, float] = (.006, .008, .001),
 ) -> tuple[list[RootPath], int, int, dict[int, int]]:
     """Trace lateral roots iteratively from parent skeletons.
 
@@ -2152,6 +2233,7 @@ def _trace_lateral_orders(
             d_bar,
             excluded_mask=excluded,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[0], ambiguity_floor=assignment_floors[2],
             return_competing_labels=True,
         )
         if evidence_ledger is not None:
@@ -2247,6 +2329,7 @@ def _trace_lateral_orders(
             d_bar,
             excluded_mask=excluded,
             segment_index_cache=segment_index_cache,
+            assignment_floor=assignment_floors[0], ambiguity_floor=assignment_floors[2],
             return_competing_labels=True,
         )
         released_interfaces: dict[int, tuple[int, ...]] = {}
@@ -2260,6 +2343,7 @@ def _trace_lateral_orders(
                 mesh_points, primary_path, selected_all, d_bar=d_bar,
                 excluded_mask=mesh_excluded_mask,
                 segment_index_cache=segment_index_cache,
+                assignment_floor=assignment_floors[1], ambiguity_floor=assignment_floors[2],
             )
             assessment = assess_attachment_footprints(
                 mesh_points, frozen_mesh_labels, primary_path, selected_all,
@@ -2636,6 +2720,12 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("Both --start and --end must be provided together.")
     if config.worker_threads is not None and int(config.worker_threads) < 1:
         raise ValueError("worker_threads must be a positive integer when provided")
+    if config.guidance_coordinate_unit not in {"mesh_unit", "mm"}:
+        raise ValueError("guidance_coordinate_unit must be mesh_unit or mm")
+    for name in ("analysis_assignment_floor_mm", "full_assignment_floor_mm", "assignment_ambiguity_floor_mm"):
+        value = getattr(config, name)
+        if value is not None and (not np.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be a positive finite number")
     attachment_values = (
         config.attachment_area_multiplier, config.attachment_angle_factor_cap,
         config.attachment_longitudinal_radii,
@@ -2650,13 +2740,31 @@ def _validate_config(config: PipelineConfig) -> None:
 
 
 def _manual_primary_guidance(config: PipelineConfig) -> PrimaryGuidance | None:
+    selected_unit = config.guidance_coordinate_unit
     if config.endpoint_file is not None:
+        if Path(config.endpoint_file).suffix.lower() == ".json":
+            payload = json.loads(Path(config.endpoint_file).read_text(encoding="utf-8-sig"))
+            if isinstance(payload, dict):
+                selected_unit = payload.get("coordinate_unit", selected_unit)
+                if selected_unit not in {"mm", "mesh_unit"}:
+                    raise ValueError("Unsupported endpoint coordinate unit")
+            if isinstance(payload, dict) and payload.get("schema") == "soyrootbio.primary-guidance":
+                guidance = read_primary_guidance(config.endpoint_file, expected_input=config.input_path)
+                if not guidance.use_endpoints:
+                    raise ValueError("This selection needs primary endpoints before reuse")
+                if config.guide_file is None or Path(config.guide_file) == Path(config.endpoint_file):
+                    return guidance
         start, end = read_endpoint_file(config.endpoint_file)
     elif config.start is not None and config.end is not None:
         start, end = np.asarray(config.start, dtype=float), np.asarray(config.end, dtype=float)
     else:
         return None
-    return PrimaryGuidance(start, end, config.soil_z, _read_primary_guides(config))
+    soil_z = config.soil_z
+    if soil_z is not None and selected_unit != config.guidance_coordinate_unit:
+        scale = _guidance_scale(config)
+        soil_z *= scale if selected_unit == "mm" else 1./scale
+    return PrimaryGuidance(start, end, soil_z, _read_primary_guides(config, target_unit=selected_unit),
+                           coordinate_unit=selected_unit)
 
 
 def _resolve_primary_path(
@@ -2673,9 +2781,10 @@ def _resolve_primary_path(
     gravity /= np.linalg.norm(gravity)
     guidance = manual_guidance if manual_guidance is not None else _manual_primary_guidance(config)
     guides = guidance.guides if guidance is not None else _read_primary_guides(config)
-    normalized_guides = (
-        normalization.transform_points(guides) if len(guides) else np.empty((0, 3), dtype=float)
-    )
+    normalized_guides = ((normalization.from_mm_points(guides)
+                          if guidance is None and config.guidance_coordinate_unit == "mm"
+                          else normalization.transform_points(guides))
+                         if len(guides) else np.empty((0, 3), dtype=float))
     candidates: list[PrimaryCandidate] = []
     if guidance is not None:
         start, end = _validate_and_transform_endpoints(guidance.start, guidance.end, normalization)
@@ -2761,22 +2870,39 @@ def _resolve_primary_path(
     return path, candidates
 
 
-def _read_primary_guides(config: PipelineConfig) -> np.ndarray:
-    rows = [np.asarray(row, dtype=float) for row in config.primary_guides]
+def _guidance_scale(config: PipelineConfig) -> float:
+    supplied = UnitCalibration(**config.unit_calibration) if config.unit_calibration else None
+    return resolve_unit_calibration(config.input_path,
+        supplied.mm_per_mesh_unit if supplied else config.mm_per_mesh_unit,
+        source=supplied.source if supplied else "cli").mm_per_mesh_unit
+
+
+def _read_primary_guides(config: PipelineConfig, *, target_unit: str | None = None) -> np.ndarray:
+    target_unit = config.guidance_coordinate_unit if target_unit is None else target_unit
+    def converted(values, unit):
+        if unit not in {"mm", "mesh_unit"}:
+            raise ValueError("Unsupported primary guide coordinate unit")
+        values = np.asarray(values, dtype=float)
+        if unit != target_unit and len(values):
+            scale = _guidance_scale(config)
+            values = values * (scale if target_unit == "mm" else 1./scale)
+        return values
+    rows = list(converted(config.primary_guides, config.guidance_coordinate_unit))
     if config.guide_file is not None:
         path = Path(config.guide_file)
         if not path.exists():
             raise FileNotFoundError(f"Primary guide file does not exist: {path}")
         if path.suffix.lower() == ".json":
             payload = json.loads(path.read_text(encoding="utf-8"))
+            file_unit = payload.get("coordinate_unit", "mesh_unit") if isinstance(payload, dict) else config.guidance_coordinate_unit
             payload = payload.get("guides", payload) if isinstance(payload, dict) else payload
-            rows.extend(np.asarray(payload, dtype=float))
+            rows.extend(converted(payload, file_unit))
         elif path.suffix.lower() == ".csv":
             frame = pd.read_csv(path)
             lower = {column.lower(): column for column in frame.columns}
             if not {"x", "y", "z"}.issubset(lower):
                 raise ValueError("Guide CSV must contain x, y, z columns")
-            rows.extend(frame[[lower["x"], lower["y"], lower["z"]]].to_numpy(float))
+            rows.extend(converted(frame[[lower["x"], lower["y"], lower["z"]]].to_numpy(float), config.guidance_coordinate_unit))
         else:
             values = []
             for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -2788,7 +2914,7 @@ def _read_primary_guides(config: PipelineConfig) -> np.ndarray:
                         continue
                 if len(numbers) >= 3:
                     values.append(numbers[:3])
-            rows.extend(values)
+            rows.extend(converted(values, config.guidance_coordinate_unit))
     if not rows:
         return np.empty((0, 3), dtype=float)
     guides = np.asarray(rows, dtype=float)
@@ -2819,8 +2945,9 @@ def _candidate_metadata(candidate: PrimaryCandidate, normalization: Normalizatio
         "rank": candidate.rank,
         "score": candidate.score,
         "confidence": candidate.confidence,
-        "start": normalization.inverse_points(candidate.start[None, :])[0],
-        "end": normalization.inverse_points(candidate.end[None, :])[0],
+        "start": normalization.to_output_points(candidate.start[None, :])[0],
+        "end": normalization.to_output_points(candidate.end[None, :])[0],
+        "coordinate_unit": normalization.coordinate_unit,
         "components": candidate.components,
         "qc_flags": candidate.qc_flags,
     }
@@ -2985,6 +3112,8 @@ def _assign_lateral_points(
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
     segment_index_cache: _ExposedSegmentIndexCache | None = None,
+    assignment_floor: float = .006,
+    ambiguity_floor: float = .001,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     labels = np.zeros(len(points), dtype=int)
     if not paths:
@@ -3002,10 +3131,10 @@ def _assign_lateral_points(
     exposed = [(idx, body) for idx, body, _ in exposed_with_starts]
     if not exposed:
         return (labels, {}) if return_competing_labels else labels
-    radius = max(4.0 * d_bar, 0.006)
+    radius = max(4.0 * d_bar, assignment_floor)
     nearest_distance, nearest_labels, competing_distance, second_labels = _nearest_exposed_segments(
         points[non_primary], exposed, d_bar=d_bar, radius=radius,
-        margin=max(0.75 * d_bar, 0.001),
+        margin=max(0.75 * d_bar, ambiguity_floor),
         segment_index_cache=segment_index_cache,
         body_start_indices=[start for _, _, start in exposed_with_starts],
     )
@@ -3016,7 +3145,7 @@ def _assign_lateral_points(
     has_competitor = second_labels >= 0
     competitor_gap[has_competitor] = (competing_distance[has_competitor]
                                       - nearest_distance[has_competitor])
-    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, 0.001))
+    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, ambiguity_floor))
     ambiguous_indices = non_primary[ambiguous]
     labels[ambiguous_indices] = -1
     if return_competing_labels:
@@ -3626,6 +3755,8 @@ def _point_assignment_summary(
     full_junction_report: dict,
     surface_patch_report: dict,
     final_surface_cleanup_report: dict,
+    assignment_floors: tuple[float, float, float] = (.006, .008, .001),
+    output_scale: float | None = None,
 ) -> dict:
     labels = np.asarray(labels, dtype=int)
     above_base = _coerce_exclusion_mask(above_base_mask, len(labels))
@@ -3647,9 +3778,15 @@ def _point_assignment_summary(
         "base_collar_neighborhood_radius_normalized": float(collar_neighborhood_radius),
         "above_base_tolerance_normalized": float(base_tolerance),
         "rule": "inside the collar neighbourhood, points collarward of the local primary cross-section remain unassigned; outside it, points above the selected base along gravity remain unassigned",
-        "analysis_lateral_assignment_radius_normalized": max(4.0 * float(d_bar), 0.006),
-        "full_resolution_assignment_radius_normalized": max(5.0 * float(d_bar), 0.008),
-        "ambiguity_margin_normalized": max(0.75 * float(d_bar), 0.001),
+        "base_point_coordinate_unit": "mm" if output_scale is not None else "mesh_unit",
+        "analysis_lateral_assignment_radius_normalized": max(4.0 * float(d_bar), assignment_floors[0]),
+        "full_resolution_assignment_radius_normalized": max(5.0 * float(d_bar), assignment_floors[1]),
+        "ambiguity_margin_normalized": max(0.75 * float(d_bar), assignment_floors[2]),
+        **({"analysis_lateral_assignment_radius_mm": max(4.0 * float(d_bar), assignment_floors[0]) * output_scale,
+            "full_resolution_assignment_radius_mm": max(5.0 * float(d_bar), assignment_floors[1]) * output_scale,
+            "ambiguity_margin_mm": max(.75 * float(d_bar), assignment_floors[2]) * output_scale,
+            "assignment_floor_policy": "explicit_physical_override_or_preserved_normalized_default"}
+           if output_scale is not None else {}),
         "assigned_vertex_count": int(np.count_nonzero(assigned)),
         "uncertain_vertex_count": int(np.count_nonzero(uncertain)),
         "unassigned_vertex_count": int(np.count_nonzero(unassigned)),
@@ -3928,6 +4065,8 @@ def _assign_full_root_labels(
     excluded_mask: np.ndarray | None = None,
     return_competing_labels: bool = False,
     segment_index_cache: _ExposedSegmentIndexCache | None = None,
+    assignment_floor: float = .008,
+    ambiguity_floor: float = .001,
 ) -> np.ndarray | tuple[np.ndarray, dict[int, tuple[int, int]]]:
     exposed_with_starts = [(0, np.asarray(primary_path, dtype=float), 0)]
     for label, path in enumerate(lateral_paths, start=1):
@@ -3938,10 +4077,10 @@ def _assign_full_root_labels(
     exposed_with_starts = [row for row in exposed_with_starts if len(row[1])]
     exposed = [(label, body) for label, body, _ in exposed_with_starts]
     labels = np.full(len(points), -1, dtype=int)
-    radius = max(5.0 * d_bar, 0.008)
+    radius = max(5.0 * d_bar, assignment_floor)
     nearest_distance, nearest, competitor_distance, second = _nearest_exposed_segments(
         points, exposed, d_bar=d_bar, radius=radius,
-        margin=max(0.75 * d_bar, 0.001),
+        margin=max(0.75 * d_bar, ambiguity_floor),
         segment_index_cache=segment_index_cache,
         body_start_indices=[start for _, _, start in exposed_with_starts],
     )
@@ -3953,7 +4092,7 @@ def _assign_full_root_labels(
     has_competitor = second >= 0
     competitor_gap[has_competitor] = (competitor_distance[has_competitor]
                                       - nearest_distance[has_competitor])
-    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, 0.001))
+    ambiguous = assigned & (competitor_gap <= max(0.75 * d_bar, ambiguity_floor))
     labels[ambiguous] = -2
     if return_competing_labels:
         ambiguous_indices = np.flatnonzero(ambiguous)

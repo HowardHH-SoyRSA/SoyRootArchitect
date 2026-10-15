@@ -114,7 +114,6 @@ export function RootViewport({
   const setHovered = useEditorStore((store) => store.setHovered);
   const setLoadProgress = useEditorStore((store) => store.setLoadProgress);
   const setMeshReady = useEditorStore((store) => store.setMeshReady);
-  const setClientGpu = useEditorStore((store) => store.setClientGpu);
   const meshReady = useEditorStore((store) => store.meshReady);
 
   const meshUrl = apiUrl(apiBase, state.mesh.url);
@@ -155,11 +154,7 @@ export function RootViewport({
     container.appendChild(renderer.domElement);
 
     const gl = renderer.getContext();
-    const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
-    const clientGpu = debugInfo
-      ? String(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL))
-      : String(gl.getParameter(gl.RENDERER));
-    setClientGpu(clientGpu);
+
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x07110f);
@@ -554,7 +549,7 @@ export function RootViewport({
       setHovered(null);
       setMeshReady(false);
     };
-  }, [setClientGpu, setHovered, setMeshReady]);
+  }, [setHovered, setMeshReady]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;

@@ -768,16 +768,13 @@ def write_labeled_ply(
 
 
 def _source_header_metadata(path: Path) -> dict:
-    if path.suffix.lower() != ".stl":
-        return {"declared_coordinate_unit": None}
+    from .units import source_unit_metadata
     try:
-        with path.open("rb") as handle:
-            header = handle.read(80).decode("ascii", errors="ignore").strip("\x00 ")
+        return source_unit_metadata(path)
     except OSError:
-        return {"declared_coordinate_unit": None}
-    lowered = header.lower()
-    unit = "mm" if "unit:millimeter" in lowered or "unit: millimeter" in lowered else None
-    return {"stl_header": header, "declared_coordinate_unit": unit}
+        # Array-based/preloaded readers may carry a provenance-only path.
+        return {"declared_coordinate_unit": None, "declared_mm_per_mesh_unit": None,
+                "unit_declaration_status": "unavailable", "raw_unit_declaration": None}
 
 
 def _read_triangle_mesh(o3d, path: Path):

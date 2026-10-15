@@ -153,11 +153,10 @@ def test_batch_gui_source_exposes_required_controls():
         "Load endpoints + guides",
         "Total run time",
         "Scored automatic",
-        "Manual soil line + scorer",
         "Interactive endpoints + sections",
         "Analysis vertex cap",
         "Display points",
-        "Angle vector window (mesh units)",
+        "Angle vector window (mm)",
         "Concurrent samples",
         "Threads / sample",
         "Start batch",
@@ -253,7 +252,7 @@ def test_progress_eta_helpers_and_pipeline_hooks(tmp_path: Path):
     signature = inspect.signature(run_pipeline)
     assert {"preloaded_cloud", "progress_callback", "cancel_check", "pause_check"}.issubset(signature.parameters)
 
-    config = PipelineConfig(tmp_path / "missing.ply", tmp_path / "out", auto_endpoints="z")
+    config = PipelineConfig(tmp_path / "missing.ply", tmp_path / "out", auto_endpoints="z", mm_per_mesh_unit=1.0)
     with pytest.raises(AnalysisCancelled):
         run_pipeline(config, cancel_check=lambda: True)
 

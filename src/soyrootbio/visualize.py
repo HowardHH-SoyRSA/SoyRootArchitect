@@ -41,6 +41,7 @@ def save_overview_plot(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
     max_points: int = 25000,
+    *, coordinate_unit: str = "analysis_normalized",
 ) -> None:
     with _MATPLOTLIB_LOCK:
         _prepare_matplotlib()
@@ -52,6 +53,7 @@ def save_overview_plot(
             primary_path,
             lateral_paths,
             max_points=max_points,
+            coordinate_unit=coordinate_unit,
         )
 
 
@@ -63,6 +65,7 @@ def _save_overview_plot(
     primary_path: np.ndarray,
     lateral_paths: list[RootPath],
     max_points: int = 25000,
+    *, coordinate_unit: str = "analysis_normalized",
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,9 +102,9 @@ def _save_overview_plot(
     for lateral_path in lateral_paths:
         p = lateral_path.points
         ax.plot(p[:, 0], p[:, 1], p[:, 2], color=order_color(lateral_path.order), linewidth=1.25)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
+    ax.set_xlabel(f"x ({coordinate_unit})")
+    ax.set_ylabel(f"y ({coordinate_unit})")
+    ax.set_zlabel(f"z ({coordinate_unit})")
     ax.set_box_aspect(np.ptp(points, axis=0))
     fig.tight_layout()
     fig.savefig(path, dpi=220)
@@ -392,8 +395,9 @@ def _save_one_angle_front_view(
             framealpha=0.92,
         )
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("z")
+    coordinate_unit = str(traits["coordinate_unit"].iloc[0]) if hasattr(traits, "columns") and "coordinate_unit" in traits and len(traits) else "analysis_normalized"
+    ax.set_xlabel(f"x ({coordinate_unit})")
+    ax.set_ylabel(f"z ({coordinate_unit})")
     ax.set_title(f"Front view: {title}")
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(x_min - x_padding, x_max + x_padding)

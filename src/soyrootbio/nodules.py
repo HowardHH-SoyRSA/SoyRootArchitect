@@ -40,7 +40,7 @@ class NoduleResult:
     def public(self):
         return {"schema": NODULE_SCHEMA, "enabled": True, "status": self.status,
                 "classification": "nodule_like_morphology", "color_rgb": list(NODULE_RGB),
-                "coordinate_unit": "mesh_unit", "method": "native-ray-chord-compactness-neck-v1",
+                "coordinate_unit": self.evidence.get("measurement_coordinate_unit", "mesh_unit"), "method": "native-ray-chord-compactness-neck-v1",
                 "accepted_count": sum(o["status"] == "accepted" for o in self.objects),
                 "candidate_count": sum(o["status"] == "candidate" for o in self.objects),
                 "objects": self.objects, "evidence": self.evidence}
@@ -297,7 +297,7 @@ def _patch_volume(points, faces, member):
     return abs(float(volume6)) / 6, "estimated_planar_neck_cap_on_observed_faces"
 
 
-def quantify_nodules(result, points, triangles, root_labels, roots, primary_top, gravity=(0, 0, -1)):
+def quantify_nodules(result, points, triangles, root_labels, roots, primary_top, gravity=(0, 0, -1), *, coordinate_unit="mesh_unit"):
     """Measure observed patches; attachment caps are explicit volume estimates."""
     p, f = np.asarray(points, float), np.asarray(triangles if triangles is not None else [], int).reshape(-1, 3)
     gravity = np.asarray(gravity, float)
@@ -308,6 +308,7 @@ def quantify_nodules(result, points, triangles, root_labels, roots, primary_top,
         r["root_id"]: float(r["length"]) for r in roots.values()
         if r.get("length") is not None and np.isfinite(r["length"]) and r["length"] > 0
     }
+    result.evidence["measurement_coordinate_unit"] = coordinate_unit
     for obj in result.objects:
         v = np.asarray(obj["vertex_indices"], int)
         q = p[v]
@@ -348,7 +349,7 @@ def quantify_nodules(result, points, triangles, root_labels, roots, primary_top,
                     "surface_area_method": "partitioned_native_mesh_triangles",
                     "volume": volume, "volume_method": volume_method,
                     "equivalent_sphere_diameter": (6 * volume / np.pi)**(1/3) if volume is not None else None,
-                    "length_unit": "mesh_unit", "area_unit": "mesh_unit^2", "volume_unit": "mesh_unit^3",
+                    "length_unit": coordinate_unit, "area_unit": f"{coordinate_unit}^2", "volume_unit": f"{coordinate_unit}^3",
                     "supporting_root_id": supporting["root_id"] if supporting else None,
                     "supporting_root_order": supporting["order"] if supporting else None,
                     "attachment_point": attachment, "distance_along_supporting_root": arc,
@@ -361,6 +362,7 @@ def quantify_nodules(result, points, triangles, root_labels, roots, primary_top,
 def export_nodules(directory, result):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    unit = result.evidence.get("measurement_coordinate_unit", "mesh_unit")
     (directory / "nodules.json").write_text(json.dumps(result.public(), indent=2, allow_nan=False), encoding="utf-8")
     rows = []
     for o in result.objects:
@@ -379,6 +381,7 @@ def export_nodules(directory, result):
                              "measured_root_length": measured_length,
                              "total_observed_nodule_surface_area": float(accepted.surface_area.sum()) if len(accepted) else 0,
                              "volume_available_count": int(accepted.volume.notna().sum()) if len(accepted) else 0}])
+    summary["length_unit"], summary["area_unit"], summary["volume_unit"], summary["density_unit"] = unit, f"{unit}^2", f"{unit}^3", f"{unit}^-1"
     summary.to_csv(directory / "nodule_summary.csv", index=False)
     depth = pd.DataFrame(columns=["depth_start", "depth_end", "nodule_count", "surface_area"])
     if len(accepted):
@@ -386,6 +389,7 @@ def export_nodules(directory, result):
         ids = np.minimum(np.searchsorted(bins, accepted.depth_below_primary_top, side="right") - 1, 9)
         depth = pd.DataFrame([{"depth_start": bins[i], "depth_end": bins[i+1], "nodule_count": int(np.sum(ids == i)),
                                "surface_area": float(accepted.loc[ids == i, "surface_area"].sum())} for i in range(10)])
+    depth["length_unit"], depth["area_unit"] = unit, f"{unit}^2"
     depth.to_csv(directory / "nodule_depth_distribution.csv", index=False)
     by_root = []
     if len(accepted):
@@ -394,7 +398,9 @@ def export_nodules(directory, result):
             by_root.append({"supporting_root_id": root_id, "supporting_root_order": group.supporting_root_order.iloc[0],
                             "nodule_count": len(group), "surface_area": float(group.surface_area.sum()),
                             "nodules_per_measured_root_length": len(group) / length if length else None})
-    pd.DataFrame(by_root, columns=["supporting_root_id", "supporting_root_order", "nodule_count", "surface_area", "nodules_per_measured_root_length"]).to_csv(directory / "nodules_by_root.csv", index=False)
+    by_root_frame = pd.DataFrame(by_root, columns=["supporting_root_id", "supporting_root_order", "nodule_count", "surface_area", "nodules_per_measured_root_length"])
+    by_root_frame["length_unit"], by_root_frame["area_unit"], by_root_frame["density_unit"] = unit, f"{unit}^2", f"{unit}^-1"
+    by_root_frame.to_csv(directory / "nodules_by_root.csv", index=False)
     return frame, summary, depth
 
 

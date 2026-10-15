@@ -23,10 +23,10 @@ def test_observed_private_peak_increases_admission_budget_with_headroom(tmp_path
     from soyrootbio import batch_process
 
     gate = MemoryAdmission(lambda: MemorySnapshot(11 * GIB, 30 * GIB, 32 * GIB, 64 * GIB))
-    config = PipelineConfig(tmp_path / 'root.ply', tmp_path / 'out', worker_threads=2)
+    config = PipelineConfig(tmp_path / 'root.ply', tmp_path / 'out', worker_threads=2, mm_per_mesh_unit=1.0)
     with BatchScheduler(run_pipeline_process, memory_admission=gate) as scheduler:
         job = scheduler.submit(config.input_path, config.output_dir, payload=config)
-        job.memory_estimate_bytes = 1_932_735_284  # Reduced 1.8 GiB initial estimate
+        job.memory_estimate_bytes = 966_367_642  # Reduced 0.9 GiB initial estimate
         job._memory_admission = gate
         assert gate.try_acquire(job.job_id, job.memory_estimate_bytes)
         info = SimpleNamespace(private=4 * GIB, rss=GIB, peak_pagefile=4 * GIB, peak_wset=GIB)
@@ -39,9 +39,9 @@ def test_observed_private_peak_increases_admission_budget_with_headroom(tmp_path
                              'original_vertex_count':101102})
             monitor.sample(123, force=True)
             assert monitor.data['memory_budget_policy'] == MEMORY_BUDGET_POLICY
-            assert monitor.data['geometry_estimated_peak_bytes'] == 1_932_735_284
-            assert monitor.data['estimated_peak_bytes'] == 5 * GIB
-            assert job.memory_estimate_bytes == 5 * GIB
+            assert monitor.data['geometry_estimated_peak_bytes'] == 966_367_642
+            assert monitor.data['estimated_peak_bytes'] == 4_509_715_661  # 4 GiB + 5%
+            assert job.memory_estimate_bytes == 4_509_715_661
             assert gate.try_acquire('neighbor', 3 * GIB)
             assert not gate.try_acquire('third', 3 * GIB)
             # Decreasing current use and re-reporting decoded geometry must
@@ -50,11 +50,11 @@ def test_observed_private_peak_increases_admission_budget_with_headroom(tmp_path
             monitor.decoded({'full_vertex_count':101102, 'triangle_count':202202,
                              'original_vertex_count':101102})
             monitor.sample(123, force=True)
-            assert monitor.data['estimated_peak_bytes'] == 5 * GIB
-            assert job.memory_estimate_bytes == 5 * GIB
+            assert monitor.data['estimated_peak_bytes'] == 4_509_715_661
+            assert job.memory_estimate_bytes == 4_509_715_661
             monitor.save()
             saved = json.loads((config.output_dir / 'processing_resources.json').read_text())
-            assert saved['estimated_peak_bytes'] == 5 * GIB
+            assert saved['estimated_peak_bytes'] == 4_509_715_661
             return ProcessSampleResult(config.output_dir, 101102, 123)
 
         monkeypatch.setattr(batch_process, '_run_sample_process', inspect_worker)
@@ -88,7 +88,7 @@ def _failure_with_slow_cleanup(config, control, progress):
 
 
 def test_received_failure_survives_worker_cleanup_timeout(tmp_path):
-    config = PipelineConfig(tmp_path / 'root.stl', tmp_path / 'out', worker_threads=1)
+    config = PipelineConfig(tmp_path / 'root.stl', tmp_path / 'out', worker_threads=1, mm_per_mesh_unit=1.0)
     with pytest.raises(SampleProcessError, match='MemoryError.*original allocation failure') as caught:
         _run_sample_process(config, CooperativeToken(), lambda *args: None,
                             analyze=_failure_with_slow_cleanup, exit_grace_seconds=.1)
@@ -106,7 +106,7 @@ def test_unavailable_system_telemetry_does_not_hide_sample_error(tmp_path, monke
     def unavailable():
         raise OSError('memory counters unavailable')
     monkeypatch.setattr(batch_process, 'memory_snapshot', unavailable)
-    config = PipelineConfig(tmp_path / 'fail.ply', tmp_path / 'out', worker_threads=1)
+    config = PipelineConfig(tmp_path / 'fail.ply', tmp_path / 'out', worker_threads=1, mm_per_mesh_unit=1.0)
     config.output_dir.mkdir()
     with pytest.raises(SampleProcessError, match='sample failure'):
         _run_sample_process(config, CooperativeToken(), lambda *args: None, analyze=_probe_analyze)
@@ -129,7 +129,7 @@ def _until(predicate, timeout=20):
 
 
 def _job(scheduler, tmp_path, name):
-    config = PipelineConfig(tmp_path / f'{name}.ply', tmp_path / name, worker_threads=1)
+    config = PipelineConfig(tmp_path / f'{name}.ply', tmp_path / name, worker_threads=1, mm_per_mesh_unit=1.0)
     return scheduler.submit(config.input_path, config.output_dir, payload=config)
 
 

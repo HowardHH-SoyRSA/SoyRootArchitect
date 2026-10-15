@@ -11,6 +11,7 @@ import pandas as pd
 from .io import load_root_geometry_with_progress
 from .primary_guidance import PrimaryGuidance
 from .types import PointCloudData
+from .units import resolve_unit_calibration
 
 
 def _wheel_zoom_factor(button, step: float | int | None = None) -> float | None:
@@ -65,15 +66,16 @@ def _zoom_3d_axis(axis, factor: float, canvas=None) -> None:
         canvas.draw_idle()
 
 
-def _configure_selection_axis(axis, points: np.ndarray, *, title: str = "Root point cloud") -> None:
+def _configure_selection_axis(axis, points: np.ndarray, *, title: str = "Root point cloud", coordinate_unit: str | None = None) -> None:
     """Apply the shared, sparse-grid styling used by both selection windows."""
 
     from matplotlib.ticker import MaxNLocator
 
     axis.set_title(title, fontsize=12, pad=12)
-    axis.set_xlabel("x", labelpad=8)
-    axis.set_ylabel("y", labelpad=8)
-    axis.set_zlabel("z", labelpad=8)
+    suffix = f" ({coordinate_unit})" if coordinate_unit else ""
+    axis.set_xlabel(f"x{suffix}", labelpad=8)
+    axis.set_ylabel(f"y{suffix}", labelpad=8)
+    axis.set_zlabel(f"z{suffix}", labelpad=8)
     axis.tick_params(labelsize=8)
     for coordinate_axis in (axis.xaxis, axis.yaxis, axis.zaxis):
         coordinate_axis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
@@ -130,6 +132,7 @@ def select_primary_endpoints_from_file_gui(
     title: str = "Select primary-root endpoints",
     random_seed: int | None = 42,
     noise_reduction: bool = True,
+    mm_per_mesh_unit: float | None = None,
 ) -> tuple[PointCloudData, np.ndarray, np.ndarray, int]:
     """Load a root file in the picker and return the chosen endpoints.
 
@@ -137,6 +140,7 @@ def select_primary_endpoints_from_file_gui(
     reloads happen on a background worker so users can watch a pilot-sample ETA
     instead of waiting on a frozen selection window.
     """
+    calibration = resolve_unit_calibration(input_path, mm_per_mesh_unit)
     cloud, start, end, effective_sample_points = _run_endpoint_picker(
         initial_cloud=None,
         input_path=Path(input_path),
@@ -145,6 +149,7 @@ def select_primary_endpoints_from_file_gui(
         max_display_points=max_display_points,
         title=title,
         random_seed=random_seed,
+        mm_per_mesh_unit=calibration.mm_per_mesh_unit,
     )
     if cloud is None:
         raise RuntimeError("Endpoint picker closed before a root point cloud was loaded.")
@@ -176,6 +181,7 @@ def _run_endpoint_picker(
     title: str,
     random_seed: int | None,
     noise_reduction: bool = True,
+    mm_per_mesh_unit: float | None = None,
 ) -> tuple[PointCloudData | None, np.ndarray, np.ndarray, int]:
     try:
         import matplotlib.pyplot as plt
@@ -321,6 +327,8 @@ def _run_endpoint_picker(
     def show_cloud(cloud: PointCloudData) -> None:
         nonlocal display_points, instruction_artist
         display_points = _display_sample(cloud.points, max_display_points)
+        if mm_per_mesh_unit is not None:
+            display_points = display_points * mm_per_mesh_unit
         axis.cla()
         axis.scatter(
             display_points[:, 0],
@@ -331,7 +339,7 @@ def _run_endpoint_picker(
             alpha=0.62,
             depthshade=False,
         )
-        _configure_selection_axis(axis, display_points)
+        _configure_selection_axis(axis, display_points, coordinate_unit="mm" if mm_per_mesh_unit is not None else None)
         axis.disable_mouse_rotation()
         axis.view_init(elev=22.0, azim=-60.0)
         set_root_limits()
@@ -729,8 +737,9 @@ def select_primary_guidance_from_file_gui(
     title: str = "Select primary-root guidance",
     random_seed: int | None = 42,
     noise_reduction: bool = True,
+    mm_per_mesh_unit: float | None = None,
 ) -> tuple[PointCloudData, PrimaryGuidance, int]:
-    """Pick endpoints, optional primary sections, and a horizontal soil line."""
+    """Pick endpoints and optional primary sections in millimeters."""
 
     effective_samples = 0 if sample_points is None else int(sample_points)
     cloud, start, end, loaded_samples = select_primary_endpoints_from_file_gui(
@@ -740,16 +749,17 @@ def select_primary_guidance_from_file_gui(
         max_display_points=max_display_points,
         title=title,
         random_seed=random_seed,
+        mm_per_mesh_unit=mm_per_mesh_unit,
     )
     soil_z, guides = select_primary_sections_gui(
-        cloud.points,
+        cloud.points * resolve_unit_calibration(path, mm_per_mesh_unit).mm_per_mesh_unit,
         start=start,
         end=end,
         max_display_points=max_display_points,
-        title=f"{title} — soil line and primary sections",
+        title=f"{title} — primary sections (mm)",
         random_seed=random_seed,
     )
-    return cloud, PrimaryGuidance(start, end, soil_z, guides, True), loaded_samples
+    return cloud, PrimaryGuidance(start, end, None, guides, True, "mm"), loaded_samples
 
 
 def select_soil_guidance_from_file_gui(
@@ -792,20 +802,14 @@ def select_primary_sections_gui(
     start: np.ndarray,
     end: np.ndarray,
     max_display_points: int = 30000,
-    title: str = "Select soil line and primary-root sections",
+    title: str = "Select primary-root sections",
     random_seed: int | None = 42,
 ) -> tuple[float | None, np.ndarray]:
-    """Select any number of primary guide sections and one soil-line height.
-
-    Shift-clicking chooses the nearest visible cloud point. In ``Guide
-    section`` mode every click adds an ordered constraint; in ``Soil line``
-    mode the point's Z coordinate defines the horizontal soil surface. The
-    camera controls deliberately match the endpoint picker.
-    """
+    """Shift-click visible points to add ordered primary guide constraints."""
 
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, RadioButtons
+        from matplotlib.widgets import Button
         from mpl_toolkits.mplot3d import proj3d
     except ImportError as exc:
         raise ImportError("matplotlib is required for primary-section selection") from exc
@@ -821,9 +825,7 @@ def select_primary_sections_gui(
     )
     display = points[display_indices]
     state: dict[str, object] = {
-        "mode": "Guide section",
         "guides": [],
-        "soil_z": None,
         "saved": False,
     }
     drag_state: dict[str, object] = {
@@ -849,11 +851,6 @@ def select_primary_sections_gui(
 
     control_left = 0.765
     control_width = 0.20
-    figure.text(control_left, 0.835, "Selection mode", fontsize=12, weight="bold")
-    radio = RadioButtons(
-        figure.add_axes([control_left, 0.675, control_width, 0.13]),
-        ("Guide section", "Soil line"),
-    )
     figure.text(
         control_left,
         0.625,
@@ -865,10 +862,6 @@ def select_primary_sections_gui(
     undo_button = Button(
         figure.add_axes([control_left, 0.515, control_width, 0.052]),
         "Undo guide",
-    )
-    clear_soil_button = Button(
-        figure.add_axes([control_left, 0.452, control_width, 0.052]),
-        "Clear soil line",
     )
     zoom_in_button = Button(
         figure.add_axes([control_left, 0.372, 0.092, 0.050]),
@@ -884,7 +877,7 @@ def select_primary_sections_gui(
     )
     skip_button = Button(
         figure.add_axes([control_left, 0.135, control_width, 0.052]),
-        "No guides / soil",
+        "No guides",
     )
     save_button = Button(
         figure.add_axes([control_left, 0.065, control_width, 0.055]),
@@ -892,11 +885,8 @@ def select_primary_sections_gui(
         color="#dbeafe",
         hovercolor="#bfdbfe",
     )
-    for label in radio.labels:
-        label.set_fontsize(10)
     for button in (
         undo_button,
-        clear_soil_button,
         zoom_in_button,
         zoom_out_button,
         reset_view_button,
@@ -984,34 +974,7 @@ def select_primary_sections_gui(
                         "alpha": 0.82,
                     },
                 )
-        soil_z = state["soil_z"]
-        if soil_z is not None:
-            x0, x1 = float(points[:, 0].min()), float(points[:, 0].max())
-            y0, y1 = float(points[:, 1].min()), float(points[:, 1].max())
-            axis.plot(
-                [x0, x1, x1, x0, x0],
-                [y0, y0, y1, y1, y0],
-                [soil_z] * 5,
-                c="#15803d",
-                lw=2.4,
-                alpha=0.95,
-                label="Soil line",
-            )
-            axis.text(
-                x0,
-                y0,
-                soil_z,
-                f"  soil z={soil_z:.6g}",
-                color="#15803d",
-                fontsize=9,
-                bbox={
-                    "boxstyle": "round,pad=0.18",
-                    "facecolor": "white",
-                    "edgecolor": "none",
-                    "alpha": 0.82,
-                },
-            )
-        _configure_selection_axis(axis, points)
+        _configure_selection_axis(axis, points, coordinate_unit="mm")
         axis.disable_mouse_rotation()
         if view_limits is not None:
             axis.set_xlim(view_limits[0])
@@ -1035,15 +998,8 @@ def select_primary_sections_gui(
                 "alpha": 0.82,
             },
         )
-        soil_text = "not selected" if soil_z is None else f"z={float(soil_z):.6g}"
-        status_text.set_text(
-            f"{state['mode']} mode | {len(guides)} guide section(s) | Soil line {soil_text}"
-        )
+        status_text.set_text(f"{len(guides)} guide section(s)")
         figure.canvas.draw_idle()
-
-    def on_mode(label: str) -> None:
-        state["mode"] = label
-        redraw()
 
     def select_point_at_event(event) -> None:
         if event.inaxes is not axis or event.x is None or event.y is None:
@@ -1055,10 +1011,7 @@ def select_primary_sections_gui(
         screen = axis.transData.transform(np.column_stack([projected_x, projected_y]))
         distance = np.linalg.norm(screen - np.array([event.x, event.y]), axis=1)
         selected = display[int(np.argmin(distance))].copy()
-        if state["mode"] == "Soil line":
-            state["soil_z"] = float(selected[2])
-        else:
-            state["guides"].append(selected)
+        state["guides"].append(selected)
         redraw()
 
     def on_pointer_press(event) -> None:
@@ -1144,24 +1097,17 @@ def select_primary_sections_gui(
             guides.pop()
             redraw()
 
-    def clear_soil(_event) -> None:
-        state["soil_z"] = None
-        redraw()
-
     def save(_event) -> None:
         state["saved"] = True
         plt.close(figure)
 
     def skip(_event) -> None:
         state["guides"] = []
-        state["soil_z"] = None
         state["saved"] = True
         plt.close(figure)
 
     redraw(preserve_view=False)
-    radio.on_clicked(on_mode)
     undo_button.on_clicked(undo)
-    clear_soil_button.on_clicked(clear_soil)
     zoom_in_button.on_clicked(lambda _event: _zoom_3d_axis(axis, 0.75, figure.canvas))
     zoom_out_button.on_clicked(lambda _event: _zoom_3d_axis(axis, 1.35, figure.canvas))
     reset_view_button.on_clicked(reset_view)
@@ -1177,4 +1123,4 @@ def select_primary_sections_gui(
     guides = np.asarray(state["guides"], dtype=float)
     if not len(guides):
         guides = np.empty((0, 3), dtype=float)
-    return state["soil_z"], guides
+    return None, guides

@@ -111,7 +111,7 @@ class ResourceAllocation:
         return self.max_concurrent_samples * self.threads_per_sample
 
 
-def detect_hardware(*, include_gpus: bool = True) -> HardwareInfo:
+def detect_hardware(*, include_gpus: bool = False) -> HardwareInfo:
     """Inspect CPU, RAM, and optional NVIDIA GPU resources.
 
     Discovery failures are intentionally non-fatal.  Physical CPU count falls

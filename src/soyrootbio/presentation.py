@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from .bundle_layout import bundle_file
 
 from .io import write_labeled_ply
 
@@ -84,7 +85,7 @@ class NoisePresentation:
         self.mask = np.zeros(mesh.vertex_count, dtype=bool)
         self.mesh = mesh
         self.cached_path = None
-        path = Path(output_dir) / 'presentation_noise_masks.npz'
+        path = bundle_file(output_dir, 'presentation_noise_masks.npz')
         if path.exists():
             with np.load(path, allow_pickle=False) as data:
                 mask = np.asarray(data['excluded_full_vertices'], dtype=bool)
@@ -92,7 +93,7 @@ class NoisePresentation:
             if fingerprint != geometry_fingerprint(mesh.positions, mesh.triangles):
                 raise ValueError('Presentation noise mask belongs to different geometry')
         else:
-            path = Path(output_dir) / 'noise_reduction_masks.npz'
+            path = bundle_file(output_dir, 'noise_reduction_masks.npz')
             if not path.exists():
                 return
             with np.load(path, allow_pickle=False) as data:

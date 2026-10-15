@@ -74,7 +74,9 @@ def _add_sample(app, tmp_path):
     source = tmp_path / "root.ply"
     source.write_text("ply", encoding="ascii")
     app.add_files([source])
-    return next(iter(app.entries.values()))
+    entry = next(iter(app.entries.values()))
+    entry.unit_calibration = {"mm_per_mesh_unit": 1., "source": "user"}
+    return entry
 
 
 def test_start_batch_dispatches_module_level_process_runner(tmp_path, monkeypatch):
@@ -104,6 +106,7 @@ def test_automatic_gui_uses_live_gate_instead_of_startup_ram_slot_limit(tmp_path
         source = tmp_path / f'root-{i}.ply'
         source.write_text('ply', encoding='ascii')
         app.add_files([source])
+        app.entries[next(reversed(app.entries))].unit_calibration = {'mm_per_mesh_unit': 1., 'source': 'user'}
     app.concurrency_var = Variable('Auto')
     app.threads_var = Variable('Auto')
     app.hardware_var = Variable()

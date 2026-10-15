@@ -50,7 +50,6 @@ export function RootEditor() {
   const brushRadius = useEditorStore((store) => store.brushRadius);
   const loadProgress = useEditorStore((store) => store.loadProgress);
   const meshReady = useEditorStore((store) => store.meshReady);
-  const clientGpu = useEditorStore((store) => store.clientGpu);
   const setServerState = useEditorStore((store) => store.setServerState);
   const setSelectedRootId = useEditorStore((store) => store.setSelectedRootId);
   const setSelectedPatchId = useEditorStore(
@@ -540,19 +539,6 @@ export function RootEditor() {
   }
 
   const sampleName = leafName(serverState.source_output_dir);
-  const hostGpu = serverState.hardware.gpus[0];
-  const gpuName = hostGpu?.name || clientGpu || "WebGL graphics";
-  const hardwareAudit = [
-    `Host GPU: ${hostGpu?.name ?? "no discrete GPU reported"}${
-      hostGpu?.memory_total_bytes
-        ? ` (${formatBytes(hostGpu.memory_total_bytes)})`
-        : ""
-    }`,
-    `Browser renderer: ${clientGpu ?? "detecting…"}`,
-    `CPU: ${serverState.hardware.logical_cpus} logical / ${serverState.hardware.physical_cpus} physical`,
-    `RAM available: ${formatBytes(serverState.hardware.available_memory_bytes)} / ${formatBytes(serverState.hardware.total_memory_bytes)}`,
-    `Policy: ${serverState.hardware.acceleration.full_resolution_policy}`,
-  ].join("\n");
 
   return (
     <main className="editor-app">
@@ -569,9 +555,6 @@ export function RootEditor() {
         <div className="header-status">
           <div className="status-chip immutable-chip" title="Automatic output files are read-only">
             <span className="lock-glyph">▣</span>Source preserved
-          </div>
-          <div className="status-chip gpu-chip" title={hardwareAudit}>
-            <span className="live-dot" />{compactGpuName(gpuName)}
           </div>
           <div className="operation-count" title="Active edits in this session">
             <strong>{serverState.operation_count}</strong><span>edits</span>
@@ -686,20 +669,4 @@ export function RootEditor() {
 
 function leafName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-}
-
-function compactGpuName(name: string): string {
-  return name
-    .replace(/NVIDIA/gi, "")
-    .replace(/GeForce/gi, "")
-    .replace(/ANGLE\s*\(/gi, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 24);
-}
-
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "unknown";
-  const gib = bytes / 1024 ** 3;
-  return gib >= 1 ? `${gib.toFixed(1)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
 }

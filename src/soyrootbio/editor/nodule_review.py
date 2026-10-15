@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from ..bundle_layout import bundle_file
 import hashlib
 import json
 import numpy as np
@@ -11,7 +12,7 @@ from ..nodules import NoduleResult, NODULE_RGB, export_nodules, geometry_digest,
 
 class NoduleReviewMixin:
     def _load_nodules(self):
-        path = self.output_dir / "nodules.json"
+        path = bundle_file(self.output_dir, "nodules.json")
         self.nodule_objects = []
         self._nodule_detection_info = {}
         self._nodule_collar_excluded = np.zeros(self.mesh.vertex_count, dtype=bool)
@@ -20,7 +21,7 @@ class NoduleReviewMixin:
             return
         data = json.loads(path.read_text(encoding="utf-8"))
         self._nodule_detection_info = {k: v for k, v in data.items() if k != "objects"}
-        masks_path = self.output_dir / "ownership_evidence_masks.npz"
+        masks_path = bundle_file(self.output_dir, "ownership_evidence_masks.npz")
         if masks_path.is_file():
             with np.load(masks_path, allow_pickle=False) as masks:
                 self._nodule_collar_excluded = np.asarray(masks["above_base_excluded"], dtype=bool).copy()
@@ -110,13 +111,10 @@ class NoduleReviewMixin:
         result = NoduleResult(labels, objects, self._nodule_detection_info.get("status", "complete"),
                               deepcopy(self._nodule_detection_info.get("evidence", {})))
         roots = {r.numeric_label: {"root_id": r.root_id, "order": r.order, "points": r.points, "length": r.traits.get("length")} for r in self.roots.values()}
-        metadata_path = self.output_dir / "metadata.json"
+        metadata_path = bundle_file(self.output_dir, "metadata.json")
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
-        ref = metadata.get("final_compliance_audit", {}).get("primary_top_reference_normalized")
-        top = self._baseline_roots["primary"].points[0]
-        if ref is not None:
-            top = np.asarray(ref) * metadata["normalization_scale"] + np.asarray(metadata["normalization_minimum"])
-        quantify_nodules(result, self.mesh.positions, self.mesh.triangles, self.mesh.root_labels, roots, top, self.gravity)
+        quantify_nodules(result, self.mesh.positions, self.mesh.triangles, self.mesh.root_labels, roots,
+                         self.primary_top_reference, self.gravity, coordinate_unit=self.coordinate_unit)
         result.evidence["geometry_sha256"] = geometry_digest(self.mesh.positions)
         return result
 
@@ -126,6 +124,7 @@ class NoduleReviewMixin:
         result = self._nodule_result()
         export_nodules(target, result)
         review = {"schema": "soyrootbio.nodule-review/v1", "geometry_sha256": geometry_digest(self.mesh.positions),
+                  "coordinate_unit": self.coordinate_unit,
                   "decisions": [{"geometry_fingerprint": o["geometry_fingerprint"], "status": o["status"]}
                                 for o in self.nodule_objects if o.get("review_status") == "manual"]}
         (target / "nodule_review.json").write_text(json.dumps(review, indent=2), encoding="utf-8")

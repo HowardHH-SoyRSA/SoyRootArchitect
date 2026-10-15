@@ -80,13 +80,20 @@ def tube_claim_limits(reference, labels, roots, excluded_mask):
     return limits
 
 
-def load_surface_reference(path, source_points, triangles) -> SurfaceReference:
+def load_surface_reference(path, source_points, triangles, *, mm_per_mesh_unit=None) -> SurfaceReference:
     """Fail closed on different geometry, ordering, duplicates, or data content."""
     path = Path(path)
     raw = path.read_bytes()
     manifest = json.loads(raw.decode("utf-8-sig"))
     if manifest.get("schema") != SCHEMA:
         raise ValueError("Unsupported surface reference schema")
+    unit = manifest.get("coordinate_unit", "mesh_unit")
+    if unit == "mm":
+        if mm_per_mesh_unit is None:
+            raise ValueError("Millimeter surface references require explicit calibration")
+        source_points = np.asarray(source_points) * mm_per_mesh_unit
+    elif unit != "mesh_unit":
+        raise ValueError("Unsupported surface reference coordinate unit")
     owners = manifest.get("owners", [])
     names = [row["reference_root_id"] for row in owners]
     if not names or len(names) != len(set(names)):

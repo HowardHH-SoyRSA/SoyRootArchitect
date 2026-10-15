@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+from soyrootbio.bundle_layout import bundle_file, read_bundle_mesh
+from pathlib import Path
 
 import json
 
@@ -36,12 +37,12 @@ def test_stl_bundle_exports_reversible_mapping_and_unresolved_seam_qc(tmp_path):
     original = load_root_geometry(source)
     progress, resources = [], []
     result = run_pipeline(PipelineConfig(source, output, start=(0, 0, 2), end=(0, 0, 0),
-                                         max_root_order=1, worker_threads=1),
+                                         max_root_order=1, worker_threads=1, mm_per_mesh_unit=1.0),
                           progress_callback=lambda step, fraction: progress.append((step, fraction)),
                           resource_callback=resources.append)
-    metadata = json.loads((output / 'metadata.json').read_text())
-    labelled = read_labeled_ply(output / 'segmented_root_structure.ply')
-    with np.load(output / 'input_geometry_mapping.npz') as mapping, np.load(output / 'original_input_geometry.npz') as raw:
+    metadata = json.loads((bundle_file(output, 'metadata.json')).read_text())
+    labelled = read_bundle_mesh(output)
+    with np.load(bundle_file(output, 'input_geometry_mapping.npz')) as mapping, np.load(bundle_file(output, 'original_input_geometry.npz')) as raw:
         np.testing.assert_array_equal(raw['points'], original.original_points)
         np.testing.assert_array_equal(raw['triangles'], original.original_triangles)
         np.testing.assert_array_equal(labelled.positions[mapping['original_to_full']], raw['points'])
@@ -51,7 +52,7 @@ def test_stl_bundle_exports_reversible_mapping_and_unresolved_seam_qc(tmp_path):
     assert metadata['final_compliance_audit']['source_connectivity_status'] == 'unresolved_stl_connectivity'
     assert result.traits['qc_flags'].str.contains('stl_connectivity_unresolved').all()
     assert resources[0]['analysis_vertex_count'] == len(original.points)
-    assert 'input_geometry_mapping.npz' in metadata['outputs']
+    assert 'support/input_geometry_mapping.npz' in metadata['outputs']
     assert any(step == 'Tracing order-1 lateral roots' for step, _ in progress)
     assert np.all(np.diff([fraction for _, fraction in progress]) >= 0)
 
@@ -67,8 +68,8 @@ def test_capped_point_pipeline_preserves_full_exports_and_representation_qc(tmp_
     result = run_pipeline(PipelineConfig(
         source, output, endpoint_file=endpoints, sample_points=120,
         max_root_order=1, input_mode=input_mode,
-    ))
-    metadata = json.loads((output / "metadata.json").read_text())
+    mm_per_mesh_unit=1.0))
+    metadata = json.loads((bundle_file(output, "metadata.json")).read_text())
     assert result.point_count == 120
     assert len(result.full_root_labels) == len(original.points)
     assert metadata["full_resolution_point_count"] == len(original.points)
@@ -76,11 +77,11 @@ def test_capped_point_pipeline_preserves_full_exports_and_representation_qc(tmp_
     assert metadata["source_geometry"]["analysis_cap"] == 120
     assert metadata["point_only_evidence"]["native_patch_compliance"] == "unresolved_no_mesh"
     assert np.all(result.full_root_labels[result.full_above_base_mask] == -1)
-    with np.load(output / "original_input_geometry.npz") as archive:
+    with np.load(bundle_file(output, "original_input_geometry.npz")) as archive:
         np.testing.assert_array_equal(archive["points"], original.points)
-    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    labelled = pipeline_module.load_root_geometry(output / "presentation_root_structure.ply")
     np.testing.assert_array_equal(labelled.points, original.points)
-    assert "original_input_geometry.npz" in metadata["outputs"]
+    assert "support/original_input_geometry.npz" in metadata["outputs"]
     assert result.traits["qc_flags"].str.contains("native_mesh_constraints_unresolved").all()
     if input_mode == "occupied_volume":
         assert result.traits["qc_flags"].str.contains("occupied_volume_measurement_uncalibrated").all()
@@ -104,16 +105,16 @@ def test_capped_native_mesh_keeps_faces_and_uses_native_checks(tmp_path):
     result = run_pipeline(PipelineConfig(
         source, output, start=(0, 0, 2), end=(0, 0, 0),
         sample_points=120, max_root_order=1, input_mode="triangle_mesh",
-    ))
-    metadata = json.loads((output / "metadata.json").read_text())
+    mm_per_mesh_unit=1.0))
+    metadata = json.loads((bundle_file(output, "metadata.json")).read_text())
     assert result.point_count == 120
     assert metadata["point_only_evidence"]["status"] == "not_applicable_native_mesh"
     assert metadata["higher_order_primary_contact"]["status"] != "unresolved_no_mesh"
     assert metadata["source_geometry"]["native_mesh_support"] is True
-    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    labelled = pipeline_module.load_root_geometry(output / "presentation_root_structure.ply")
     np.testing.assert_array_equal(labelled.full_points, points)
     np.testing.assert_array_equal(labelled.triangles, faces)
-    with np.load(output / "original_input_geometry.npz") as archive:
+    with np.load(bundle_file(output, "original_input_geometry.npz")) as archive:
         np.testing.assert_array_equal(archive["points"], points)
         np.testing.assert_array_equal(archive["triangles"], faces)
 
@@ -136,16 +137,16 @@ def test_capped_native_mesh_keeps_faces_and_uses_native_checks(tmp_path):
     result = run_pipeline(PipelineConfig(
         source, output, start=(0, 0, 2), end=(0, 0, 0),
         sample_points=120, max_root_order=1, input_mode="triangle_mesh",
-    ))
-    metadata = json.loads((output / "metadata.json").read_text())
+    mm_per_mesh_unit=1.0))
+    metadata = json.loads((bundle_file(output, "metadata.json")).read_text())
     assert result.point_count == 120
     assert metadata["point_only_evidence"]["status"] == "not_applicable_native_mesh"
     assert metadata["higher_order_primary_contact"]["status"] != "unresolved_no_mesh"
     assert metadata["source_geometry"]["native_mesh_support"] is True
-    labelled = pipeline_module.load_root_geometry(output / "segmented_root_structure.ply")
+    labelled = pipeline_module.load_root_geometry(output / "presentation_root_structure.ply")
     np.testing.assert_array_equal(labelled.full_points, points)
     np.testing.assert_array_equal(labelled.triangles, faces)
-    with np.load(output / "original_input_geometry.npz") as archive:
+    with np.load(bundle_file(output, "original_input_geometry.npz")) as archive:
         np.testing.assert_array_equal(archive["points"], points)
         np.testing.assert_array_equal(archive["triangles"], faces)
 
@@ -168,16 +169,16 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
             sample_points=1000,
             lateral_max_paths=6,
             max_root_order=2,
-        )
+        mm_per_mesh_unit=1.0)
     )
 
     assert result.point_count > 0
     assert result.primary_path.shape[0] > 2
     assert result.lateral_start_count >= 1
 
-    primary = pd.read_csv(output_dir / "primary_skeleton.csv")
-    traits = pd.read_csv(output_dir / "root_traits.csv")
-    lateral_skeletons = pd.read_csv(output_dir / "lateral_skeletons.csv")
+    primary = pd.read_csv(output_dir / "tables" / "centerlines.csv").query("root_order == 0")
+    traits = pd.read_csv(bundle_file(output_dir, "root_traits.csv"))
+    lateral_skeletons = pd.read_csv(output_dir / "tables" / "centerlines.csv").query("root_order > 0")
 
     assert not primary.empty
     assert not traits.empty
@@ -185,19 +186,19 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert int(traits.loc[traits["root_id"] == "primary", "lateral_start_count"].iloc[0]) >= 1
     assert "tip_angle_parent_deg" in traits.columns
     assert "tip_angle_z_deg" in traits.columns
-    assert (output_dir / "metadata.json").exists()
-    collar = json.loads((output_dir / "collar_qc.json").read_text())
-    metadata = json.loads((output_dir / "metadata.json").read_text())
+    assert (bundle_file(output_dir, "metadata.json")).exists()
+    collar = json.loads((bundle_file(output_dir, "collar_qc.json")).read_text())
+    metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text())
     assert collar == metadata["joint_root_collar"]
     assert collar["policy"] == "joint-root-collar-v1"
     assert metadata["higher_order_primary_contact"]["status"] == "unresolved_no_mesh"
     assert metadata["source_geometry"]["input_mode"] == "surface_points"
     assert metadata["point_only_evidence"]["native_contact_compliance"] == "unresolved_no_mesh"
     assert metadata["point_only_evidence"]["changed_vertex_count"] == 0
-    original = np.load(output_dir / "original_input_geometry.npz")
+    original = np.load(bundle_file(output_dir, "original_input_geometry.npz"))
     np.testing.assert_array_equal(original["points"], pipeline_module.load_root_geometry(points_path).full_points)
     assert original["triangles"].shape == (0, 3)
-    guidance = read_primary_guidance(output_dir / "primary_guidance.json", expected_input=points_path)
+    guidance = read_primary_guidance(bundle_file(output_dir, "primary_guidance.json"), expected_input=points_path)
     start, end = pipeline_module.read_endpoint_file(endpoint_path)
     np.testing.assert_array_equal(guidance.start, start)
     np.testing.assert_array_equal(guidance.end, end)
@@ -208,14 +209,14 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     assert (output_dir / "tip_start_gravity_front_view_600dpi.png").exists()
     assert (output_dir / "tip_primary_front_view_600dpi.png").exists()
     assert (output_dir / "skeleton_original_overlay.ply").exists()
-    assert (output_dir / "segmented_root_structure.ply").exists()
-    assert (output_dir / "root_system.rsml").exists()
-    assert (output_dir / "root_hierarchy.json").exists()
-    assert (output_dir / "traits.xlsx").exists()
+    assert (output_dir / "presentation_root_structure.ply").exists()
+    assert (bundle_file(output_dir, "root_system.rsml")).exists()
+    assert (bundle_file(output_dir, "root_hierarchy.json")).exists()
+    assert (bundle_file(output_dir, "traits.xlsx")).exists()
     assert ["root_id", "parent_id", "root_order", "node_id", "x", "y", "z"] == list(lateral_skeletons.columns[:7])
     assert {"confidence", "qc_flags"}.issubset(lateral_skeletons.columns)
     assert {"tortuosity", "mean_diameter", "tip_gravity_angle_deg", "tip_start_gravity_angle_deg", "tip_primary_angle_deg"}.issubset(traits.columns)
-    assert set(traits["length_unit"]) == {"mesh_unit"}
+    assert set(traits["length_unit"]) == {"mm"}
     assert traits["qc_flags"].str.contains("native_mesh_constraints_unresolved").all()
     assert not any("mm" in column.lower() for column in traits.columns)
     length_by_id = traits.set_index("root_id")["length"].to_dict()
@@ -223,8 +224,8 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
         if pd.isna(row.parent_id) or not str(row.parent_id):
             continue
         assert float(row.length) <= float(length_by_id[str(row.parent_id)]) + 1e-9
-    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["primary_guidance_file"] == "primary_guidance.json"
+    metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8"))
+    assert metadata["primary_guidance_file"] == "support/primary_guidance.json"
     assert "final_centerline_fitting" in metadata["stage_timings_seconds"]
     fitting = metadata["final_centerline_fitting"]
     assert len(fitting["roots"]) == len(traits)
@@ -346,7 +347,7 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
             lateral_max_paths=4,
             max_root_order=1,
             random_seed=23,
-        )
+        mm_per_mesh_unit=1.0)
     )
 
     assert result.full_above_base_mask is not None
@@ -355,7 +356,7 @@ def test_points_above_selected_base_remain_unassigned_and_are_explained(tmp_path
     assert np.all(result.full_root_labels[appended_indices] == -1)
     assert np.all(result.full_root_labels[result.full_above_base_mask] == -1)
 
-    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8"))
     assignment = metadata["point_assignment"]
     assert assignment["full_resolution_above_base_point_count"] == int(
         np.count_nonzero(result.full_above_base_mask)
@@ -458,7 +459,7 @@ def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
             lateral_max_paths=6,
             max_root_order=1,
             random_seed=31,
-        )
+        mm_per_mesh_unit=1.0)
     )
 
     assert events == [
@@ -471,7 +472,7 @@ def test_pipeline_reassigns_points_after_reported_internal_o1_swap(
         "full_assignment",
     ]
     metadata = json.loads(
-        (output_dir / "metadata.json").read_text(encoding="utf-8")
+        (bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8")
     )
     assert metadata["internal_o1_contact_decisions"] == [
         expected_decision

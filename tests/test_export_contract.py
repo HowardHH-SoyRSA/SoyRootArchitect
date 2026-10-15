@@ -1,4 +1,5 @@
 from __future__ import annotations
+from soyrootbio.bundle_layout import bundle_file, read_bundle_mesh
 
 import copy
 import json
@@ -102,7 +103,7 @@ def synthetic_export(
             lateral_max_paths=6,
             max_root_order=2,
             random_seed=11,
-        )
+        mm_per_mesh_unit=1.0)
     )
     assert result.lateral_paths, "Synthetic fixture must exercise lateral-root exports."
     return points_path, output_dir, result
@@ -173,14 +174,14 @@ def test_rsml_parses_and_preserves_parent_child_order(
     tmp_path: Path,
 ) -> None:
     _, output_dir, _ = synthetic_export
-    pipeline_tree = ET.parse(output_dir / "root_system.rsml")
+    pipeline_tree = ET.parse(bundle_file(output_dir, "root_system.rsml"))
     assert pipeline_tree.getroot().tag == "rsml"
-    assert pipeline_tree.findtext("./metadata/unit") == "mesh_unit"
+    assert pipeline_tree.findtext("./metadata/unit") == "mm"
 
     plant = pipeline_tree.find("./scene/plant")
     assert plant is not None
     root_elements = {element.attrib["id"]: element for element in plant.findall(".//root")}
-    hierarchy = json.loads((output_dir / "root_hierarchy.json").read_text(encoding="utf-8"))
+    hierarchy = json.loads((bundle_file(output_dir, "root_hierarchy.json")).read_text(encoding="utf-8"))
     detected_laterals = [root for root in hierarchy["roots"] if root["root_id"] != "primary"]
     assert len(detected_laterals) == 3
     assert {root["root_order"] for root in detected_laterals} == {1}
@@ -241,34 +242,18 @@ def test_trait_workbook_and_per_trait_csv_contract(
     synthetic_export: tuple[Path, Path, PipelineResult],
 ) -> None:
     _, output_dir, _ = synthetic_export
-    workbook = output_dir / "traits.xlsx"
+    workbook = bundle_file(output_dir, "traits.xlsx")
     expected_sheet_columns = {
-        "Root traits": {"root_id", "root_order"},
-        "System summary": {"trait", "value"},
-        "Length": {"root_id", "length", "length_unit"},
-        "Counts by order": {"root_order", "lateral_root_count"},
-        "Angles": {
-            "tip_gravity_angle_deg",
-            "tip_start_gravity_angle_deg",
-            "tip_primary_angle_deg",
-        },
-        "Tortuosity": {"root_id", "tortuosity"},
-        "Surface area": {"root_id", "surface_area", "area_unit"},
-        "Volume": {"root_id", "volume", "volume_unit"},
-        "Diameter": {"root_id", "mean_diameter", "length_unit"},
-        "Vectors": {
-            "root_id",
-            "root_start_x",
-            "root_tip_x",
-            "base_vector_start_x",
-            "base_vector_end_x",
-            "base_vector_dx",
-            "base_vector_arc_window",
-            "base_vector_window_unit",
-        },
-        "Topology": {"root_id", "parent_id", "root_order"},
-        "QC": {"root_id", "confidence", "qc_flags"},
-        "Label map": {"numeric_label", "root_id", "root_order"},
+        "root_traits": {"root_id", "root_order", "length", "volume_frustum", "mesh_volume", "mean_diameter"},
+        "root_inventory": {"root_id", "measurement_eligible", "qc_flags"},
+        "architecture_summary": {"scope", "root_count", "hull_volume", "lateral_density", "diameter_p90"},
+        "system_summary": {"trait", "value"},
+        "branch_positions": {"root_id", "insertion_arc", "parent_id"},
+        "branch_spacing": {"scope", "parent_id", "distance"},
+        "diameter_distribution": {"scope", "mean_diameter", "cumulative_fraction"},
+        "trait_dictionary": {"table", "field", "definition"},
+        "root_label_map": {"root_id", "numeric_label"},
+        "centerlines": {"root_id", "node_id", "x", "y", "z"},
     }
     with pd.ExcelFile(workbook, engine="openpyxl") as excel_file:
         assert set(expected_sheet_columns).issubset(excel_file.sheet_names)
@@ -283,32 +268,53 @@ def test_trait_workbook_and_per_trait_csv_contract(
         assert worksheet["A1"].font.bold
         assert worksheet["A1"].fill.fgColor.rgb.endswith("1F4E78")
         assert worksheet.column_dimensions["A"].width >= 10
-    root_traits_sheet = styled_workbook["Root traits"]
+    root_traits_sheet = styled_workbook["root_traits"]
     length_column = next(cell.column for cell in root_traits_sheet[1] if cell.value == "length")
     assert root_traits_sheet.cell(row=2, column=length_column).number_format == "0.000000"
 
-    assert (output_dir / "root_traits.csv").stat().st_size > 0
-    for filename, expected_columns in TRAIT_CSV_COLUMNS.items():
-        path = output_dir / "csv" / filename
-        assert path.is_file() and path.stat().st_size > 0, filename
-        frame = pd.read_csv(path)
-        assert expected_columns.issubset(frame.columns), filename
-
-    summary = pd.read_csv(output_dir / "csv" / "system_summary.csv").set_index("trait")["value"]
-    assert summary["root_system_surface_area_method"] == "sum_per_root_surface_estimates"
-    assert summary["length_unit"] == "mesh_unit"
-    assert summary["area_unit"] == "mesh_unit^2"
-    assert summary["volume_unit"] == "mesh_unit^3"
-    assert float(summary["unassigned_vertex_fraction"]) >= 0.0
+    assert (bundle_file(output_dir, "root_traits.csv")).stat().st_size > 0
+    for sheet, columns in expected_sheet_columns.items():
+        path = output_dir / "tables" / f"{sheet}.csv"
+        assert path.is_file()
+        csv = pd.read_csv(path)
+        assert columns.issubset(csv.columns)
+        xlsx = pd.read_excel(workbook, sheet_name=sheet)
+        if sheet == "system_summary":
+            actual = {row[0].value: row[1].value for row in styled_workbook[sheet].iter_rows(min_row=2)}
+            for record in csv.itertuples():
+                value = actual[record.trait]
+                if pd.isna(record.value):
+                    assert value is None
+                elif record.value in {"True", "False"}:
+                    assert value == (record.value == "True")
+                elif isinstance(value, (int, float)):
+                    assert float(record.value) == pytest.approx(value)
+                else:
+                    assert str(record.value) == str(value)
+        else:
+            pd.testing.assert_frame_equal(csv, xlsx, check_dtype=False, rtol=1e-10, atol=1e-10)
+    assert not (output_dir / "csv").exists()
+    assert not (output_dir / "segmented_root_structure.ply").exists()
+    assert not (output_dir / "tables" / "root_diameter.csv").exists()
+    for path in output_dir.rglob("*"):
+        if path.is_file():
+            expected = "tables" if path.suffix in {".csv", ".xlsx"} else "support"
+            if path.suffix not in {".png", ".ply"}:
+                assert path.relative_to(output_dir).parts[0] == expected
+    summary = pd.read_csv(output_dir / "tables" / "system_summary.csv").set_index("trait")["value"]
+    assert summary["root_system_surface_area_method"] == "eligible_segmented_mesh_triangles"
+    assert summary["length_unit"] == "mm"
+    assert summary["area_unit"] == "mm^2"
+    assert summary["volume_unit"] == "mm^3"
 
 
 def test_primary_qc_provenance_and_skeleton_coordinate_contract(
     synthetic_export: tuple[Path, Path, PipelineResult],
 ) -> None:
     _, output_dir, result = synthetic_export
-    traits = pd.read_csv(output_dir / "root_traits.csv")
-    topology = pd.read_csv(output_dir / "csv" / "root_topology.csv")
-    hierarchy = json.loads((output_dir / "root_hierarchy.json").read_text(encoding="utf-8"))
+    traits = pd.read_csv(bundle_file(output_dir, "root_traits.csv"))
+    topology = pd.read_csv(output_dir / "tables" / "root_inventory.csv")
+    hierarchy = json.loads((bundle_file(output_dir, "root_hierarchy.json")).read_text(encoding="utf-8"))
 
     trait_primary = traits.loc[traits["root_id"] == "primary"].iloc[0]
     topology_primary = topology.loc[topology["root_id"] == "primary"].iloc[0]
@@ -320,15 +326,15 @@ def test_primary_qc_provenance_and_skeleton_coordinate_contract(
     assert hierarchy_primary["confidence"] == pytest.approx(trait_primary["confidence"])
     assert topology_flags == expected_flags
     assert hierarchy_primary["qc_flags"] == expected_flags
-    assert set(traits["coordinate_unit"]) == {"mesh_unit"}
-    assert set(topology["coordinate_unit"]) == {"mesh_unit"}
-    assert hierarchy["coordinate_unit"] == "mesh_unit"
+    assert set(traits["coordinate_unit"]) == {"mm"}
+    assert set(topology["coordinate_unit"]) == {"mm"}
+    assert hierarchy["coordinate_unit"] == "mm"
     assert "coordinate_to_mm_scale" not in hierarchy
     assert not any("mm" in column.lower() for column in traits.columns)
     assert not any("mm" in column.lower() for column in topology.columns)
 
-    primary_skeleton = pd.read_csv(output_dir / "primary_skeleton.csv")
-    lateral_skeletons = pd.read_csv(output_dir / "lateral_skeletons.csv")
+    primary_skeleton = pd.read_csv(output_dir / "tables" / "centerlines.csv").query("root_order == 0")
+    lateral_skeletons = pd.read_csv(output_dir / "tables" / "centerlines.csv").query("root_order > 0")
     required = {
         "x",
         "y",
@@ -337,7 +343,7 @@ def test_primary_qc_provenance_and_skeleton_coordinate_contract(
     }
     for skeleton in (primary_skeleton, lateral_skeletons):
         assert required.issubset(skeleton.columns)
-        assert set(skeleton["coordinate_unit"]) == {"mesh_unit"}
+        assert set(skeleton["coordinate_unit"]) == {"mm"}
         assert not any("mm" in column.lower() for column in skeleton.columns)
 
     np.testing.assert_allclose(
@@ -351,7 +357,7 @@ def test_labeled_ply_headers_include_labels_and_mesh_faces(
     tmp_path: Path,
 ) -> None:
     _, output_dir, _ = synthetic_export
-    segmented_header = _ply_header(output_dir / "segmented_root_structure.ply")
+    segmented_header = _ply_header(output_dir / "presentation_root_structure.ply")
     assert "property int root_id\n" in segmented_header
     assert "property uchar root_order\n" in segmented_header
     assert "element face 0\n" in segmented_header
@@ -500,7 +506,7 @@ def test_pipeline_metadata_records_side_by_side_skeleton_layout(
     synthetic_export: tuple[Path, Path, PipelineResult],
 ) -> None:
     _, output_dir, _ = synthetic_export
-    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8"))
     layout = metadata["skeleton_original_overlay_layout"]
     records, faces, header = _read_labeled_ply(
         output_dir / "skeleton_original_overlay.ply"
@@ -540,7 +546,7 @@ def test_hierarchy_is_editable_and_metadata_records_provenance_and_timings(
     tmp_path: Path,
 ) -> None:
     points_path, output_dir, result = synthetic_export
-    hierarchy_path = output_dir / "root_hierarchy.json"
+    hierarchy_path = bundle_file(output_dir, "root_hierarchy.json")
     hierarchy = json.loads(hierarchy_path.read_text(encoding="utf-8"))
     assert hierarchy["schema"] == "soyrootbio.root-hierarchy/v1"
     assert all(term in hierarchy["instructions"] for term in ("parent_id", "valid", "polyline"))
@@ -584,7 +590,7 @@ def test_hierarchy_is_editable_and_metadata_records_provenance_and_timings(
     assert len(corrected) == len(result.lateral_paths) - 1
     assert lateral_to_remove["root_id"] not in {root.root_id for root in corrected}
 
-    metadata_text = (output_dir / "metadata.json").read_text(encoding="utf-8")
+    metadata_text = (bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8")
     metadata = json.loads(
         metadata_text,
         parse_constant=lambda token: pytest.fail(f"Non-finite JSON constant in metadata: {token}"),
@@ -595,7 +601,7 @@ def test_hierarchy_is_editable_and_metadata_records_provenance_and_timings(
     assert metadata["config"]["endpoint_file"].endswith("synthetic_root_endpoints.csv")
     assert metadata["primary_detection_method"] == "manual_endpoints_with_optional_sections"
     assert metadata["gravity_vector"] == [0.0, 0.0, -1.0]
-    assert metadata["output_length_unit"] == "mesh_unit"
+    assert metadata["output_length_unit"] == "mm"
     assert metadata["source_geometry"]["geometry_kind"] == "point_cloud"
     assert metadata["point_count"] == result.point_count
     assert metadata["selected_lateral_count"] == len(result.lateral_paths)
@@ -633,18 +639,9 @@ def test_hierarchy_is_editable_and_metadata_records_provenance_and_timings(
     assert timings["total"] >= max(timings[stage] for stage in expected_stages - {"total"})
 
     recorded_outputs = set(metadata["outputs"])
-    assert {
-        "root_system.rsml",
-        "root_hierarchy.json",
-        "traits.xlsx",
-        "segmented_root_structure.ply",
-        *(ANGLE_FIGURES),
-    }.issubset(recorded_outputs)
-    actual_outputs = {
-        str(path.relative_to(output_dir)).replace("\\", "/")
-        for path in output_dir.rglob("*")
-        if path.is_file() and path.name != "metadata.json"
-    }
+    assert {"tables/traits.xlsx", "presentation_root_structure.ply", "primary_points.ply", "lateral_points.ply", "support/root_hierarchy.json",
+            "support/root_system.rsml", *ANGLE_FIGURES}.issubset(recorded_outputs)
+    actual_outputs = {path.relative_to(output_dir).as_posix() for path in output_dir.rglob("*") if path.is_file()}
     assert recorded_outputs == actual_outputs
 
 
@@ -653,8 +650,8 @@ def test_unchanged_exported_hierarchy_round_trip_is_not_reported_as_manual_edit(
     tmp_path: Path,
 ) -> None:
     points_path, output_dir, _ = synthetic_export
-    original_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
-    correction_file = output_dir / "root_hierarchy.json"
+    original_metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8"))
+    correction_file = bundle_file(output_dir, "root_hierarchy.json")
     round_trip_output = tmp_path / "round-trip"
 
     rerun = run_pipeline(
@@ -666,11 +663,11 @@ def test_unchanged_exported_hierarchy_round_trip_is_not_reported_as_manual_edit(
             lateral_max_paths=6,
             max_root_order=2,
             random_seed=11,
-        )
+        mm_per_mesh_unit=1.0)
     )
 
     correction_metadata = json.loads(
-        (round_trip_output / "metadata.json").read_text(encoding="utf-8")
+        (bundle_file(round_trip_output, "metadata.json")).read_text(encoding="utf-8")
     )["hierarchy_correction"]
     exported_ids = {
         root["root_id"]
@@ -681,3 +678,52 @@ def test_unchanged_exported_hierarchy_round_trip_is_not_reported_as_manual_edit(
     assert correction_metadata["applied"] is True
     assert correction_metadata["removed_root_ids"] == []
     assert correction_metadata["manually_changed_root_ids"] == []
+
+
+@pytest.mark.parametrize("value, expected", [
+    (np.nan, "false"), (np.float64(np.nan), "false"), (None, "false"),
+    (pd.NA, "false"), (np.inf, "false"), (1, "false"), ("True", "false"),
+    (False, "false"), (np.bool_(False), "false"),
+    (True, "true"), (np.bool_(True), "true"),
+])
+def test_rsml_unknown_completeness_never_serializes_as_true(tmp_path, value, expected):
+    length, diameter = (1., .2) if expected == "true" else (np.nan, np.nan)
+    traits = pd.DataFrame([{"root_id": "primary", "length": length, "mean_diameter": diameter,
+                            "length_estimate_complete": value, "radius_profile_complete": value}])
+    path = write_rsml(tmp_path / "quality.rsml", np.array([[0., 0., 1.], [0., 0., 0.]]), [], traits,
+                      {"coordinate_unit": "mm"})
+    properties = ET.parse(path).find("./scene/plant/root/properties")
+    if expected == "false":
+        assert properties.find("length").attrib == {"available": "false"}
+        assert properties.find("mean_diameter").attrib == {"available": "false"}
+    assert properties.find("length_estimate_complete").attrib == {"value": expected}
+    assert properties.find("radius_profile_complete").attrib == {"value": expected}
+
+
+def test_rsml_noise_excluded_topology_placeholder_has_unavailable_incomplete_measurements(tmp_path):
+    from soyrootbio.traits import compute_traits
+    points = np.array([[0., 0., 0.], [0., 0., 1.], [0., 0., 2.]])
+    labels = np.zeros(len(points), dtype=int)
+    placeholder = RootPath("noise-parent", np.array([[0., 0., 1.], [50., 0., 1.]]),
+                           qc_flags=["noise_excluded_root"], parent_points=points)
+    traits = compute_traits(points, [placeholder], points, labels == 0, labels,
+                            Normalization(np.zeros(3), 1., 1.), full_points=points, full_root_labels=labels)
+    row = traits.loc[traits.root_id == "noise-parent"].iloc[0]
+    assert np.isnan(row.length_estimate_complete)
+    assert np.isnan(row.radius_profile_complete)
+    path = write_rsml(tmp_path / "placeholder.rsml", points, [placeholder], traits, {"coordinate_unit": "mm"})
+    properties = ET.parse(path).find(".//root[@id='noise-parent']/properties")
+    assert properties.find("length").attrib == {"available": "false"}
+    assert properties.find("mean_diameter").attrib == {"available": "false"}
+    assert properties.find("length_estimate_complete").attrib == {"value": "false"}
+    assert properties.find("radius_profile_complete").attrib == {"value": "false"}
+
+
+def test_rsml_true_quality_cannot_certify_unavailable_corresponding_metric(tmp_path):
+    traits = pd.DataFrame([{"root_id": "primary", "length": np.nan, "mean_diameter": np.nan,
+                            "length_estimate_complete": True, "radius_profile_complete": np.bool_(True)}])
+    path = write_rsml(tmp_path / "unavailable.rsml", np.array([[0., 0., 1.], [0., 0., 0.]]), [], traits,
+                      {"coordinate_unit": "mm"})
+    properties = ET.parse(path).find("./scene/plant/root/properties")
+    assert properties.find("length_estimate_complete").attrib == {"value": "false"}
+    assert properties.find("radius_profile_complete").attrib == {"value": "false"}

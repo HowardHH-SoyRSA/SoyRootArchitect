@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--input", required=True, type=Path, help="Root-only point cloud or mesh exported from VG Studio.")
     run.add_argument("--output", required=True, type=Path, help="Output directory.")
     run.add_argument("--input-mode", choices=INPUT_MODES, default="auto", help="auto prefers native faces, otherwise assumes surface points. Declare occupied_volume explicitly; no mesh is reconstructed.")
+    run.add_argument("--mm-per-mesh-unit", type=float, help="Millimeters per raw mesh unit. Required when the binary STL header has no supported unambiguous declaration; a known header must agree.")
     run.add_argument("--nodule-aware", action="store_true", help="Detect nodule-like mesh bulges and measure them separately; default off.")
     run.add_argument("--noise-reduction", action=argparse.BooleanOptionalAction, default=True,
                      help="Exclude small disconnected native mesh fragments before primary selection; default on. Point-only inputs are retained.")
@@ -64,10 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runtime-limit-minutes", type=float, default=30.0, help="Projected runtime threshold before limited analysis reduction is allowed.")
     run.add_argument("--minimum-retained-fraction", type=float, default=0.25, help="Smallest automatic fraction of source points to retain (0-1); explicit caps take precedence.")
     run.add_argument(
-        "--tip-window-mesh-units",
+        "--tip-window-mm", "--tip-window-mesh-units",
+        dest="tip_window_mm",
         type=float,
         default=2.0,
-        help="Arc-length window, in source mesh units, used for local tip, lateral-start, and primary-reference vectors.",
+        help="Arc-length window in millimeters used for local tip, lateral-start, and primary-reference vectors (legacy flag is an alias).",
     )
 
     synth = subparsers.add_parser("generate-synthetic", help="Write a synthetic taproot point cloud and endpoint file.")
@@ -118,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             input_path=args.input,
             output_dir=args.output,
             input_mode=args.input_mode,
+            mm_per_mesh_unit=args.mm_per_mesh_unit,
             nodule_aware=args.nodule_aware,
             noise_reduction=args.noise_reduction,
             nodule_review_file=args.nodule_review_file,
@@ -135,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
             max_root_order=args.max_root_order,
             runtime_limit_minutes=args.runtime_limit_minutes,
             minimum_retained_fraction=args.minimum_retained_fraction,
-            tip_vector_window_mesh_units=args.tip_window_mesh_units,
+            tip_vector_window_mesh_units=args.tip_window_mm,
         )
         result = run_pipeline(config)
         print(f"Processed {result.point_count} points")

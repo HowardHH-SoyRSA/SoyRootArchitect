@@ -3,8 +3,8 @@
 Local, full-resolution 3D inspection and non-destructive graph editing for
 SoyRootBio result bundles.
 
-The browser renders the labelled PLY through WebGL with the high-performance
-GPU preference. PLY parsing, normal calculation, and the spatial picking index
+The browser renders the labelled PLY through WebGL. Host/browser GPU
+identification and GPU status chips are disabled in this CPU analysis build. PLY parsing, normal calculation, and the spatial picking index
 run in workers. Vertex count is preserved; the UI does not downsample the mesh.
 
 ## Build
@@ -55,4 +55,6 @@ on a separate frontend port, append
 
 The renderer uses the backend-provided float64 render origin before converting
 positions to float32 GPU buffers. Clicked coordinates are converted back to the
-original coordinate system before an edit is submitted.
+bundle coordinate system (mm for calibrated outputs; legacy mesh units otherwise) before an edit is submitted.
+
+New materialized exports retain millimeter units, immutable selected-top metadata, collar exclusions, and fresh read-only native contact/patch audits. Ordinary bundle filenames allow direct reopening. Earlier automatic stage reports are retained as historical provenance and cannot certify edited labels.

@@ -20,11 +20,11 @@ def test_binary_stl_budget_uses_facet_count_and_scales_with_geometry(tmp_path):
         stream.write(bytes(80) + struct.pack('<I', 1_000_000))
         stream.seek(84 + 50 * 1_000_000 - 1)
         stream.write(b'\0')
-    assert estimate_input_memory(small) == 1_932_735_284  # 1.8 GiB, rounded up
-    assert estimate_input_memory(large) > 3.6 * GIB
+    assert estimate_input_memory(small) == 966_367_642  # 0.9 GiB, rounded up
+    assert estimate_input_memory(large) > 1.8 * GIB
 
 
-def test_initial_budgets_are_cut_40_percent_but_observed_peaks_are_not_discounted():
+def test_initial_budgets_are_halved_and_observed_peaks_reserve_five_percent():
     path = Path(__file__).parents[1] / 'docs/benchmarks/memory_admission/recorded_peaks.json'
     records = json.loads(path.read_text())['records']
     assert len(records) == 25
@@ -32,28 +32,35 @@ def test_initial_budgets_are_cut_40_percent_but_observed_peaks_are_not_discounte
     assert any(row['noise_reduction'] for row in records)
     # Freeze the previous policy's budgets independently of the new estimator.
     previous_budgets = {
-        'BaxiNo2_4-2_20260525': 3_221_225_472,
-        'Kaixinlv_3-2_20260525': 5_125_324_208,
-        'SN14_6-2_20260405': 6_686_209_216,
-        'w5168-3_m4-2_20260415': 3_623_159_936,
-        'W82_9cm_water_1-2_20260522': 3_567_491_376,
-        'W82_MS4-2_20260617': 3_674_813_808,
+        'BaxiNo2_4-2_20260525': 1_932_735_284,
+        'Kaixinlv_3-2_20260525': 3_075_194_525,
+        'SN14_6-2_20260405': 4_011_725_530,
+        'w5168-3_m4-2_20260415': 2_173_895_962,
+        'W82_9cm_water_1-2_20260522': 2_140_494_826,
+        'W82_MS4-2_20260617': 2_204_888_285,
     }
     below_recorded_peak = set()
     for row in records:
         budget = estimate_decoded_memory(
             row['full_vertex_count'], row['triangle_count'], row['original_vertex_count'])
-        target = previous_budgets[row['sample']] * 0.6
+        target = previous_budgets[row['sample']] / 2
         assert target <= budget < target + 1, row['source_log']
-        assert observed_memory_budget(row['peak_private_bytes']) >= 1.25 * row['peak_private_bytes']
+        observed_target = 1.05 * row['peak_private_bytes']
+        assert observed_target <= observed_memory_budget(row['peak_private_bytes']) < observed_target + 1
         if budget < row['peak_private_bytes']:
             below_recorded_peak.add(row['sample'])
     # Lower initial estimates no longer claim to cover all historical peaks.
-    assert len(below_recorded_peak) == 5
+    assert len(below_recorded_peak) == 6
+
+
+def test_observed_peak_headroom_rounds_up_without_discounting_actual_usage():
+    for peak, expected in [(-1, 0), (0, 0), (1, 2), (19, 20), (20, 21), (21, 23),
+                           (4 * GIB, 4_509_715_661)]:
+        assert observed_memory_budget(peak) == expected
 
 
 def test_unknown_inputs_keep_fallback_and_stl_raw_records_still_cost_memory(tmp_path):
-    assert estimate_input_memory(tmp_path / 'missing.ply') == 2_576_980_378  # 2.4 GiB
+    assert estimate_input_memory(tmp_path / 'missing.ply') == 1_288_490_189  # 1.2 GiB
     indexed = estimate_decoded_memory(500_000, 1_000_000, 500_000)
     facets = estimate_decoded_memory(500_000, 1_000_000, 3_000_000)
     assert facets > indexed
@@ -77,8 +84,8 @@ def test_live_admission_uses_cpu_ceiling_and_honors_manual_limits():
 
 
 def test_automatic_batch_admits_more_workers_when_free_memory_recovers(tmp_path):
-    state = MemorySnapshot(4 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
-    hardware = HardwareInfo(16, 8, 32 * GIB, available_memory_bytes=4 * GIB)
+    state = MemorySnapshot(3 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
+    hardware = HardwareInfo(16, 8, 32 * GIB, available_memory_bytes=3 * GIB)
     release = threading.Event()
     started = [threading.Event() for _ in range(3)]
     lock = threading.Lock()
@@ -113,10 +120,10 @@ def test_automatic_batch_admits_more_workers_when_free_memory_recovers(tmp_path)
         try:
             assert started[0].wait(3)
             assert not started[1].wait(.35)
-            state = MemorySnapshot(6 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
+            state = MemorySnapshot(4 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
             assert started[1].wait(3)
             assert not started[2].wait(.35)
-            state = MemorySnapshot(8 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
+            state = MemorySnapshot(5 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
             assert started[2].wait(3)
             assert sum(job.started_at is not None for job in jobs) == 3
             assert sum(job.state == BatchJobState.QUEUED for job in jobs) == 1
@@ -127,19 +134,19 @@ def test_automatic_batch_admits_more_workers_when_free_memory_recovers(tmp_path)
         assert peak == 3
 
 
-def test_nine_gib_available_admits_two_smaller_samples_beside_kaixinlv():
+def test_nine_gib_available_admits_five_smaller_samples_beside_kaixinlv():
     # A running Kaixinlv worker occupies 1.5 GiB; the snapshot already excludes
-    # it. The previous budgets admit one w5168-sized neighbor; the cut admits two.
+    # it. Include its recorded private peak with the revised live headroom.
     state = MemorySnapshot(16 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
     gate = MemoryAdmission(lambda: state)
     kai = estimate_decoded_memory(345297, 690590, 345297)
     small = estimate_decoded_memory(171120, 341914, 171120)
     assert gate.try_acquire('kaixinlv', kai)
     state = MemorySnapshot(9 * GIB, 30 * GIB, 32 * GIB, 64 * GIB)
-    gate.update('kaixinlv', int(1.5 * GIB), kai)
-    assert gate.try_acquire('w5168', small)
-    assert gate.try_acquire('third', small)
-    assert not gate.try_acquire('fourth', small)
+    gate.update('kaixinlv', int(1.5 * GIB), observed_memory_budget(2_748_805_120))
+    for i in range(5):
+        assert gate.try_acquire(f'w5168-{i}', small)
+    assert not gate.try_acquire('sixth-neighbor', small)
 
 
 def test_observed_growth_stops_further_admission():
@@ -200,7 +207,7 @@ def test_waiting_for_memory_stays_queued_and_can_be_cancelled(tmp_path):
 
 
 def test_atomic_reservations_prevent_simultaneous_overadmission(tmp_path):
-    state = MemorySnapshot(10 * GIB, 10 * GIB, 32 * GIB, 64 * GIB)
+    state = MemorySnapshot(6 * GIB, 6 * GIB, 32 * GIB, 64 * GIB)
     gate = MemoryAdmission(lambda: state)
     active = peak = 0
     lock = threading.Lock()

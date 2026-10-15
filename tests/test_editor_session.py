@@ -1,4 +1,5 @@
 from __future__ import annotations
+from soyrootbio.bundle_layout import bundle_file, read_bundle_mesh
 
 from hashlib import sha256
 import json
@@ -26,7 +27,7 @@ SOURCE_FILES = (
 
 def test_noise_mask_blocks_assignment_creation_and_survives_editor_export(editor_bundle, tmp_path):
     from soyrootbio.presentation import export_noise_free_presentation
-    mesh = read_labeled_ply(editor_bundle / 'segmented_root_structure.ply')
+    mesh = read_bundle_mesh(editor_bundle)
     mask = np.zeros(mesh.vertex_count, bool); mask[17] = True
     export_noise_free_presentation(editor_bundle, mesh.positions, mesh.triangles,
         colors=mesh.colors/255., root_ids=mesh.root_labels, root_orders=mesh.root_orders,
@@ -48,18 +49,18 @@ def test_noise_mask_blocks_assignment_creation_and_survives_editor_export(editor
     reloaded = EditorSession(editor_bundle, session_dir=tmp_path/'noise-session')
     assert reloaded.mesh.root_labels[17] == -1
     output = reloaded.export_materialised()
-    assert np.load(output/'presentation_noise_masks.npz')['excluded_full_vertices'][17]
-    assert read_labeled_ply(output/'edited_segmented_root_structure.ply').root_labels[17] == -1
+    assert np.load(bundle_file(output, 'presentation_noise_masks.npz'))['excluded_full_vertices'][17]
+    assert read_bundle_mesh(output).root_labels[17] == -1
     assert len(read_labeled_ply(output/'presentation_root_structure.ply').positions) == mesh.vertex_count-1
 
 
 def _add_nodule_candidate(bundle, vertices, label=-3):
     from soyrootbio.nodules import geometry_digest
-    mesh = read_labeled_ply(bundle / "segmented_root_structure.ply")
+    mesh = read_bundle_mesh(bundle)
     obj = {"nodule_id": "nodule-001", "numeric_label": label, "status": "candidate",
            "review_status": "automatic", "vertex_indices": vertices, "vertex_count": len(vertices),
            "geometry_fingerprint": sha256(np.sort(vertices).astype('<i8').tobytes()).hexdigest(), "qc_flags": [], "evidence": {}}
-    (bundle / "nodules.json").write_text(json.dumps({"evidence": {"geometry_sha256": geometry_digest(mesh.positions)}, "objects": [obj]}))
+    (bundle_file(bundle, "nodules.json")).write_text(json.dumps({"evidence": {"geometry_sha256": geometry_digest(mesh.positions)}, "objects": [obj]}))
 
 
 def test_nodule_review_undo_redo_reload_preserves_root_identity(editor_bundle, tmp_path):
@@ -83,11 +84,11 @@ def test_nodule_review_undo_redo_reload_preserves_root_identity(editor_bundle, t
     np.testing.assert_array_equal(reloaded.mesh.root_labels, session.mesh.root_labels)
     assert reloaded.public_state()["nodule_count"] == 1
     exported = reloaded.export_materialised()
-    assert (exported / "nodule_traits.csv").is_file()
-    label_map = pd.read_csv(exported / "edited_root_label_map.csv")
+    assert (bundle_file(exported, "nodule_traits.csv")).is_file()
+    label_map = pd.read_csv(bundle_file(exported, "edited_root_label_map.csv"))
     assert label_map.loc[label_map.numeric_label == -3, "root_id"].tolist() == ["nodule-001"]
-    assert json.loads((exported / "nodule_review.json").read_text())["decisions"][0]["status"] == "accepted"
-    mesh = read_labeled_ply(exported / "edited_segmented_root_structure.ply")
+    assert json.loads((bundle_file(exported, "nodule_review.json")).read_text())["decisions"][0]["status"] == "accepted"
+    mesh = read_bundle_mesh(exported)
     np.testing.assert_array_equal(mesh.colors[9:13], np.tile([255,244,179], (4,1)))
     reloaded.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "rejected"})
     np.testing.assert_array_equal(reloaded.mesh.root_labels, source_labels)
@@ -98,12 +99,40 @@ def test_nodule_review_undo_redo_reload_preserves_root_identity(editor_bundle, t
 def test_nodule_review_preserves_frozen_collar_exclusion(editor_bundle, tmp_path):
     _add_nodule_candidate(editor_bundle, [10, 11, 12])
     excluded = np.zeros(19, bool); excluded[10] = True
-    np.savez(editor_bundle / "ownership_evidence_masks.npz", above_base_excluded=excluded)
+    np.savez(bundle_file(editor_bundle, "ownership_evidence_masks.npz"), above_base_excluded=excluded)
+    mesh = read_bundle_mesh(editor_bundle)
+    mesh.root_labels[10] = -1
+    mesh.assignment_states[10] = 0
+    write_labeled_ply(editor_bundle / "segmented_root_structure.ply", mesh.positions,
+                     triangles=mesh.triangles, colors=mesh.colors/255., root_ids=mesh.root_labels,
+                     root_orders=mesh.root_orders, assignment_states=mesh.assignment_states)
     session = EditorSession(editor_bundle, session_dir=tmp_path / "collar-nodule")
     labels = session.mesh.root_labels.copy()
     with pytest.raises(ValueError, match="above-collar"):
         session.apply_operation("review_nodule", {"nodule_id": "nodule-001", "status": "accepted"})
     np.testing.assert_array_equal(session.mesh.root_labels, labels)
+
+
+def test_editor_collar_assignment_is_rejected_independently_of_nodules(editor_bundle,tmp_path):
+    excluded=np.zeros(19,bool);excluded[17]=True
+    np.savez(bundle_file(editor_bundle, 'ownership_evidence_masks.npz'),above_base_excluded=excluded)
+    session=EditorSession(editor_bundle,session_dir=tmp_path/'collar-only')
+    before=session.mesh.root_labels.copy()
+    with pytest.raises(EditorValidationError,match='Above-collar'):
+        session.apply_operation('assign_points',{'root_id':'root-a','indices':[17]})
+    np.testing.assert_array_equal(session.mesh.root_labels,before)
+
+
+def test_materialization_audits_current_native_higher_order_primary_contact(editor_bundle,tmp_path):
+    session=EditorSession(editor_bundle,session_dir=tmp_path/'native-current')
+    session.apply_operation('assign_points',{'root_id':'root-c','indices':[0]})
+    target=session.export_materialised(tmp_path/'native-export')
+    metadata=json.loads((bundle_file(target, 'metadata.json')).read_text())
+    contact=metadata['higher_order_primary_contact']
+    assert contact['status']=='unresolved_contacts'
+    assert contact['contact_edge_count']>0
+    assert not metadata['final_compliance_audit']['compliant']
+    assert metadata['final_compliance_audit']['higher_order_primary_contact_status']==contact['status']
 
 
 def test_partial_nodule_review_marks_retained_root_measurements_unavailable(editor_bundle, tmp_path):
@@ -129,7 +158,7 @@ def test_nodule_review_cannot_remove_parent_of_supported_descendant(editor_bundl
 
 
 def test_final_fit_gap_and_sparse_body_survive_editor_reload_and_edits(editor_bundle, tmp_path):
-    hierarchy_path = editor_bundle / "root_hierarchy.json"
+    hierarchy_path = bundle_file(editor_bundle, "root_hierarchy.json")
     hierarchy = json.loads(hierarchy_path.read_text())
     for row in hierarchy["roots"]:
         if row["root_id"] == "root-b":
@@ -152,7 +181,7 @@ def test_final_fit_gap_and_sparse_body_survive_editor_reload_and_edits(editor_bu
 
 
 def test_editor_preserves_exposed_body_trait_window(editor_bundle, tmp_path):
-    hierarchy_path = editor_bundle / "root_hierarchy.json"
+    hierarchy_path = bundle_file(editor_bundle, "root_hierarchy.json")
     hierarchy = json.loads(hierarchy_path.read_text())
     row = next(r for r in hierarchy["roots"] if r["root_id"] == "root-b")
     row["body_start_index"] = 1
@@ -318,7 +347,7 @@ def editor_bundle(tmp_path: Path) -> Path:
             "qc_flags": [],
         },
     ]
-    (output_dir / "root_hierarchy.json").write_text(
+    (bundle_file(output_dir, "root_hierarchy.json")).write_text(
         json.dumps(
             {
                 "schema": "soyrootbio.root-hierarchy/v1",
@@ -374,7 +403,7 @@ def editor_bundle(tmp_path: Path) -> Path:
                 "volume_unit": "mesh_unit^3",
             }
         )
-    pd.DataFrame(trait_rows).to_csv(output_dir / "root_traits.csv", index=False)
+    pd.DataFrame(trait_rows).to_csv(bundle_file(output_dir, "root_traits.csv"), index=False)
 
     pd.DataFrame(
         [
@@ -462,7 +491,7 @@ def _new_session(bundle: Path, name: str = "session") -> EditorSession:
 def test_binary_ply_reader_preserves_geometry_faces_and_editor_scalars(
     editor_bundle: Path,
 ) -> None:
-    mesh = read_labeled_ply(editor_bundle / "segmented_root_structure.ply")
+    mesh = read_bundle_mesh(editor_bundle)
 
     assert mesh.vertex_count == 19
     assert mesh.face_count == 8
@@ -527,8 +556,8 @@ def test_public_state_exposes_full_metrics_relationships_and_gpu_policy(
         "redraw_root",
         "correct_root_order",
     ]
-    assert state["hardware"]["discrete_gpu_present"] is True
-    assert state["hardware"]["gpus"][0]["name"] == "Test discrete GPU"
+    assert state["hardware"]["discrete_gpu_present"] is False
+    assert state["hardware"]["gpus"] == []
     assert (
         state["hardware"]["acceleration"]["full_resolution_policy"]
         == "retain unless browser/device allocation fails"
@@ -998,9 +1027,7 @@ def test_created_root_round_trips_through_all_edited_exports(
     export_dir = session.export_materialised(
         session.session_dir / "materialised-create"
     )
-    exported_mesh = read_labeled_ply(
-        export_dir / "edited_segmented_root_structure.ply"
-    )
+    exported_mesh = read_bundle_mesh(export_dir)
     np.testing.assert_array_equal(exported_mesh.root_labels[[17, 18]], [4, -2])
     np.testing.assert_array_equal(exported_mesh.root_orders[[17, 18]], [1, 254])
     np.testing.assert_array_equal(
@@ -1009,16 +1036,16 @@ def test_created_root_round_trips_through_all_edited_exports(
     )
     np.testing.assert_array_equal(exported_mesh.colors[17], [255, 0, 255])
 
-    label_map = pd.read_csv(export_dir / "edited_root_label_map.csv")
+    label_map = pd.read_csv(bundle_file(export_dir, "edited_root_label_map.csv"))
     created_row = label_map.set_index("root_id").loc["root-manual-path"]
     assert int(created_row["numeric_label"]) == 4
     assert created_row["parent_id"] == "primary"
     assert int(created_row["root_order"]) == 1
     assert created_row["color_rgb"] == "255,0,255"
 
-    traits = pd.read_csv(export_dir / "edited_root_traits.csv")
+    traits = pd.read_csv(bundle_file(export_dir, "edited_root_traits.csv"))
     assert "root-manual-path" in set(traits["root_id"])
-    rsml = ET.parse(export_dir / "edited_root_system.rsml")
+    rsml = ET.parse(bundle_file(export_dir, "edited_root_system.rsml"))
     assert (
         rsml.find(
             "./scene/plant/root[@id='primary']/root[@id='root-manual-path']"
@@ -1058,7 +1085,7 @@ def test_operation_log_replay_restores_active_state_and_exact_labels(
 
     events = [
         json.loads(line)
-        for line in (session_dir / "operations.jsonl").read_text(
+        for line in (bundle_file(session_dir, "operations.jsonl")).read_text(
             encoding="utf-8"
         ).splitlines()
     ]
@@ -1273,7 +1300,7 @@ def test_existing_session_rejects_a_changed_automatic_source(
         session_dir=session_dir,
         load_existing_log=False,
     )
-    traits_path = editor_bundle / "root_traits.csv"
+    traits_path = bundle_file(editor_bundle, "root_traits.csv")
     traits_path.write_text(
         traits_path.read_text(encoding="utf-8") + "\n",
         encoding="utf-8",
@@ -1293,7 +1320,7 @@ def test_existing_session_rejects_a_changed_automatic_source(
 def test_editor_reuses_original_angle_window_and_gravity_configuration(
     editor_bundle: Path,
 ) -> None:
-    (editor_bundle / "metadata.json").write_text(
+    (bundle_file(editor_bundle, "metadata.json")).write_text(
         json.dumps(
             {
                 "config": {
@@ -1328,29 +1355,17 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     )
     export_dir = session.export_materialised(tmp_path / "materialised")
 
-    expected_names = {
-        "edited_root_hierarchy.json",
-        "edited_root_label_map.csv",
-        "edited_root_traits.csv",
-        "edited_segmented_root_structure.ply",
-        "edited_root_system.rsml",
-        "operations.jsonl",
-        "blobs",
-        "manifest.json",
-    }
-    assert {path.name for path in export_dir.iterdir()} == expected_names
+    assert {path.name for path in export_dir.iterdir()} == {"tables", "support", "presentation_root_structure.ply", "primary_points.ply", "lateral_points.ply"}
     exported_events = [
         json.loads(line)
-        for line in (export_dir / "operations.jsonl").read_text(
+        for line in (bundle_file(export_dir, "operations.jsonl")).read_text(
             encoding="utf-8"
         ).splitlines()
     ]
     exported_blob = exported_events[0]["operation"]["arguments"]["indices_blob"]
-    assert (export_dir / exported_blob).is_file()
+    assert (export_dir / "support" / exported_blob).is_file()
 
-    exported_mesh = read_labeled_ply(
-        export_dir / "edited_segmented_root_structure.ply"
-    )
+    exported_mesh = read_bundle_mesh(export_dir)
     np.testing.assert_array_equal(
         exported_mesh.root_labels,
         session.mesh.root_labels,
@@ -1362,13 +1377,13 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     np.testing.assert_array_equal(exported_mesh.triangles, session.mesh.triangles)
 
     hierarchy = json.loads(
-        (export_dir / "edited_root_hierarchy.json").read_text(encoding="utf-8")
+        (bundle_file(export_dir, "edited_root_hierarchy.json")).read_text(encoding="utf-8")
     )
     assert hierarchy["baseline_fingerprint"] == session.baseline_fingerprint
     assert {root["root_id"] for root in hierarchy["roots"]} == set(session.roots)
-    traits = pd.read_csv(export_dir / "edited_root_traits.csv")
+    traits = pd.read_csv(bundle_file(export_dir, "edited_root_traits.csv"))
     assert set(traits["root_id"]) == set(session.roots)
-    label_map = pd.read_csv(export_dir / "edited_root_label_map.csv")
+    label_map = pd.read_csv(bundle_file(export_dir, "edited_root_label_map.csv"))
     assert set(label_map["root_id"]) == {
         "uncertain",
         "unassigned",
@@ -1378,7 +1393,7 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
         zip(label_map["root_id"], label_map["numeric_label"], strict=True)
     )["root-a"] == session.roots["root-a"].numeric_label
 
-    rsml = ET.parse(export_dir / "edited_root_system.rsml")
+    rsml = ET.parse(bundle_file(export_dir, "edited_root_system.rsml"))
     assert rsml.findtext("./metadata/unit") == "mesh_unit"
     rsml_roots = {
         element.attrib["id"]
@@ -1389,7 +1404,7 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     assert root_c is not None
 
     manifest = json.loads(
-        (export_dir / "manifest.json").read_text(encoding="utf-8")
+        (bundle_file(export_dir, "manifest.json")).read_text(encoding="utf-8")
     )
     assert manifest["baseline_fingerprint"] == session.baseline_fingerprint
     assert manifest["active_operation_ids"] == ["export-assignment"]
@@ -1418,7 +1433,7 @@ def test_editor_accepts_overlong_child_with_warning_and_exact_history(editor_bun
     reloaded = EditorSession(editor_bundle, session_dir=session.session_dir)
     assert _materialised_snapshot(reloaded) == after
     export_dir = session.export_materialised(tmp_path / "overlong-export")
-    hierarchy = json.loads((export_dir / "edited_root_hierarchy.json").read_text())
+    hierarchy = json.loads((bundle_file(export_dir, "edited_root_hierarchy.json")).read_text())
     exported_child = next(row for row in hierarchy["roots"] if row["root_id"] == "root-c")
     assert "child_longer_than_parent" in exported_child["qc_flags"]
     assert _file_digests(editor_bundle) == source_before
@@ -1432,6 +1447,47 @@ def test_editor_accepts_overlong_child_with_warning_and_exact_history(editor_bun
         operation_id="resolve-length-warning",
     )
     assert "child_longer_than_parent" not in session.roots["root-c"].qc_flags
+
+
+def _historical_length_review_bundle(bundle):
+    hierarchy=json.loads((bundle_file(bundle, 'root_hierarchy.json')).read_text(encoding='utf-8'))
+    flags=['historical_before','child_longer_than_parent','historical_after']
+    for row in hierarchy['roots']:
+        if row['root_id']=='root-c':
+            row['qc_flags']=flags.copy()
+            row['centerline_assessment']={'status':'partial_support','fit_qc_passed':False}
+        elif row['root_id']=='root-a':
+            row['centerline_assessment']={'status':'no_support','traits_geometry_source':'retained_prior','fit_qc_passed':False}
+    (bundle_file(bundle, 'root_hierarchy.json')).write_text(json.dumps(hierarchy),encoding='utf-8')
+    traits=pd.read_csv(bundle_file(bundle, 'root_traits.csv'))
+    traits['qc_flags']=traits['qc_flags'].astype(object)
+    traits.loc[traits.root_id=='root-a','length']=np.nan
+    traits.loc[traits.root_id=='root-c','qc_flags']=';'.join(flags)
+    traits.to_csv(bundle_file(bundle, 'root_traits.csv'),index=False)
+    return flags
+
+
+def test_read_reopen_and_noop_export_preserve_historical_long_child_qc(editor_bundle,tmp_path):
+    expected=_historical_length_review_bundle(editor_bundle)
+    source_before=_file_digests(editor_bundle)
+    session=EditorSession(editor_bundle,session_dir=tmp_path/'historical-review')
+    assert session.roots['root-c'].qc_flags==expected
+    assert session.roots['root-a'].traits['length'] is None
+    target=session.export_materialised(tmp_path/'historical-export')
+    row=next(row for row in json.loads((bundle_file(target, 'root_hierarchy.json')).read_text())['roots'] if row['root_id']=='root-c')
+    assert row['qc_flags']==expected
+    reopened=EditorSession(target,session_dir=tmp_path/'historical-reopened')
+    assert reopened.roots['root-c'].qc_flags==expected
+    assert _file_digests(editor_bundle)==source_before
+
+
+def test_unrelated_label_edit_does_not_discharge_historical_long_child_qc(editor_bundle,tmp_path):
+    expected=_historical_length_review_bundle(editor_bundle)
+    session=EditorSession(editor_bundle,session_dir=tmp_path/'unrelated-review')
+    session.apply_operation('assign_points',{'root_id':'root-b','indices':[17]})
+    assert session.roots['root-c'].qc_flags==expected
+    session.undo();session.redo()
+    assert session.roots['root-c'].qc_flags==expected
 
 
 def test_editor_rejects_new_higher_order_origin_above_primary_top_atomically(

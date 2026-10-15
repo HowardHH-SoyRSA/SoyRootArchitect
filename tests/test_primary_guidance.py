@@ -42,7 +42,7 @@ def test_guidance_round_trip_keeps_source_precision_and_order(tmp_path: Path) ->
     start, end = pipeline.read_endpoint_file(path)
     np.testing.assert_array_equal(start, selected.start)
     np.testing.assert_array_equal(end, selected.end)
-    config = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "out", guide_file=path)
+    config = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "out", guide_file=path, mm_per_mesh_unit=1.0)
     np.testing.assert_array_equal(pipeline._read_primary_guides(config), selected.guides)
 
 
@@ -94,7 +94,7 @@ def test_pipeline_saves_manual_guidance_before_loading_geometry(tmp_path: Path, 
     config = pipeline.PipelineConfig(
         Path("root.ply"), tmp_path / "manual-output",
         endpoint_file=source_file, guide_file=source_file, soil_z=selected.soil_z,
-    )
+    mm_per_mesh_unit=1.0)
 
     def stop_loading(*args, **kwargs):
         raise RuntimeError("test stopped after saving guidance")
@@ -106,7 +106,7 @@ def test_pipeline_saves_manual_guidance_before_loading_geometry(tmp_path: Path, 
     np.testing.assert_array_equal(loaded.start, selected.start)
     np.testing.assert_array_equal(loaded.guides, selected.guides)
 
-    automatic = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "automatic-output", auto_endpoints="z")
+    automatic = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "automatic-output", auto_endpoints="z", mm_per_mesh_unit=1.0)
     with pytest.raises(RuntimeError, match="test stopped"):
         pipeline.run_pipeline(automatic)
     assert not (automatic.output_dir / PRIMARY_GUIDANCE_FILENAME).exists()
@@ -115,7 +115,7 @@ def test_pipeline_saves_manual_guidance_before_loading_geometry(tmp_path: Path, 
 def test_pipeline_uses_the_saved_snapshot_not_reread_files(tmp_path: Path, monkeypatch) -> None:
     selected = _guidance()
     source_file = write_primary_guidance(tmp_path / "selected.json", selected, input_path="root.ply")
-    config = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "out", endpoint_file=source_file, guide_file=source_file)
+    config = pipeline.PipelineConfig(Path("root.ply"), tmp_path / "out", endpoint_file=source_file, guide_file=source_file, mm_per_mesh_unit=1.0)
     snapshot = pipeline._manual_primary_guidance(config)
     source_file.unlink()
     received = {}

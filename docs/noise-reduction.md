@@ -1,7 +1,7 @@
 # Noise reduction before primary selection
 
 The **Noise reduction** checkbox is on by default in the batch GUI and legacy
-single-sample launcher. It applies when opening the endpoint/soil-line picker
+single-sample launcher. It applies when opening the endpoint/section picker
 and when processing a sample with recorded or automatic primary guidance.
 The CLI accepts `--noise-reduction` (default) and `--no-noise-reduction`.
 The corresponding `PipelineConfig` field is `noise_reduction`.

@@ -11,6 +11,12 @@ import numpy as np
 class Normalization:
     minimum: np.ndarray
     scale: float
+    mm_per_mesh_unit: float | None = None
+
+    def __post_init__(self):
+        if self.mm_per_mesh_unit is not None:
+            from .units import validate_scale
+            object.__setattr__(self, "mm_per_mesh_unit", validate_scale(self.mm_per_mesh_unit))
 
     def transform_points(self, points: np.ndarray) -> np.ndarray:
         return (points - self.minimum) / self.scale
@@ -25,6 +31,44 @@ class Normalization:
         """Restore a normalized length to the source mesh coordinate unit."""
 
         return float(length * self.scale)
+
+    @property
+    def coordinate_unit(self) -> str:
+        return "mm" if self.mm_per_mesh_unit is not None else "mesh_unit"
+
+    @property
+    def output_scale(self) -> float:
+        return self.scale * (self.mm_per_mesh_unit if self.mm_per_mesh_unit is not None else 1.)
+
+    def source_to_output_points(self, points: np.ndarray) -> np.ndarray:
+        """Convert raw source arrays to canonical output coordinates without mutation."""
+        return np.asarray(points) * (self.mm_per_mesh_unit if self.mm_per_mesh_unit is not None else 1.)
+
+    def to_output_points(self, points: np.ndarray) -> np.ndarray:
+        """Convert normalized coordinates to mm, or legacy mesh units."""
+        return self.source_to_output_points(self.inverse_points(points))
+
+    def from_output_points(self, points: np.ndarray) -> np.ndarray:
+        raw = np.asarray(points) / (self.mm_per_mesh_unit if self.mm_per_mesh_unit is not None else 1.)
+        return self.transform_points(raw)
+
+    def to_output_length(self, length: float) -> float:
+        return float(length * self.output_scale)
+
+    def to_mm_points(self, points: np.ndarray) -> np.ndarray:
+        if self.mm_per_mesh_unit is None:
+            raise ValueError("Millimeter coordinates require explicit calibration")
+        return self.to_output_points(points)
+
+    def from_mm_points(self, points: np.ndarray) -> np.ndarray:
+        if self.mm_per_mesh_unit is None:
+            raise ValueError("Millimeter coordinates require explicit calibration")
+        return self.from_output_points(points)
+
+    def to_mm_length(self, length: float) -> float:
+        if self.mm_per_mesh_unit is None:
+            raise ValueError("Millimeter lengths require explicit calibration")
+        return self.to_output_length(length)
 
 
 @dataclass

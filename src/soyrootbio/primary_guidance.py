@@ -20,6 +20,17 @@ class PrimaryGuidance:
     soil_z: float | None
     guides: np.ndarray
     use_endpoints: bool = True
+    coordinate_unit: str = "mesh_unit"
+
+    def in_unit(self, unit: str, mm_per_mesh_unit: float) -> "PrimaryGuidance":
+        if unit not in {"mm", "mesh_unit"} or self.coordinate_unit not in {"mm", "mesh_unit"}:
+            raise ValueError("Unsupported primary guidance coordinate unit")
+        if self.coordinate_unit == unit:
+            return self
+        factor = mm_per_mesh_unit if unit == "mm" else 1. / mm_per_mesh_unit
+        return PrimaryGuidance(self.start * factor, self.end * factor,
+                               None if self.soil_z is None else self.soil_z * factor,
+                               self.guides * factor, self.use_endpoints, unit)
 
 
 def _coordinates(value, name: str, *, multiple: bool = False) -> np.ndarray:
@@ -62,7 +73,9 @@ def _validated_guidance(guidance: PrimaryGuidance) -> PrimaryGuidance:
             raise ValueError("Soil-line Z must be a finite number.") from exc
         if not np.isfinite(soil_z):
             raise ValueError("Soil-line Z must be a finite number.")
-    return PrimaryGuidance(start, end, soil_z, guides, guidance.use_endpoints)
+    if guidance.coordinate_unit not in {"mm", "mesh_unit"}:
+        raise ValueError("Unsupported primary guidance coordinate unit")
+    return PrimaryGuidance(start, end, soil_z, guides, guidance.use_endpoints, guidance.coordinate_unit)
 
 
 def write_primary_guidance(
@@ -71,22 +84,25 @@ def write_primary_guidance(
     *,
     input_path: str | Path,
     overwrite: bool = True,
+    unit_calibration: dict | None = None,
 ) -> Path:
     """Save endpoints and ordered guides together without external references."""
 
     selected = _validated_guidance(guidance)
     payload = {
         "schema": PRIMARY_GUIDANCE_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2 if selected.coordinate_unit == "mm" else 1,
         "input_path": str(input_path),
         "coordinate_space": "source",
-        "coordinate_unit": "mesh_unit",
+        "coordinate_unit": selected.coordinate_unit,
         "start": selected.start.tolist(),
         "end": selected.end.tolist(),
         "guides": selected.guides.tolist(),
         "soil_z": selected.soil_z,
         "use_endpoints": selected.use_endpoints,
     }
+    if unit_calibration is not None:
+        payload["unit_calibration"] = unit_calibration
     serialized = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -109,9 +125,10 @@ def read_primary_guidance(
     payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict) or payload.get("schema") != PRIMARY_GUIDANCE_SCHEMA:
         raise ValueError("Choose an exported primary_guidance.json selection file.")
-    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] not in {1, 2}:
         raise ValueError("Unsupported primary guidance schema version.")
-    if payload.get("coordinate_space") != "source" or payload.get("coordinate_unit") != "mesh_unit":
+    expected_unit = "mesh_unit" if payload["schema_version"] == 1 else "mm"
+    if payload.get("coordinate_space") != "source" or payload.get("coordinate_unit") != expected_unit:
         raise ValueError("Primary guidance must use original source mesh coordinates.")
     if expected_input is not None:
         source = payload.get("input_path")
@@ -130,5 +147,6 @@ def read_primary_guidance(
             soil_z=payload.get("soil_z"),
             guides=payload.get("guides"),
             use_endpoints=payload.get("use_endpoints", True),
+            coordinate_unit=expected_unit,
         )
     )

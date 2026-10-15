@@ -1,3 +1,4 @@
+from soyrootbio.bundle_layout import bundle_file, read_bundle_mesh
 import json
 from pathlib import Path
 
@@ -31,7 +32,7 @@ def tube_mesh(bulge=False):
 
 
 def test_default_off_and_cli_explicit_opt_in():
-    assert not PipelineConfig(Path('input'), Path('output')).nodule_aware
+    assert not PipelineConfig(Path('input'), Path('output'), mm_per_mesh_unit=1.0).nodule_aware
     parser = build_parser()
     assert not parser.parse_args(['run','--input','a','--output','b']).nodule_aware
     assert parser.parse_args(['run','--input','a','--output','b','--nodule-aware']).nodule_aware
@@ -115,8 +116,8 @@ def test_nodule_pipeline_keeps_primary_and_exports_separate_objects(tmp_path):
     source=tmp_path/'bulge.ply'
     write_labeled_ply(source,p,triangles=f)
     result=run_pipeline(PipelineConfig(source,tmp_path/'out',start=(0,0,5),end=(0,0,-5),
-                                       nodule_aware=True,max_root_order=1,worker_threads=1))
-    document=json.loads((tmp_path/'out/nodules.json').read_text())
+                                       nodule_aware=True,max_root_order=1,worker_threads=1, mm_per_mesh_unit=1.0))
+    document=json.loads((tmp_path/'out/support/nodules.json').read_text())
     assert document['accepted_count']>=1
     assert np.any(result.full_root_labels<=-3)
     assert np.all(result.full_root_labels[result.full_above_base_mask]==-1)
@@ -127,9 +128,9 @@ def test_nodule_pipeline_keeps_primary_and_exports_separate_objects(tmp_path):
     assert np.ptp(result.primary_path[:,2])*result.normalization.scale>9
     assert not result.traits.root_id.str.startswith('nodule').any()
     assert result.traits.attrs['system_summary']['nodule_excluded_from_root_totals']
-    mesh=read_labeled_ply(tmp_path/'out/segmented_root_structure.ply')
+    mesh=read_bundle_mesh(tmp_path/'out')
     np.testing.assert_array_equal(mesh.positions,p)
     np.testing.assert_array_equal(mesh.triangles,f)
     assert set(mesh.assignment_states[mesh.root_labels<=-3])=={3}
-    book=pd.ExcelFile(tmp_path/'out/traits.xlsx')
-    assert {'Nodules','Nodule summary','Nodule depth'}<=set(book.sheet_names)
+    book=pd.ExcelFile(tmp_path/'out/tables/traits.xlsx')
+    assert {'nodule_traits','nodule_summary','nodule_depth_distribution'}<=set(book.sheet_names)
