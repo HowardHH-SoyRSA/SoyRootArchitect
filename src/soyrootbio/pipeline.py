@@ -43,6 +43,8 @@ from .fork_recovery import recover_unassigned_fork_arms
 from .recovered_children import recover_children_on_extensions
 from .junction_transections import trim_primary_junctions
 from .junction_tubes import reconcile_parent_owned_tubes
+from .tube_tracking import reconcile_shared_o1_tubes
+from .native_growth import NativeStepGuard
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
     _polyline_projection_distance_and_arc,
@@ -1624,9 +1626,9 @@ def _run_pipeline_impl(
             "overlong_child_reexamination_penalty_max": CHILD_PARENT_LENGTH_PENALTY_MAX,
             "overlong_child_reexamination_penalty_formula": "0.05 * max(0, 1 - parent_length / child_length)",
             "junction_review_score_weights": {
-                "direction_continuity": 0.45,
+                "direction_continuity": 0.55,
                 "fork_evidence": 0.35,
-                "sustained_continuation_length": 0.20,
+                "sustained_continuation_length": 0.10,
             },
             "post_fit_length_violation_action": "QC_flag_preserve_final_ownership_and_hierarchy",
             "overlong_child_alternative_parent_resurvey": True,
@@ -1948,6 +1950,15 @@ def _trace_lateral_orders(
         if max_paths is not None and len(selected_all) >= max_paths:
             break
         order_candidates: list[RootPath] = []
+        native_step_guard = None
+        if (mesh_context is not None and mesh_context.triangles is not None
+                and len(mesh_context.triangles)):
+            native_step_guard = NativeStepGuard(
+                mesh_context, points, analysis_to_mesh, occupied_mask,
+                (mesh_excluded_mask if mesh_excluded_mask is not None
+                 else np.zeros(len(mesh_context.points), bool)), d_bar)
+            origin_constraint.setdefault("native_growth", []).append(
+                {"order": order, "evidence": native_step_guard.report})
         order_starts = 0
         order_candidate_count = 0
         order_parent_tracking_rejections = 0
@@ -2090,6 +2101,7 @@ def _trace_lateral_orders(
                 parent_path,
                 occupied_mask,
                 d_bar=d_bar,
+                native_step_guard=native_step_guard,
                 max_steps=max_steps,
                 parent_radius_profile=parent_radius_profile,
                 ancestor_exclusion_mask=(
@@ -2166,6 +2178,15 @@ def _trace_lateral_orders(
             )
             break
         reduced = reduce_similar_paths(order_candidates)
+        if order == 1:
+            origin_constraint["native_tube_identity"] = reconcile_shared_o1_tubes(
+                reduced, points, primary_mask, context=mesh_context,
+                analysis_to_mesh=analysis_to_mesh,
+                excluded=(mesh_excluded_mask if mesh_excluded_mask is not None
+                          else np.zeros(len(mesh_points), dtype=bool)
+                          if mesh_points is not None else np.zeros(0, dtype=bool)),
+                spacing=d_bar, cooperate=cooperate,
+            )
         remaining = None if max_paths is None else max(0, max_paths - len(selected_all))
         existing_order_support: set[int] = set()
         for existing in selected_all:
@@ -2249,7 +2270,8 @@ def _trace_lateral_orders(
                 covered = np.asarray(sorted(traced.covered_indices), dtype=int)
                 covered = covered[(covered >= 0) & (covered < len(points))]
                 local_mask[covered] = True
-                if np.count_nonzero(local_mask) >= 30:
+                if (np.count_nonzero(local_mask) >= 30
+                        and traced.score_components.get("native_tube_identity_corrected", 0) <= 0):
                     centered = refine_primary_centerline(
                         points,
                         local_mask,
@@ -2305,6 +2327,11 @@ def _trace_lateral_orders(
         for traced in refined:
             if traced.score_components.get("parent_tracking_rejected", 0.0) > 0.0:
                 continue
+            if traced.score_components.get("native_tube_identity_corrected", 0.0) > 0.0:
+                # Native contours already followed the supported tube to its
+                # endpoint/contact. A broad point-neighborhood extension here
+                # could immediately consume the sibling's distal body again.
+                continue
             resume_lateral_tip_in_batches(
                 points,
                 traced,
@@ -2312,6 +2339,7 @@ def _trace_lateral_orders(
                 d_bar,
                 point_tree=extension_tree,
                 cooperate=cooperate,
+                native_step_guard=native_step_guard,
             )
             if traced.score_components.get("tip_continuation_accepted", 0.0) <= 0.0:
                 continue

@@ -90,6 +90,7 @@ class _TraceCheckpoint:
     covered_recovery_steps: int
     previous_turn_degrees: float
     travel_fractions: tuple[float, ...]
+    native_anchor_index: int | None = None
 
 
 class _TraceEvidenceCache:
@@ -914,6 +915,7 @@ def grow_lateral_candidates(
     point_tree: cKDTree | None = None,
     parent_tree: cKDTree | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    native_step_guard=None,
 ) -> list[RootPath]:
     if not starts:
         return []
@@ -1008,6 +1010,7 @@ def grow_lateral_candidates(
                         density_support_index=novel_support_index,
                         cooperate=cooperate,
                         evidence_cache=evidence_cache,
+                        native_step_guard=native_step_guard,
                     )
                     hypothesis_group = (
                         f"{start.start_id}:{direction_label}:"
@@ -1030,6 +1033,10 @@ def grow_lateral_candidates(
                             support_mask=None,
                             source_indices=novel_support_index.source_indices,
                         )
+                        if native_step_guard is not None:
+                            # Nearby disconnected walls cannot inflate a path's
+                            # novelty score or consume a competing root's body.
+                            path.novel_support_indices &= path.covered_indices
                         path.score_components["novel_density_support"] = float(
                             len(path.novel_support_indices)
                         )
@@ -1098,6 +1105,7 @@ def _grow_candidate_hypotheses(
     cooperate: Callable[[], None] | None,
     replay_from_checkpoint: bool = True,
     evidence_cache: _TraceEvidenceCache | None = None,
+    native_step_guard=None,
 ) -> list[RootPath]:
     """Trace the default route plus one sustained recent-fork alternative.
 
@@ -1134,6 +1142,7 @@ def _grow_candidate_hypotheses(
         fork_observations=observations,
         fork_checkpoints=checkpoints,
         evidence_cache=evidence_cache,
+        native_step_guard=native_step_guard,
     )
     base_steps = max(0, len(base.points) - 2)
     recent_window = max(6, min(14, int(np.ceil(0.25 * max(base_steps, 1)))))
@@ -1187,6 +1196,7 @@ def _grow_candidate_hypotheses(
                 checkpoints.get(fork_step) if checkpoints is not None else None
             ),
             evidence_cache=evidence_cache,
+            native_step_guard=native_step_guard,
         )
         common_prefix = _common_prefix_node_count(
             base.points,
@@ -1377,6 +1387,7 @@ def _grow_one_candidate(
     fork_checkpoints: dict[int, _TraceCheckpoint] | None = None,
     resume_checkpoint: _TraceCheckpoint | None = None,
     evidence_cache: _TraceEvidenceCache | None = None,
+    native_step_guard=None,
 ) -> RootPath:
     """Grow one trace and optionally record or force supported fork choices."""
 
@@ -1392,6 +1403,12 @@ def _grow_one_candidate(
         np.asarray(start.point, dtype=float).copy(),
     ]
     current = nodes[-1].copy()
+    current_analysis_index = None
+    members = np.asarray(start.member_indices, int)
+    if len(members):
+        nearest = int(members[np.argmin(np.linalg.norm(points[members] - current, axis=1))])
+        if np.array_equal(points[nearest], current):
+            current_analysis_index = nearest
     direction = initial
     covered_mask = np.zeros(len(points), dtype=bool)
     selected_mask = np.zeros(len(points), dtype=bool)
@@ -1422,6 +1439,7 @@ def _grow_one_candidate(
     covered_recovery_steps = 0
     previous_turn_degrees = 0.0
     travel_fractions: list[float] = []
+    native_rejections = 0
     first_step = 0
     if resume_checkpoint is not None:
         state = resume_checkpoint
@@ -1443,6 +1461,7 @@ def _grow_one_candidate(
         covered_recovery_steps = state.covered_recovery_steps
         previous_turn_degrees = state.previous_turn_degrees
         travel_fractions = list(state.travel_fractions)
+        current_analysis_index = state.native_anchor_index
         if cooperate is not None:
             cooperate()
 
@@ -1459,6 +1478,15 @@ def _grow_one_candidate(
         local = np.asarray(nearby_indices, dtype=int)
         if len(local):
             local = local[allowed[local]]
+        if len(local) and native_step_guard is not None:
+            reachable = native_step_guard.reachable(
+                current, local, search_radius,
+                junction_origin=(start.primary_point if np.linalg.norm(current - start.point)
+                                 <= 2 * search_radius else None),
+                junction_seed=start.point,
+                analysis_anchor=current_analysis_index)
+            native_rejections += int(np.count_nonzero(~reachable))
+            local = local[reachable]
         if len(local) < max(1, int(minimum_local_support)):
             break
 
@@ -1648,6 +1676,7 @@ def _grow_one_candidate(
                         covered_recovery_steps=pre_step_recovery,
                         previous_turn_degrees=previous_turn_degrees,
                         travel_fractions=tuple(travel_fractions),
+                        native_anchor_index=current_analysis_index,
                     )
                 fork_observations.append(
                     {
@@ -1729,6 +1758,7 @@ def _grow_one_candidate(
             1e-12,
         )
         current = next_point
+        current_analysis_index = next_index
         nodes.append(current.copy())
         selected_mask[next_index] = True
         local_covered = point_tree.query_ball_point(
@@ -1749,6 +1779,13 @@ def _grow_one_candidate(
             ]
         if len(local_covered_array):
             local_covered_array = local_covered_array[allowed[local_covered_array]]
+        if len(local_covered_array) and native_step_guard is not None:
+            local_covered_array = local_covered_array[native_step_guard.reachable(
+                current, local_covered_array, .90 * float(search_radius),
+                junction_origin=(start.primary_point if np.linalg.norm(current - start.point)
+                                 <= 1.8 * search_radius else None),
+                junction_seed=start.point,
+                analysis_anchor=current_analysis_index)]
         if len(local_covered_array):
             newly_covered = local_covered_array[~covered_mask[local_covered_array]]
             covered_mask[local_covered_array] = True
@@ -1826,6 +1863,7 @@ def _grow_one_candidate(
             "trace_cumulative_score": float(cumulative_score),
             "trace_rank_score": trace_rank_score,
             "adaptive_travel_fallback_steps": float(fallback_steps),
+            "native_growth_rejected_proposals": float(native_rejections),
             "adaptive_travel_covered_recovery_steps": float(
                 covered_recovery_steps
             ),
@@ -1888,6 +1926,7 @@ def extend_lateral_tip(
     min_support: int = 4,
     point_tree: cKDTree | None = None,
     cooperate: Callable[[], None] | None = None,
+    native_step_guard=None,
 ) -> RootPath:
     """Continue a selected path when dense unclaimed support exists ahead.
 
@@ -1962,6 +2001,7 @@ def extend_lateral_tip(
         max_turn_degrees=45.0,
         minimum_local_support=min_support,
         cooperate=cooperate,
+        native_step_guard=native_step_guard,
     )
     appended = np.asarray(candidate.points[2:], dtype=float)
     candidate_extension_length = 0.0
@@ -2011,6 +2051,7 @@ def resume_lateral_tip_in_batches(
     min_support: int = 4,
     point_tree: cKDTree | None = None,
     cooperate: Callable[[], None] | None = None,
+    native_step_guard=None,
 ) -> RootPath:
     """Resume supported growth in bounded, ownership-safe batches.
 
@@ -2052,6 +2093,7 @@ def resume_lateral_tip_in_batches(
             min_support=min_support,
             point_tree=tree,
             cooperate=cooperate,
+            native_step_guard=native_step_guard,
         )
         accepted = bool(
             path.score_components.get("tip_continuation_accepted", 0.0)
@@ -2489,6 +2531,8 @@ def select_non_overlapping_paths(
         best_path = None
         best_value = 0.0
         for path in pool:
+            if path.score_components.get("native_identity_conflict_unresolved", 0) > 0:
+                continue
             if any(duplicate(path, retained) for retained in selected):
                 continue
             covered = support[id(path)]

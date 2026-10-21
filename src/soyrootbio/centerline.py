@@ -40,7 +40,7 @@ POLICY = {
     "minimum_section_points": 8,
     "smoothing_neighbor_weight": 0.125,
     "smoothing_max_displacement_spacing": 0.25,
-    "component_policy": "largest_connected_support_no_bridges",
+    "component_policy": "origin_supported_lateral_component_no_bridges",
     "sparse_policy": "longest_contiguous_measurable_body_or_single_location",
     "tip_policy": "assigned_terminal_sections_no_extrapolation",
     "connector_policy": "owned_junction_transverse_hulls_no_free_space_bridges",
@@ -901,6 +901,39 @@ def _retained_attachment_prefix(old, body, support, child_hints, top_reference, 
     return line, body_start, join_gap
 
 
+def _origin_supported_component(cloud, components, old, root, spacing):
+    """Choose an independently supported early body rather than a large tail.
+
+    Require several separated prior stations on one component. A tiny isolated
+    patch beside the origin cannot displace a supported exposed body. Ambiguous
+    evidence is reported and does not manufacture an attachment.
+    """
+    sizes = np.bincount(components)
+    largest = int(np.argmax(sizes))
+    if root is None or len(sizes) == 1:
+        return largest, "single_or_primary_component"
+    line = resample_polyline(old, 2 * spacing)
+    # Search only the established early body, not a distal tail selected by size.
+    line = line[:21]
+    evidence = []
+    for component, size in enumerate(sizes):
+        if size < 8:
+            continue
+        distance = cKDTree(cloud[components == component]).query(line)[0]
+        hits = np.flatnonzero(distance <= 4 * spacing)
+        axis = line[hits[-1]] - line[hits[0]] if len(hits) > 1 else np.zeros(3)
+        axis /= max(np.linalg.norm(axis), 1e-12)
+        extent = np.ptp(cloud[components == component] @ axis)
+        if len(hits) >= 3 and np.any(np.diff(hits) == 1) and extent >= 4 * spacing:
+            evidence.append((int(hits[0]), float(np.median(distance[hits[:3]])), component))
+    evidence.sort()
+    if not evidence:
+        return largest, "origin_component_unresolved"
+    if len(evidence) > 1 and evidence[1][0] <= evidence[0][0] + 2:
+        return largest, "origin_component_ambiguous"
+    return evidence[0][2], "early_body_supported_component"
+
+
 def refit_final_centerlines(
     points: np.ndarray, labels: np.ndarray, primary: np.ndarray,
     roots: list[RootPath], *, d_bar: float, triangles: np.ndarray | None = None,
@@ -1023,7 +1056,12 @@ def refit_final_centerlines(
             graph = ownership.local_graph(label, edges)
             count, components = connected_components(graph, directed=False)
             sizes = np.bincount(components)
-            keep = components == int(np.argmax(sizes))
+            selected_component, component_decision = _origin_supported_component(
+                cloud, components, old, root, d_bar)
+            keep = components == selected_component
+            detail.update(component_selection=component_decision,
+                          selected_component=int(selected_component),
+                          largest_component=int(np.argmax(sizes)))
             support = cloud[keep]
             # Full resolution spacing, bounded by the analysis spacing. This
             # prevents a reduced analysis cloud from producing wide bend slabs.
@@ -1090,6 +1128,14 @@ def refit_final_centerlines(
                     body, fit_report = _fit_body(support, initial, spacing)
                 detail.update(fit_report)
                 flags.extend(fit_report.get("qc_flags", []))
+            if root is not None and count > 1:
+                # A good local fit does not certify a disconnected identity.
+                detail["identity_qc_passed"] = False
+                if component_decision.startswith("origin_component_"):
+                    flags.append("centerline_origin_component_unresolved")
+                    detail.update(fit_qc_passed=False, exposed_body_supported=False)
+                elif selected_component != int(np.argmax(sizes)):
+                    flags.append("centerline_disconnected_distal_identity_review")
         if nodule_labels is not None and len(indices) and detail.get("component_count", 0) > 1:
             native_nodules = np.asarray(nodule_labels)
             crossing = edges[((labels[edges[:, 0]] == label) & (native_nodules[edges[:, 1]] <= -3))
