@@ -22,6 +22,10 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite an existing output: {output}")
     source = json.loads(bundle_file(bundle, "metadata.json").read_text(encoding="utf-8"))
     config = dict(source["config"])
+    # Calibrated exports use the canonical field name; the runtime retains
+    # its compatibility name. Both express the already calibrated window.
+    if "tip_vector_window_mm" in config:
+        config["tip_vector_window_mesh_units"] = config.pop("tip_vector_window_mm")
     config["input_path"] = Path(config["input_path"])
     config["output_dir"] = output
     for key in ("endpoint_file", "guide_file", "correction_file"):

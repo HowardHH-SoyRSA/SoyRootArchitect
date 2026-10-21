@@ -37,6 +37,7 @@ from .ownership_ledger import (
 )
 from .mesh_geometry import MeshGeometryContext
 from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
+from .attachment_review import connected_body_evidence, review_basal_attachments
 from .primary_surface import reconcile_primary_surface_tracks
 from .fork_recovery import recover_unassigned_fork_arms
 from .recovered_children import recover_children_on_extensions
@@ -1134,7 +1135,36 @@ def _run_pipeline_impl(
         reference_limits=(tube_claim_limits(surface_reference, full_root_labels, selected, full_nonroot_mask)
                           if surface_reference is not None else None),
     )
+    # Tube cleanup can separate a misleading basal patch from its supposed
+    # parent's exposed body. Review this new snapshot before child hints can
+    # veto a supported fit. Explicit reviewed constraints retain their own
+    # later specimen-bound reconciliation.
+    basal_attachment_report = {'status': 'retained_explicit_correction',
+                               'changed_parent_count': 0, 'changed_vertex_count': 0,
+                               'decisions': []}
+    if config.correction_file is None and surface_reference is None:
+        full_root_labels, selected, basal_attachment_report = review_basal_attachments(
+            full_normalized, full_root_labels, primary.points, selected,
+            d_bar=d_bar, triangles=cloud.triangles, mesh_context=mesh_context,
+            excluded_mask=full_nonroot_mask, primary_top_reference=primary_top_reference,
+            gravity=config.gravity,
+        )
+    if basal_attachment_report['changed_parent_count']:
+        reviewed_ids = {row['root_id'] for row in basal_attachment_report['decisions']
+                        if row['status'] == 'reparented_measured_native_body'}
+        full_root_labels, reviewed_tubes = reconcile_parent_owned_tubes(
+            full_normalized, full_root_labels, primary.points, selected,
+            d_bar=d_bar, triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
+            mesh_context=mesh_context, review_root_ids=reviewed_ids,
+        )
+        child_tube_report['after_parent_review'] = reviewed_tubes
+        child_tube_report['transferred_vertex_count'] += reviewed_tubes['transferred_vertex_count']
+        child_tube_report['changed_vertex_indices'] = sorted(set(
+            child_tube_report['changed_vertex_indices'] + reviewed_tubes['changed_vertex_indices']))
     tube_rows = {row['root_id']: row for row in child_tube_report['junctions']}
+    if basal_attachment_report['changed_parent_count']:
+        tube_rows.update({row['root_id']: row for row in reviewed_tubes['junctions']
+                          if row['root_id'] in reviewed_ids})
     for root in selected:
         row = tube_rows.get(root.root_id, {})
         if row.get('proposed_vertex_count', 0) and row.get('status', '').startswith('unresolved_'):
@@ -1619,6 +1649,7 @@ def _run_pipeline_impl(
         "surface_reference": surface_reference_report,
         "branch_facing_transection_trimming": transection_report,
         "parent_owned_tube_reconciliation": child_tube_report,
+        "basal_attachment_review": basal_attachment_report,
         "final_surface_cleanup": final_surface_cleanup_report,
         "joint_root_collar": collar_report,
         "parent_contact_reconciliation": {
@@ -1641,6 +1672,9 @@ def _run_pipeline_impl(
                 full_root_labels[full_above_base_mask] >= 0
             )),
             "origin_or_hierarchy_error_count": len(final_topology_errors),
+            "unresolved_basal_parent_review_count": sum(
+                str(row['status']).startswith('unresolved')
+                for row in basal_attachment_report['decisions']),
             "higher_order_primary_contact_status": final_primary_contact_audit["status"],
             "discrete_child_patch_status": final_surface_patch_audit["status"],
             "overlong_child_review_count": len(topology_report.overlong_child_details),
@@ -1677,7 +1711,7 @@ def _run_pipeline_impl(
                  "recovered_descendants", "primary_surface_track_reconciliation", "final_centerline_fitting",
                  "branch_facing_transection_trimming", "parent_owned_tube_reconciliation", "final_surface_cleanup",
                  "joint_root_collar", "parent_contact_reconciliation", "attachment_constraint",
-                 "higher_order_primary_contact", "final_surface_patch_audit", "topology_report"):
+                 "higher_order_primary_contact", "basal_attachment_review", "final_surface_patch_audit", "topology_report"):
         report = metadata.get(name)
         if isinstance(report, dict):
             report["unit_context"] = {"coordinate_unit": "analysis_normalized", "length_unit": "analysis_normalized",
@@ -1890,6 +1924,10 @@ def _trace_lateral_orders(
     parent_radius_cache: dict[str, np.ndarray] = {
         "primary": primary_ancestor_radius_profile,
     }
+    # Native body masks are refreshed after every ownership generation. They
+    # constrain attachment evidence; permissive tracing remains a hypothesis
+    # search so ambiguous but supported branches are not lost at discovery.
+    parent_body_support: dict[str, np.ndarray] = {}
     primary_ancestor_mask = _ancestor_tube_mask(
         points,
         primary_path,
@@ -1958,7 +1996,14 @@ def _trace_lateral_orders(
                     if parent_position is not None
                     else np.zeros(len(points), dtype=bool)
                 )
+            all_parent_support = points[parent_support_mask]
+            if parent_id in parent_body_support:
+                parent_support_mask &= parent_body_support[parent_id]
             parent_support_points = points[parent_support_mask]
+            fragment_parent_tree = (cKDTree(all_parent_support)
+                if parent_id in parent_body_support and len(all_parent_support) else None)
+            body_parent_tree = (cKDTree(parent_support_points)
+                if fragment_parent_tree is not None and len(parent_support_points) else None)
             if len(parent_support_points) < 3:
                 parent_support_points = np.asarray(parent_path, dtype=float)
             parent_tree = parent_tree_cache.get(parent_id)
@@ -1969,7 +2014,7 @@ def _trace_lateral_orders(
             if parent_radius_profile is None:
                 parent_radius_profile = estimate_parent_radius_profile(
                     parent_path,
-                    parent_support_points,
+                    (all_parent_support if len(all_parent_support) >= 3 else parent_path),
                     d_bar,
                     parent_tree=parent_tree,
                 )
@@ -2062,6 +2107,13 @@ def _trace_lateral_orders(
                 candidate.order = order
                 candidate.parent_id = parent_id
                 candidate.parent_points = parent_path
+                if fragment_parent_tree is not None:
+                    seed = (candidate.raw_start_point if candidate.raw_start_point is not None
+                            else candidate.points[0])
+                    fragment_gap = float(fragment_parent_tree.query(seed)[0])
+                    body_gap = float(body_parent_tree.query(seed)[0]) if body_parent_tree is not None else np.inf
+                    if body_gap > fragment_gap + d_bar:
+                        candidate.qc_flags.append('attachment_parent_component_unresolved')
                 if order > 1:
                     ancestor_rejected, ancestor_metrics = (
                         is_ancestor_inward_candidate(
@@ -2412,6 +2464,24 @@ def _trace_lateral_orders(
                                   "provisional_ownership_reconciliation": native_reconciliation,
                                   "proximal_interface_analysis_vertex_count": interface_analysis,
                                   "deferred_rejected_footprint_start_count": blocked_attachment_starts})
+            if mapping is not None:
+                body_snapshot = restricted_mesh_labels.copy()
+                # Use the labels actually handed to the next tracing order,
+                # not the different full-resolution nearest-path proposal.
+                body_snapshot[mapping] = _analysis_root_labels(primary_mask, labels)
+                connected_owner, _, body_rows = connected_body_evidence(
+                    mesh_points, body_snapshot, primary_path, selected_all,
+                    d_bar=d_bar, mesh_context=(mesh_context or MeshGeometryContext.build(mesh_points,mesh_triangles)),
+                    excluded_mask=mesh_excluded_mask,
+                )
+                parent_body_support = {}
+                for label, path in enumerate(selected_all, 1):
+                    if body_rows[label]['detached_vertex_count']:
+                        parent_body_support[path.root_id] = connected_owner[mapping] == label
+                if attachment_report is not None:
+                    per_order[-1]['connected_parent_body_evidence'] = {
+                        path.root_id: body_rows[label] for label,path in enumerate(selected_all,1)
+                        if body_rows[label]['detached_vertex_count']}
         if evidence_ledger is not None:
             evidence_ledger.capture(
                 _analysis_root_labels(primary_mask, labels), selected_all,

@@ -23,12 +23,15 @@ def reconcile_parent_owned_tubes(
     excluded_mask: np.ndarray | None = None,
     mesh_context: MeshGeometryContext | None = None,
     reference_limits: dict[int, dict] | None = None,
+    review_root_ids: set[str] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Reclaim a measured child tube from its direct parent at any order.
 
     Every candidate uses the same frozen ownership. Recipient support must
     reach the existing child body on native edges. No path, topology, negative
     assignment or geometry is changed. Ambiguous claims keep their owner.
+    When review_root_ids is supplied, all roots still compete on frozen
+    evidence, but only the requested roots may receive a committed claim.
     """
     points, before = np.asarray(points, float), np.asarray(labels, int)
     if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
@@ -111,6 +114,10 @@ def reconcile_parent_owned_tubes(
     ambiguous = np.isfinite(second) & ((second - np.where(np.isfinite(best), best, 0)) < .15)
     report['ambiguous_vertex_count'] = int(ambiguous.sum())
     winner[ambiguous] = -1
+    if review_root_ids is not None:
+        allowed = [i for i, root in enumerate(roots, 1) if root.root_id in review_root_ids]
+        winner[~np.isin(winner, allowed)] = -1
+        report['review_root_ids'] = sorted(review_root_ids)
     result = before.copy()
     result[winner > 0] = winner[winner > 0]
 
@@ -180,6 +187,9 @@ def reconcile_parent_owned_tubes(
         retain_connected_claims()
     for label, row in proposals.items():
         row['transferred_vertex_count'] = int(np.sum((before != result) & (result == label)))
+        if review_root_ids is not None and row['root_id'] not in review_root_ids:
+            row['status'] = 'retained_outside_parent_review'
+            continue
         if row['status'] == 'retained_reference_bound':
             continue
         if row['transferred_vertex_count']:
