@@ -280,6 +280,44 @@ def test_disconnected_fragment_is_not_bridged_or_used_for_tip(mesh):
     assert "centerline_disconnected_support" in report["primary_qc_flags"]
 
 
+def test_primary_label_seam_does_not_discard_supported_distal_body():
+    axis=straight(0,2,101)
+    points,faces=tube(axis)
+    labels=np.zeros(len(points),int)
+    labels[(points[:,0]>.98)&(points[:,0]<1.02)]=-2
+    before=labels.copy();geometry=points.copy();native=faces.copy()
+    fitted,report=refit_final_centerlines(points,labels,axis,[],d_bar=.02,triangles=faces)
+    assert fitted[:,0].max()>1.9
+    assert fitted[:,0].min()<.1
+    assert report['roots'][0]['component_selection']=='native_primary_axial_coverage'
+    assert report['roots'][0]['native_label_seams_unresolved']
+    assert 'centerline_primary_label_seams' in report['primary_qc_flags']
+    np.testing.assert_array_equal(labels,before)
+    np.testing.assert_array_equal(points,geometry)
+    np.testing.assert_array_equal(faces,native)
+
+
+def test_nearby_separate_native_primary_fragments_are_not_joined():
+    a,fa=tube(straight(0,1,51));b,fb=tube(straight(1.02,2,50))
+    points=np.vstack([a,b]);faces=np.vstack([fa,fb+len(a)])
+    fitted,report=refit_final_centerlines(points,np.zeros(len(points),int),straight(),[],
+                                        d_bar=.02,triangles=faces)
+    assert fitted[:,0].max()<=1.01
+    assert report['roots'][0]['excluded_fragment_points']==len(b)
+
+
+def test_primary_component_radius_is_not_defined_by_interior_seam_vertices():
+    axis=straight(0,2,101);outer,faces=tube(axis)
+    inner,inner_faces=tube(straight(0,2,201),radius=.01,sides=4)
+    points=np.vstack([outer,inner]);faces=np.vstack([faces,inner_faces+len(outer)])
+    labels=np.zeros(len(points),int)
+    labels[:len(outer)][(outer[:,0]>.98)&(outer[:,0]<1.02)]=-2
+    fitted,report=refit_final_centerlines(points,labels,axis,[],d_bar=.02,triangles=faces)
+    assert fitted[:,0].max()>1.9
+    assert report['roots'][0]['component_selection']=='native_primary_axial_coverage'
+    assert report['roots'][0]['excluded_fragment_points']>=len(inner)
+
+
 @pytest.mark.parametrize("count", [0, 3, 7])
 def test_unmeasurable_support_has_no_fabricated_segments(count):
     points = straight(count=max(count, 1))[:count]

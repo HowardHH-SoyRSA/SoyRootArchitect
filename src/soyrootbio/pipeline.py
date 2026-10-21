@@ -39,10 +39,11 @@ from .mesh_geometry import MeshGeometryContext
 from .parent_contact import mark_parent_contact_qc, reconcile_parent_contacts
 from .attachment_review import connected_body_evidence, review_basal_attachments
 from .primary_surface import reconcile_primary_surface_tracks
+from .provisional_primary import release_mapped_primary_branches
 from .fork_recovery import recover_unassigned_fork_arms
 from .recovered_children import recover_children_on_extensions
 from .junction_transections import trim_primary_junctions
-from .junction_tubes import reconcile_parent_owned_tubes
+from .junction_tubes import reconcile_parent_owned_tubes, audit_parent_owned_tubes
 from .tube_tracking import reconcile_shared_o1_tubes
 from .native_growth import NativeStepGuard
 from .surface_patches import (
@@ -774,6 +775,17 @@ def _run_pipeline_impl(
         analysis_nonroot_mask = above_base_mask | analysis_nodules
         primary_mask = primary_mask & ~analysis_nodules
         LOGGER.info("Nodule detection: %d accepted, %d candidates", nodules.public()["accepted_count"], nodules.public()["candidate_count"])
+    # Reopen only positively observed native branches before the primary mask
+    # suppresses lateral seeds. Unmapped native vertices are evidence barriers;
+    # never infer their labels from a sparse analysis sample. Primary geometry
+    # and its frozen top remain unchanged.
+    primary_mask, provisional_primary_report = release_mapped_primary_branches(
+        full_normalized, primary_mask, primary.points,
+        analysis_to_mesh=cloud.analysis_indices, d_bar=d_bar,
+        triangles=cloud.triangles, excluded_mask=full_nonroot_mask,
+        mesh_context=mesh_context,
+    )
+    primary_mask &= ~analysis_nonroot_mask
     trace_evidence_ledger = ProvisionalTraceEvidenceLedger(
         normalized, above_base_mask,
     )
@@ -1169,7 +1181,9 @@ def _run_pipeline_impl(
                           if row['root_id'] in reviewed_ids})
     for root in selected:
         row = tube_rows.get(root.root_id, {})
-        if row.get('proposed_vertex_count', 0) and row.get('status', '').startswith('unresolved_'):
+        if row.get('status', '').startswith('unresolved_') or row.get('status') in {
+                'insufficient_support', 'insufficient_connected_child_support',
+                'no_native_parent_child_contact'}:
             root.qc_flags = list(dict.fromkeys([*root.qc_flags, 'parent_owned_tube_unresolved']))
     cleaned_analysis_labels: np.ndarray | None = None
     if analysis_to_full is not None:
@@ -1356,6 +1370,23 @@ def _run_pipeline_impl(
             root.qc_flags = list(dict.fromkeys([
                 *root.qc_flags, "discrete_child_patch_unresolved",
             ]))
+    final_parent_surface_audit = audit_parent_owned_tubes(
+        full_normalized, full_root_labels, primary.points, selected,
+        d_bar=d_bar, triangles=cloud.triangles,
+        excluded_mask=full_nonroot_mask, mesh_context=mesh_context,
+    )
+    residual_surface_ids = {row['root_id'] for row in final_parent_surface_audit['junctions']
+                            if row['status'] == 'unresolved_parent_owned_child_surface'}
+    inconclusive_surface_ids = {row['root_id'] for row in final_parent_surface_audit['junctions']
+                               if row['status'].startswith('unresolved_')}
+    for root in selected:
+        if root.root_id in inconclusive_surface_ids:
+            flag = ('parent_owned_surface_unresolved' if root.root_id in residual_surface_ids
+                    else 'parent_owned_surface_inconclusive')
+            root.qc_flags = list(dict.fromkeys([*root.qc_flags, flag]))
+    if any(row['parent_id'] == 'primary' and row['root_id'] in residual_surface_ids
+           for row in final_parent_surface_audit['junctions']):
+        primary.qc_flags = list(dict.fromkeys([*primary.qc_flags, 'parent_owned_surface_unresolved']))
     final_topology_errors = validate_root_tree(
         selected, primary_path=primary.points,
         primary_top_reference=primary_top_reference,
@@ -1645,6 +1676,7 @@ def _run_pipeline_impl(
         ),
         "internal_o1_contact_decisions": internal_o1_contact_decisions,
         "unassigned_fork_recovery": fork_recovery_report,
+        "provisional_primary_branch_recovery": provisional_primary_report,
         "recovered_descendants": recovered_children_report,
         "primary_surface_track_reconciliation": primary_surface_report,
         "final_centerline_fitting": final_centerline_report,
@@ -1663,6 +1695,7 @@ def _run_pipeline_impl(
         "attachment_constraint": attachment_constraint_report,
         "higher_order_primary_contact": primary_contact_report,
         "final_surface_patch_audit": final_surface_patch_audit,
+        "final_parent_surface_audit": final_parent_surface_audit,
         "final_compliance_audit": {
             "policy": "final-export-snapshot-constraints-v1",
             "source_connectivity_status": stl_indexing.get("status", "as_supplied"),
@@ -1679,6 +1712,11 @@ def _run_pipeline_impl(
                 for row in basal_attachment_report['decisions']),
             "higher_order_primary_contact_status": final_primary_contact_audit["status"],
             "discrete_child_patch_status": final_surface_patch_audit["status"],
+            "parent_owned_child_surface_status": final_parent_surface_audit["status"],
+            "parent_owned_child_surface_residual_root_count": final_parent_surface_audit["residual_root_count"],
+            "parent_owned_child_surface_inconclusive_root_count": final_parent_surface_audit["inconclusive_root_count"],
+            "provisional_primary_branch_recovery_status": provisional_primary_report["status"],
+            "provisional_primary_unresolved_candidate_count": provisional_primary_report.get("unresolved_candidate_count", 0),
             "overlong_child_review_count": len(topology_report.overlong_child_details),
         },
         "ownership_evidence_ledger": ownership_ledger_metadata,
@@ -1713,7 +1751,8 @@ def _run_pipeline_impl(
                  "recovered_descendants", "primary_surface_track_reconciliation", "final_centerline_fitting",
                  "branch_facing_transection_trimming", "parent_owned_tube_reconciliation", "final_surface_cleanup",
                  "joint_root_collar", "parent_contact_reconciliation", "attachment_constraint",
-                 "higher_order_primary_contact", "basal_attachment_review", "final_surface_patch_audit", "topology_report"):
+                 "higher_order_primary_contact", "basal_attachment_review", "final_surface_patch_audit",
+                 "final_parent_surface_audit", "provisional_primary_branch_recovery", "topology_report"):
         report = metadata.get(name)
         if isinstance(report, dict):
             report["unit_context"] = {"coordinate_unit": "analysis_normalized", "length_unit": "analysis_normalized",

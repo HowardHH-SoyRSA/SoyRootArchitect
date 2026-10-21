@@ -200,9 +200,71 @@ def reconcile_parent_owned_tubes(
             row['status'] = 'no_parent_owned_tube_detected'
     report['transferred_vertex_count'] = int(np.sum(before != result))
     report['changed_vertex_indices'] = np.flatnonzero(before != result).tolist()
-    report['unresolved_junction_count'] = sum(row['proposed_vertex_count'] > 0 and
-        row['status'].startswith('unresolved_') for row in report['junctions'])
+    report['unresolved_junction_count'] = sum(
+        row['status'].startswith('unresolved_') or row['status'] in {
+            'insufficient_support', 'insufficient_connected_child_support',
+            'no_native_parent_child_contact'} for row in report['junctions'])
     return result, report
+
+
+def audit_parent_owned_tubes(points, labels, primary_path, roots, *, d_bar,
+                             triangles, excluded_mask=None, mesh_context=None):
+    """Observe the final ownership without applying proposed transfers.
+
+    This checks represented children; absence of a tube witness is explicitly
+    inconclusive and does not certify the boundary or undiscovered branches.
+    A successful earlier partial transfer cannot suppress this final check.
+    """
+    from hashlib import sha256
+
+    source, owner = np.asarray(points, float), np.asarray(labels, int)
+    report = dict(policy='final-parent-owned-child-surface-v1',
+                  status='unresolved_no_mesh', junctions=[],
+                  residual_root_count=0, inconclusive_root_count=0,
+                  geometry_sha256=sha256(np.ascontiguousarray(source).tobytes()).hexdigest(),
+                  labels_sha256=sha256(np.ascontiguousarray(owner).tobytes()).hexdigest(),
+                  scope='represented roots; no absence claim for undiscovered branches')
+    if triangles is None or not len(triangles):
+        report['inconclusive_root_count'] = len(roots)
+        return report
+    context = mesh_context or MeshGeometryContext.build(source, triangles)
+    context.validate(source, triangles)
+    excluded = (np.zeros(len(source), bool) if excluded_mask is None
+                else np.array(excluded_mask, bool, copy=True))
+    excluded |= owner < 0
+    excluded[np.unique(context.edges[context.edge_incidence != 2])] = True
+    normals = vertex_normals(source, np.asarray(triangles, int))
+    lookup = {'primary': 0, **{r.root_id: i for i, r in enumerate(roots, 1)}}
+    paths = [np.asarray(primary_path)] + [np.asarray(r.points) for r in roots]
+    profiles, arcs = {}, {}
+    for label, root in enumerate(roots, 1):
+        parent = lookup.get(root.parent_id)
+        if parent is None:
+            report['junctions'].append(dict(root_id=root.root_id, parent_id=root.parent_id,
+                status='unresolved_missing_parent', residual_vertex_count=0, vertex_indices=[]))
+            report['inconclusive_root_count'] += 1
+            continue
+        if parent not in profiles:
+            donor = (owner == parent) & ~excluded
+            profiles[parent] = _segment_radius_profile(source[donor], paths[parent], d_bar)
+            arcs[parent] = project(source[donor], paths[parent])[1]
+        ids, _, witness = child_tube_witnesses(source, owner, parent, label,
+            paths[parent], paths[label][root.body_start_index:], spacing=d_bar,
+            context=context, normals=normals, excluded=excluded,
+            parent_profile=profiles[parent], parent_surface_arc=arcs[parent])
+        residual = ids[(owner[ids] == parent) & ~excluded[ids]]
+        status = ('unresolved_parent_owned_child_surface' if len(residual) else
+                  'not_detected' if witness['status'] == 'supported' else
+                  'unresolved_' + witness['status'].removeprefix('unresolved_'))
+        row = dict(witness, root_id=root.root_id, parent_id=root.parent_id,
+                   status=status, residual_vertex_count=len(residual),
+                   vertex_indices=residual.tolist())
+        report['junctions'].append(row)
+        report['residual_root_count'] += bool(len(residual))
+        report['inconclusive_root_count'] += status.startswith('unresolved_') and not len(residual)
+    report['status'] = ('unresolved_residual_surface' if report['residual_root_count'] else
+                        'unresolved_inconclusive' if report['inconclusive_root_count'] else 'not_detected')
+    return report
 
 
 def vertex_normals(points, triangles):

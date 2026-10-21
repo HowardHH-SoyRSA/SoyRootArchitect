@@ -21,7 +21,7 @@ def _unsafe_native_vertices(faces, count):
 
 
 def primary_wall_evidence(points, labels, primary, *, d_bar, triangles, excluded_mask=None,
-                          mesh_context=None):
+                          mesh_context=None, longitudinal_confirmation=False):
     """Fit transverse rings to frozen native geometry, irrespective of labels.
 
     The supplied primary axis is a local prior, not an expanded cylinder.
@@ -33,7 +33,7 @@ def primary_wall_evidence(points, labels, primary, *, d_bar, triangles, excluded
     excluded = np.zeros(len(p), bool) if excluded_mask is None else np.asarray(excluded_mask, bool)
     context = mesh_context or MeshGeometryContext.build(p, triangles)
     context.validate(p, triangles)
-    report = {"policy": "native-primary-wall-transverse-evidence-v1", "accepted_section_count": 0}
+    report = {"policy": "native-primary-wall-transverse-evidence-v2", "accepted_section_count": 0}
     wall = np.zeros(len(p), bool)
     radius_at_point = np.full(len(p), d_bar)
     if triangles is None or not len(triangles) or np.count_nonzero((labels == 0) & ~excluded) < 20:
@@ -53,6 +53,7 @@ def primary_wall_evidence(points, labels, primary, *, d_bar, triangles, excluded
     centers = line.copy()
     measured = radius.copy()
     accepted = np.zeros(len(line), bool)
+    envelopes = {}
     for i in range(len(line)):
         section = _primary_section(p, context.vertex_area_weights, context.point_tree,
                                    line, tangents, arc, assigned, radius, i, d_bar, 4 * d_bar)
@@ -71,6 +72,7 @@ def primary_wall_evidence(points, labels, primary, *, d_bar, triangles, excluded
         # radius test would exclude its broad wall and manufacture laterals.
         # Use the measured transverse envelope; never expand a radius sphere.
         envelope = ConvexHull(section["envelope"])
+        envelopes[i] = (envelope.equations, section["basis"])
         members = np.flatnonzero((assigned == i) & ~excluded & ~bad)
         uv = (p[members] - line[i]) @ section["basis"].T
         signed = np.max(uv @ envelope.equations[:, :2].T + envelope.equations[:, 2], axis=1)
@@ -83,6 +85,48 @@ def primary_wall_evidence(points, labels, primary, *, d_bar, triangles, excluded
     radius_at_point = measured[assigned]
     wall &= np.abs(axial) <= 4 * d_bar
     report["accepted_section_count"] = int(accepted.sum())
+    report["wall_vertex_count"] = int(wall.sum())
+    if not longitudinal_confirmation:
+        return wall, radius_at_point, report
+    report["policy"] = "native-primary-wall-flank-evidence-v2"
+    # A single transverse convex hull can include an emerging branch. Require
+    # its radial extent to agree with independently measured longitudinal
+    # flanks. Compare directional hull radii, preserving elliptical/flat walls
+    # rather than forcing a circular primary. Missing flanks provide no claim.
+    report["local_wall_vertex_count"] = int(wall.sum())
+    observed = np.flatnonzero(accepted)
+    coherent = np.zeros(len(p), bool)
+    for i in observed:
+        members = np.flatnonzero(wall & (assigned == i))
+        if not len(members):
+            continue
+        offset = max(2 * radius[i], 8 * d_bar)
+        tolerance = 1e-9 * max(offset, d_bar)
+        lo = observed[arc[observed] <= arc[i] - offset + tolerance]
+        hi = observed[arc[observed] >= arc[i] + offset - tolerance]
+        if not len(lo) or not len(hi):
+            continue
+        lower, upper = int(lo[-1]), int(hi[0])
+        if max(arc[i]-arc[lower], arc[upper]-arc[i]) > 2 * offset + tolerance:
+            continue
+        radial = p[members] - line[i]
+        radial -= (radial @ tangents[i])[:, None] * tangents[i]
+        length = np.linalg.norm(radial, axis=1)
+        direction = radial / np.maximum(length[:, None], 1e-12)
+        limits = []
+        for flank in (lower, upper):
+            equations, basis = envelopes[flank]
+            uv = direction @ basis.T
+            uv /= np.maximum(np.linalg.norm(uv, axis=1)[:, None], 1e-12)
+            denominator = uv @ equations[:, :2].T
+            limits.append(np.min(np.where(denominator > 1e-12,
+                -equations[:, 2] / np.maximum(denominator, 1e-12), np.inf), axis=1))
+        fraction = (arc[i]-arc[lower]) / (arc[upper]-arc[lower])
+        expected = (1-fraction)*limits[0] + fraction*limits[1]
+        coherent[members] = (np.isfinite(expected) & (expected > 0)
+                            & (length <= expected + np.maximum(1.5*d_bar, .1*expected)))
+    wall &= coherent
+    report["wall_flank_policy"] = "interpolated_directional_native_envelopes"
     report["wall_vertex_count"] = int(wall.sum())
     return wall, radius_at_point, report
 
@@ -99,7 +143,9 @@ def reconcile_primary_surface_tracks(points, labels, primary, roots, *, d_bar, t
         excluded_mask=excluded_mask, mesh_context=context,
     )
     report.update(roots=[], changed_vertex_count=0, retired_root_ids=[], label_mapping={},
-                  confirmed_primary_vertex_indices=[])
+                  confirmed_primary_vertex_indices=[],
+                  reconciliation_policy="positive-wall-evidence-per-vertex-v2",
+                  unresolved_root_count=0)
     if triangles is None or not len(triangles):
         return result, roots, report
     excluded = np.zeros(len(points), bool) if excluded_mask is None else np.asarray(excluded_mask, bool)
@@ -127,11 +173,16 @@ def reconcile_primary_surface_tracks(points, labels, primary, roots, *, d_bar, t
             continue
         body = _tubular_body_witnesses(points[owned], root.points, d_bar, normals[owned])
         protected[owned[body]] = True
-        eligible[owned[~body]] = True
+        # Failure to demonstrate a child tube is not evidence of parent wall.
+        # Smooth mesh edges may establish reachability, but cannot expand the
+        # directly measured wall into the unprotected exposed child body.
+        eligible[owned[wall[owned] & ~body]] = True
         candidates[label] = owned
         report["roots"].append({"root_id": str(root.root_id), "label": label,
                                "owned": len(owned), "wall_fraction": float(wall[owned].mean()),
-                               "protected_tube_vertices": int(body.sum())})
+                               "protected_tube_vertices": int(body.sum()),
+                               "measured_wall_vertices": int(wall[owned].sum()),
+                               "retained_without_wall_evidence": int((~wall[owned]).sum())})
     # Frozen, simultaneous native propagation into smooth wall patches. The
     # geodesic budget is local primary radius, never an unbounded label flood.
     safe = edges[eligible[edges].all(axis=1)]
@@ -153,13 +204,16 @@ def reconcile_primary_surface_tracks(points, labels, primary, roots, *, d_bar, t
             members = owned[component[owned] == part]
             if np.count_nonzero(wall[members]) < min(8, len(members)):
                 proposal[members] = False
-        # Preserve connected exposed tubes. Tiny unsupported edge fragments
-        # can remain QC, but must not roll back an entire flat parent patch.
+        # Preserve every retained native child component, including short or
+        # curved bodies for which tube observation was inconclusive. A wall
+        # cut must not divide the retained body merely because no section was
+        # accepted by the tube detector. Separate erroneous wall components
+        # can still be removed without consuming a connected exposed body.
         retained = owned[~proposal[owned]]
-        if np.any(protected[retained]):
+        if len(retained):
             from .primary_contact import _preserves_components
             if not _preserves_components(len(points), ownership.edges(label, context.bounded_edges(d_bar)),
-                                         owned[proposal[owned]], retained[protected[retained]]):
+                                         owned[proposal[owned]], retained):
                 proposal[owned] = False
                 row["status"] = "unresolved_would_split_exposed_body"
     # A donor rollback must not strand a different proposed recipient. Check
@@ -196,7 +250,9 @@ def reconcile_primary_surface_tracks(points, labels, primary, roots, *, d_bar, t
         if old != new:
             remapped[result == old] = new
     report["changed_vertex_count"] = int(proposal.sum())
-    report["confirmed_primary_vertex_indices"] = np.flatnonzero(proposal).tolist()
+    report["confirmed_primary_vertex_indices"] = np.flatnonzero(proposal & wall).tolist()
+    report["unresolved_root_count"] = sum(row["status"].startswith("unresolved_")
+                                           for row in report["roots"])
     report["label_mapping"] = mapping
     return remapped, retained_roots, report
 

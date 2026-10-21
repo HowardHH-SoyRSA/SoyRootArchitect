@@ -2,8 +2,10 @@
 
 Ownership and hierarchy are inputs, never inferred or changed here. Mesh edges
 are the connectivity authority; point clouds use bounded local neighbours.
-Disconnected components are never bridged. A root with no measurable body is
-represented by a single location and flagged, not by an unsupported polyline.
+Separate native meshes are never bridged. Nearby primary label components may
+contribute measured sections on the same native mesh, with their ownership
+seams retained as unresolved QC. A root with no measurable body is represented
+by a single location and flagged, not by an unsupported polyline.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 from .native_sections import recovered_wall_sections
+from .surface_patches import _segment_radius_profile
 
 from .geometry import (
     is_above_primary_top,
@@ -40,7 +43,7 @@ POLICY = {
     "minimum_section_points": 8,
     "smoothing_neighbor_weight": 0.125,
     "smoothing_max_displacement_spacing": 0.25,
-    "component_policy": "origin_supported_lateral_component_no_bridges",
+    "component_policy": "native_primary_axial_sections_and_origin_supported_lateral_component",
     "sparse_policy": "longest_contiguous_measurable_body_or_single_location",
     "tip_policy": "assigned_terminal_sections_no_extrapolation",
     "connector_policy": "owned_junction_transverse_hulls_no_free_space_bridges",
@@ -934,6 +937,52 @@ def _origin_supported_component(cloud, components, old, root, spacing):
     return evidence[0][2], "early_body_supported_component"
 
 
+def _primary_axial_components(points, indices, components, old, spacing, edges):
+    """Retain nearby primary sections separated by an ownership seam.
+
+    This does not connect native surfaces or reassign intervening vertices.
+    Components must share an existing native mesh component, follow the prior
+    axis, and have overlapping or sampling-scale adjacent axial intervals.
+    The transverse fitter still rejects unsupported section gaps.
+    """
+    sizes=np.bincount(components)
+    largest=int(np.argmax(sizes))
+    keep=components==largest
+    if len(sizes)<2 or len(old)<2:
+        return keep,[largest]
+    cloud=points[indices]
+    distance,arc=_polyline_projection(cloud,old)
+    # Median transverse support, not the nearest few interior/seam vertices:
+    # those can understate the primary radius and reject its actual outer wall.
+    station_arc,radius=_segment_radius_profile(cloud,old,spacing)
+    allowed=np.maximum(2*np.interp(arc,station_arc,radius),4*spacing)
+    graph=coo_matrix((np.ones(len(edges)),(edges[:,0],edges[:,1])),
+                     shape=(len(points),len(points))).tocsr()
+    native=connected_components(graph,directed=False)[1][indices]
+    native_anchors=np.unique(native[keep])
+    intervals={}
+    for component,size in enumerate(sizes):
+        members=components==component
+        if size<12 or np.mean(distance[members]<=allowed[members])<.9:
+            continue
+        if not np.all(np.isin(native[members],native_anchors)):
+            continue
+        low,high=float(arc[members].min()),float(arc[members].max())
+        if high-low>=4*spacing:
+            intervals[component]=(low,high)
+    accepted={largest}
+    low,high=float(arc[keep].min()),float(arc[keep].max())
+    while True:
+        joined={component for component,(a,b) in intervals.items()
+                if component not in accepted and a<=high+6*spacing and b>=low-6*spacing}
+        if not joined:
+            break
+        accepted|=joined
+        low=min(low,*(intervals[c][0] for c in joined))
+        high=max(high,*(intervals[c][1] for c in joined))
+    return np.isin(components,sorted(accepted)),sorted(accepted)
+
+
 def refit_final_centerlines(
     points: np.ndarray, labels: np.ndarray, primary: np.ndarray,
     roots: list[RootPath], *, d_bar: float, triangles: np.ndarray | None = None,
@@ -1062,6 +1111,14 @@ def refit_final_centerlines(
             detail.update(component_selection=component_decision,
                           selected_component=int(selected_component),
                           largest_component=int(np.argmax(sizes)))
+            if root is None and count>1 and triangles is not None and len(triangles):
+                keep,primary_components=_primary_axial_components(
+                    points,indices,components,old,d_bar,edges)
+                if len(primary_components)>1:
+                    detail.update(component_selection='native_primary_axial_coverage',
+                                  selected_components=primary_components,
+                                  native_label_seams_unresolved=True)
+                    flags.append('centerline_primary_label_seams')
             support = cloud[keep]
             # Full resolution spacing, bounded by the analysis spacing. This
             # prevents a reduced analysis cloud from producing wide bend slabs.

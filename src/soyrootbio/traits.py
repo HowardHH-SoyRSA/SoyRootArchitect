@@ -549,6 +549,12 @@ def _record_radius_quality(record: dict, assessment: dict, normalization: Normal
     complete = complete and not fit_incomplete
     complete = complete and np.isfinite(record["mean_radius"]) and np.isfinite(record["mean_diameter"])
     flags = [flag for flag in str(record.get("qc_flags", "")).split(";") if flag]
+    # A numerically supported fit can still describe the wrong ownership.
+    # Retain measured values and expose their incompleteness; do not replace
+    # supported geometry or silently certify a known residual parent sleeve.
+    if any(flag in flags for flag in ('parent_owned_surface_unresolved',
+                                      'centerline_primary_label_seams')):
+        complete = False
     if assessment.get("outside_body_support_count",0):
         flags.append("radius_outside_fitted_body_support_excluded")
     if assessment.get("admissible_support_count",0) < 3 or assessment.get("positive_radius_support_count",0) < 3:

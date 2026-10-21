@@ -140,6 +140,32 @@ def test_absent_child_body_is_reported_without_inventing_a_root():
     np.testing.assert_array_equal(after, case[1])
     assert report['junctions'][0]['status'] == 'insufficient_support'
     assert report['transferred_vertex_count'] == 0
+    assert report['unresolved_junction_count'] == 1
+
+
+def test_final_parent_surface_audit_reports_residual_without_changing_ownership():
+    from soyrootbio.junction_tubes import audit_parent_owned_tubes
+    p, labels, primary, roots, faces, _ = junction()
+    before = labels.copy()
+    paths = [r.points.copy() for r in roots]
+    report = audit_parent_owned_tubes(p, labels, primary, roots, d_bar=.004, triangles=faces)
+    assert report['residual_root_count'] == 1
+    assert report['junctions'][0]['residual_vertex_count'] > 0
+    np.testing.assert_array_equal(labels, before)
+    for r, path in zip(roots, paths):
+        np.testing.assert_array_equal(r.points, path)
+    corrected, _ = run((p, labels, primary, roots, faces, 0))
+    checked = audit_parent_owned_tubes(p, corrected, primary, roots, d_bar=.004, triangles=faces)
+    assert checked['junctions'][0]['residual_vertex_count'] < report['junctions'][0]['residual_vertex_count']
+
+
+def test_failed_final_tube_observation_is_inconclusive_even_without_proposal():
+    from soyrootbio.junction_tubes import audit_parent_owned_tubes
+    p, labels, primary, roots, faces, _ = junction()
+    labels[:] = 0
+    report = audit_parent_owned_tubes(p, labels, primary, roots, d_bar=.004, triangles=faces)
+    assert report['inconclusive_root_count'] == 1
+    assert report['junctions'][0]['status'] == 'unresolved_insufficient_support'
 
 
 def test_parent_cut_rollback_cannot_expose_primary_to_an_accepted_grandchild(monkeypatch):
