@@ -43,6 +43,8 @@ from .fork_recovery import recover_unassigned_fork_arms
 from .recovered_children import recover_children_on_extensions
 from .junction_transections import trim_primary_junctions
 from .junction_tubes import reconcile_parent_owned_tubes
+from .tube_tracking import reconcile_shared_o1_tubes
+from .native_growth import NativeStepGuard
 from .surface_patches import (
     correct_surface_patches as _correct_surface_patches,
     _polyline_projection_distance_and_arc,
@@ -51,6 +53,7 @@ from .surface_patches import (
 from .surface_patch_audit import audit_discrete_child_patches
 from .export import export_results
 from .centerline import refit_final_centerlines
+from .identity_repair import freeze_identity_references, reconcile_identity_ownership
 from .surface_reference import load_surface_reference, apply_surface_reference, tube_claim_limits
 from .primary_guidance import (
     PRIMARY_GUIDANCE_FILENAME,
@@ -1094,6 +1097,7 @@ def _run_pipeline_impl(
         triangles=cloud.triangles, d_bar=d_bar,
         excluded_mask=contact_excluded,
         mesh_context=mesh_context,
+        identity_references=freeze_identity_references(primary.points, selected),
     )
     full_root_labels, initial_ownership_ledger, initial_ledger_report = (
         reconcile_released_primary_contact_vertices(
@@ -1199,6 +1203,14 @@ def _run_pipeline_impl(
         int(final_surface_cleanup_report["filled_hole_vertex_count"]),
     )
     checkpoint("point_assignment", "Fitting final assigned root centerlines", 0.80)
+    identity_references = freeze_identity_references(primary.points, selected)
+    full_root_labels, identity_repair_report = reconcile_identity_ownership(
+        full_normalized, full_root_labels, primary.points, selected,
+        triangles=cloud.triangles, d_bar=d_bar,
+        primary_top_reference=primary_top_reference, gravity=config.gravity,
+        excluded_mask=full_nonroot_mask, mesh_context=mesh_context,
+        identity_references=identity_references,
+    )
     fit_input_primary = deepcopy(primary)
     fit_input_roots = deepcopy(selected)
     parent_contact_passes: list[dict] = []
@@ -1218,6 +1230,7 @@ def _run_pipeline_impl(
             triangles=cloud.triangles,
             gravity=np.asarray(config.gravity, dtype=float),
             primary_top_reference=primary_top_reference,
+            identity_references=identity_references,
             cooperate=cooperate,
             mesh_context=mesh_context,
             nodule_labels=nodules.vertex_labels if nodules is not None else None,
@@ -1234,6 +1247,7 @@ def _run_pipeline_impl(
             frozen_labels, attachment_assessment, selected, full_normalized,
             triangles=cloud.triangles, d_bar=d_bar,
             mesh_context=mesh_context,
+            identity_references=identity_references,
         )
         parent_proposal, parent_contact_report = reconcile_parent_contacts(
             full_normalized, frozen_labels, primary.points, selected,
@@ -1241,6 +1255,7 @@ def _run_pipeline_impl(
             cleanup_report=final_surface_cleanup_report,
             excluded_mask=patch_excluded,
             mesh_context=mesh_context,
+            identity_references=identity_references,
         )
         proposal = _merge_final_contact_proposals(
             frozen_labels, parent_proposal, parent_contact_report,
@@ -1279,6 +1294,7 @@ def _run_pipeline_impl(
             triangles=cloud.triangles, d_bar=d_bar,
             excluded_mask=contact_excluded,
             mesh_context=mesh_context,
+            identity_references=identity_references,
         )
         full_root_labels, contact_ledger, contact_ledger_report = (
             reconcile_released_primary_contact_vertices(
@@ -1344,16 +1360,24 @@ def _run_pipeline_impl(
         triangles=cloud.triangles, d_bar=d_bar,
         excluded_mask=full_nonroot_mask,
         mesh_context=mesh_context,
+        identity_references=identity_references,
         nonroot_labels=tuple(int(o["numeric_label"]) for o in nodules.objects if o["status"] == "accepted") if nodules is not None else (),
     )
     unresolved_patch_roots = {
         str(row["root_id"]) for row in final_surface_patch_audit["patches"]
     }
+    unresolved_body_roots = {
+        str(row["root_id"]) for row in final_surface_patch_audit.get("body_anchor_ambiguities", [])
+    }
     for root in selected:
+        root.qc_flags = [flag for flag in root.qc_flags if flag not in {
+            "discrete_child_patch_unresolved", "native_body_identity_unresolved"}]
         if str(root.root_id) in unresolved_patch_roots:
             root.qc_flags = list(dict.fromkeys([
                 *root.qc_flags, "discrete_child_patch_unresolved",
             ]))
+        if str(root.root_id) in unresolved_body_roots:
+            root.qc_flags.append("native_body_identity_unresolved")
     final_topology_errors = validate_root_tree(
         selected, primary_path=primary.points,
         primary_top_reference=primary_top_reference,
@@ -1624,9 +1648,9 @@ def _run_pipeline_impl(
             "overlong_child_reexamination_penalty_max": CHILD_PARENT_LENGTH_PENALTY_MAX,
             "overlong_child_reexamination_penalty_formula": "0.05 * max(0, 1 - parent_length / child_length)",
             "junction_review_score_weights": {
-                "direction_continuity": 0.45,
+                "direction_continuity": 0.55,
                 "fork_evidence": 0.35,
-                "sustained_continuation_length": 0.20,
+                "sustained_continuation_length": 0.10,
             },
             "post_fit_length_violation_action": "QC_flag_preserve_final_ownership_and_hierarchy",
             "overlong_child_alternative_parent_resurvey": True,
@@ -1661,6 +1685,7 @@ def _run_pipeline_impl(
         "attachment_constraint": attachment_constraint_report,
         "higher_order_primary_contact": primary_contact_report,
         "final_surface_patch_audit": final_surface_patch_audit,
+        "identity_ownership_repair": identity_repair_report,
         "final_compliance_audit": {
             "policy": "final-export-snapshot-constraints-v1",
             "source_connectivity_status": stl_indexing.get("status", "as_supplied"),
@@ -1677,6 +1702,8 @@ def _run_pipeline_impl(
                 for row in basal_attachment_report['decisions']),
             "higher_order_primary_contact_status": final_primary_contact_audit["status"],
             "discrete_child_patch_status": final_surface_patch_audit["status"],
+            "native_body_identity_status": "unresolved" if unresolved_body_roots else "clear",
+            "unresolved_native_body_identity_count": len(unresolved_body_roots),
             "overlong_child_review_count": len(topology_report.overlong_child_details),
         },
         "ownership_evidence_ledger": ownership_ledger_metadata,
@@ -1711,7 +1738,7 @@ def _run_pipeline_impl(
                  "recovered_descendants", "primary_surface_track_reconciliation", "final_centerline_fitting",
                  "branch_facing_transection_trimming", "parent_owned_tube_reconciliation", "final_surface_cleanup",
                  "joint_root_collar", "parent_contact_reconciliation", "attachment_constraint",
-                 "higher_order_primary_contact", "basal_attachment_review", "final_surface_patch_audit", "topology_report"):
+                 "higher_order_primary_contact", "basal_attachment_review", "final_surface_patch_audit", "identity_ownership_repair", "topology_report"):
         report = metadata.get(name)
         if isinstance(report, dict):
             report["unit_context"] = {"coordinate_unit": "analysis_normalized", "length_unit": "analysis_normalized",
@@ -1948,6 +1975,15 @@ def _trace_lateral_orders(
         if max_paths is not None and len(selected_all) >= max_paths:
             break
         order_candidates: list[RootPath] = []
+        native_step_guard = None
+        if (mesh_context is not None and mesh_context.triangles is not None
+                and len(mesh_context.triangles)):
+            native_step_guard = NativeStepGuard(
+                mesh_context, points, analysis_to_mesh, occupied_mask,
+                (mesh_excluded_mask if mesh_excluded_mask is not None
+                 else np.zeros(len(mesh_context.points), bool)), d_bar)
+            origin_constraint.setdefault("native_growth", []).append(
+                {"order": order, "evidence": native_step_guard.report})
         order_starts = 0
         order_candidate_count = 0
         order_parent_tracking_rejections = 0
@@ -2090,6 +2126,7 @@ def _trace_lateral_orders(
                 parent_path,
                 occupied_mask,
                 d_bar=d_bar,
+                native_step_guard=native_step_guard,
                 max_steps=max_steps,
                 parent_radius_profile=parent_radius_profile,
                 ancestor_exclusion_mask=(
@@ -2166,6 +2203,15 @@ def _trace_lateral_orders(
             )
             break
         reduced = reduce_similar_paths(order_candidates)
+        if order == 1:
+            origin_constraint["native_tube_identity"] = reconcile_shared_o1_tubes(
+                reduced, points, primary_mask, context=mesh_context,
+                analysis_to_mesh=analysis_to_mesh,
+                excluded=(mesh_excluded_mask if mesh_excluded_mask is not None
+                          else np.zeros(len(mesh_points), dtype=bool)
+                          if mesh_points is not None else np.zeros(0, dtype=bool)),
+                spacing=d_bar, cooperate=cooperate,
+            )
         remaining = None if max_paths is None else max(0, max_paths - len(selected_all))
         existing_order_support: set[int] = set()
         for existing in selected_all:
@@ -2249,7 +2295,8 @@ def _trace_lateral_orders(
                 covered = np.asarray(sorted(traced.covered_indices), dtype=int)
                 covered = covered[(covered >= 0) & (covered < len(points))]
                 local_mask[covered] = True
-                if np.count_nonzero(local_mask) >= 30:
+                if (np.count_nonzero(local_mask) >= 30
+                        and traced.score_components.get("native_tube_identity_corrected", 0) <= 0):
                     centered = refine_primary_centerline(
                         points,
                         local_mask,
@@ -2305,6 +2352,11 @@ def _trace_lateral_orders(
         for traced in refined:
             if traced.score_components.get("parent_tracking_rejected", 0.0) > 0.0:
                 continue
+            if traced.score_components.get("native_tube_identity_corrected", 0.0) > 0.0:
+                # Native contours already followed the supported tube to its
+                # endpoint/contact. A broad point-neighborhood extension here
+                # could immediately consume the sibling's distal body again.
+                continue
             resume_lateral_tip_in_batches(
                 points,
                 traced,
@@ -2312,6 +2364,7 @@ def _trace_lateral_orders(
                 d_bar,
                 point_tree=extension_tree,
                 cooperate=cooperate,
+                native_step_guard=native_step_guard,
             )
             if traced.score_components.get("tip_continuation_accepted", 0.0) <= 0.0:
                 continue

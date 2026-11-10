@@ -1044,7 +1044,12 @@ def test_created_root_round_trips_through_all_edited_exports(
     assert created_row["color_rgb"] == "255,0,255"
 
     traits = pd.read_csv(bundle_file(export_dir, "edited_root_traits.csv"))
-    assert "root-manual-path" in set(traits["root_id"])
+    inventory = pd.read_csv(bundle_file(export_dir, "root_inventory.csv")).set_index("root_id")
+    assert "root-manual-path" in inventory.index
+    # A drawn path with one owned vertex survives editing, but supplies no
+    # measured tube length. It must not become a biological measurement.
+    assert "root-manual-path" not in set(traits["root_id"])
+    assert inventory.loc["root-manual-path", "length_measurement_status"] == "unavailable"
     rsml = ET.parse(bundle_file(export_dir, "edited_root_system.rsml"))
     assert (
         rsml.find(
@@ -1382,7 +1387,9 @@ def test_materialised_export_is_complete_and_round_trips_labels_and_hierarchy(
     assert hierarchy["baseline_fingerprint"] == session.baseline_fingerprint
     assert {root["root_id"] for root in hierarchy["roots"]} == set(session.roots)
     traits = pd.read_csv(bundle_file(export_dir, "edited_root_traits.csv"))
-    assert set(traits["root_id"]) == set(session.roots)
+    inventory = pd.read_csv(bundle_file(export_dir, "root_inventory.csv"))
+    assert set(inventory["root_id"]) == set(session.roots)
+    assert set(traits["root_id"]) == set(inventory.loc[inventory.measurement_eligible.eq(True), "root_id"])
     label_map = pd.read_csv(bundle_file(export_dir, "edited_root_label_map.csv"))
     assert set(label_map["root_id"]) == {
         "uncertain",
@@ -1428,7 +1435,8 @@ def test_editor_accepts_overlong_child_with_warning_and_exact_history(editor_bun
     child = session.roots["root-c"]
     assert "child_longer_than_parent" in child.qc_flags
     assert child.parent_id == "root-a"
-    assert child.traits["length"] == pytest.approx(3.0)
+    assert child.traits["topology_path_length"] == pytest.approx(3.0)
+    assert child.traits["length_measurement_status"] == "unavailable"
     np.testing.assert_array_equal(session.mesh.root_labels, labels_before)
     reloaded = EditorSession(editor_bundle, session_dir=session.session_dir)
     assert _materialised_snapshot(reloaded) == after

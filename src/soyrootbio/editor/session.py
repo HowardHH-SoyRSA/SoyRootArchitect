@@ -582,12 +582,17 @@ class EditorSession(NoduleReviewMixin):
                     shutil.copy2(bundle_file(self.output_dir, filename), target / filename)
             source_metadata = bundle_file(self.output_dir, "metadata.json")
             edited_metadata = json.loads(source_metadata.read_text(encoding="utf-8")) if source_metadata.is_file() else {}
+            from ..provenance import processing_provenance
+            if edited_metadata.get("processing_provenance"):
+                edited_metadata["source_processing_provenance"] = edited_metadata["processing_provenance"]
+            edited_metadata["processing_provenance"] = processing_provenance(
+                edited_metadata.get("source"), edited_metadata.get("config"))
             if source_metadata.is_file():
                 shutil.copy2(source_metadata, target / "source_metadata_before_editor.json")
             for historical in ("final_compliance_audit", "topology_report", "higher_order_primary_contact",
                                "final_surface_patch_audit", "attachment_constraint", "parent_contact_reconciliation",
                                "final_centerline_fitting", "point_only_evidence", "ownership_evidence_ledger",
-                               "joint_root_collar", "surface_reference"):
+                               "joint_root_collar", "surface_reference", "identity_ownership_repair"):
                 edited_metadata.pop(historical, None)
             edited_metadata.update(coordinate_unit=self.coordinate_unit,
                                    output_length_unit=self.coordinate_unit,
@@ -704,6 +709,20 @@ class EditorSession(NoduleReviewMixin):
                     root.centerline_assessment["assignment_changed_since_fit"] = True
                     root.qc_flags = list(dict.fromkeys([*root.qc_flags, "centerline_fit_stale_assignment"]))
             self._refresh_attachments()
+            # A child's own surface can remain unchanged while its parent fit
+            # or ownership no longer supports the saved insertion certificate.
+            # Preserve usable body measurements but invalidate dependent angles
+            # and whole-root completeness until that attachment is revalidated.
+            changed_parent_ids = {
+                rid for rid, root in self.roots.items()
+                if rid not in roots_before
+                or root.numeric_label in changed_labels
+                or root.parent_id != roots_before[rid].parent_id
+                or not np.array_equal(root.points, roots_before[rid].points)
+            }
+            for root in self.roots.values():
+                if root.parent_id in changed_parent_ids and root.centerline_assessment:
+                    root.centerline_assessment["attachment_context_changed_since_fit"] = True
             self._validate_changed_lateral_origins(roots_before)
             self._refresh_changed_length_qc(roots_before)
             self._validate_state()

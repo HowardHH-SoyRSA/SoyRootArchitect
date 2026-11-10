@@ -316,7 +316,9 @@ def test_primary_qc_provenance_and_skeleton_coordinate_contract(
     topology = pd.read_csv(output_dir / "tables" / "root_inventory.csv")
     hierarchy = json.loads((bundle_file(output_dir, "root_hierarchy.json")).read_text(encoding="utf-8"))
 
-    trait_primary = traits.loc[traits["root_id"] == "primary"].iloc[0]
+    # A rejected prior remains a topology/geometry record even when its traits
+    # are unavailable. Provenance belongs to the complete inventory.
+    trait_primary = result.traits.loc[result.traits["root_id"] == "primary"].iloc[0]
     topology_primary = topology.loc[topology["root_id"] == "primary"].iloc[0]
     hierarchy_primary = next(root for root in hierarchy["roots"] if root["root_id"] == "primary")
     expected_flags = [] if pd.isna(trait_primary["qc_flags"]) else str(trait_primary["qc_flags"]).split(";")

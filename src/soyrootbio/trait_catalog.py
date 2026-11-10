@@ -113,7 +113,24 @@ DEFINITIONS = {
     "confidence": "Algorithmic root confidence score; not a statistical confidence interval.",
     "qc_flags": "Semicolon-separated unresolved measurement, support and topology findings.",
     "point_count": "Number of final assigned support vertices for this root.",
-    "measurement_eligible": "True for positive finite length and no noise-exclusion flag; only these roots enter biological measurements.",
+    "measurement_eligible": "Legacy length eligibility used for root_traits rows and root_count_total. Other traits use their own measurement eligibility; all identities and independent measurements remain in root_inventory.",
+    "tracing_confidence": "Earlier tracing/topology heuristic; not confidence in final root identity or measurement validity.",
+    "measurement_identity_resolved": "Whether final evidence supports the root identity; false prevents complete whole-root measurement claims.",
+    "measurement_evidence_valid": "Whether support evidence matches the current native geometry, ownership and fitted path.",
+    "measurement_evidence_reason": "Support validation result or explicit reason current geometry cannot reuse saved measurement evidence.",
+    "measurement_supported_length": "Sum of supported centerline intervals in the recorded length unit; excludes unsupported gaps.",
+    "radius_supported_length": "Length of intervals with usable radius measurements in the recorded length unit.",
+    "origin_coverage_complete": "Whether the fitted start covers the independently preserved biological origin within sampling tolerance, with supported attachment. Required for complete path-derived traits and origin-referenced angles; does not establish complete body or tip support.",
+    "origin_coverage_reason": "Result of the independent origin-coverage check, including missing reference, unsupported attachment, or excessive axial displacement.",
+    "origin_axial_loss": "Nonnegative tipward retreat of the fitted start from the preserved origin, projected onto the independent pre-fit initial direction, in the recorded length unit. Radial recentering is excluded.",
+    "origin_axial_displacement": "Signed fitted-start displacement from the preserved origin along the independent pre-fit initial tipward direction, in the recorded length unit; positive is missing basal extent and negative is extension before the origin.",
+    "origin_radial_offset": "Magnitude of fitted-start displacement perpendicular to the independent initial tipward direction, in the recorded length unit; reported separately from axial loss.",
+    "origin_tolerance": "Allowed absolute axial displacement for origin coverage, equal to 1.5 times support spacing in the recorded length unit; independent of root radius.",
+    "measured_child_parent_length_ratio": "Child supported measured length divided by its declared parent's supported measured length; missing unless both lengths are eligible and positive. Consult comparison basis before interpreting as a whole-root ratio.",
+    "measured_child_parent_length_excess": "Nonnegative child-minus-parent supported measured length in the recorded length unit; missing unless both lengths are eligible and positive.",
+    "measured_parent_length_measurement_status": "The declared parent's length measurement status used in this child-parent comparison; empty when either length is unavailable.",
+    "measured_child_parent_length_comparison_basis": "complete_root_lengths when both measured lengths are complete; otherwise supported_partial_extents. Partial extents do not establish a whole-root biological length comparison.",
+    "measured_child_parent_length_review": "Whether positive measured child-parent excess exceeds numerical roundoff (1e-12 times the larger length). Adds measured_child_longer_than_parent QC for junction review only; never changes measurements, eligibility, ownership, hierarchy, or descendants.",
     "measurement_excluded": "Noise-only topology placeholder retained to preserve hierarchy; excluded from measurements.",
     "measurement_exclusion_reason": "Explicit reason a topology root is absent from the eligible measurement table.",
     "centerline_fit_status": "Status of the final centerline fit against assigned support.",
@@ -128,6 +145,12 @@ DEFINITIONS = {
 def describe(column):
     if column in DEFINITIONS:
         return DEFINITIONS[column]
+    if column.endswith("_measurement_status"):
+        return "Metric-specific state: complete, partial, unavailable, or excluded. Partial values represent observed supported portions, not an entire root; exclusions are outside the non-noise inventory denominator."
+    if column.endswith("_measurement_eligible"):
+        return "Whether this metric contributes to its own aggregate; independent of legacy length eligibility."
+    if column.endswith("_measurement_reason"):
+        return "Explicit support, identity, endpoint or attachment reason for this metric's measurement state."
     if column.startswith("mean_") and column[5:] in DEFINITIONS:
         return "Arithmetic mean of finite values over eligible roots in this scope. " + DEFINITIONS[column[5:]]
     if column.endswith("_complete_root_count"):

@@ -25,16 +25,20 @@ def _strips_with_parent_patch():
     for label, x in [(0, 0.0), (1, 3.0)]:
         offset = len(points)
         for z in np.arange(0.0, 10.01, .25):
-            points.extend([[x + .2, y, z] for y in (-.12, 0.0, .12)])
+            surface_x = x + .2 if label == 0 else .32 + 2.88 * min(z / 3., 1.)
+            points.extend([[surface_x, y, z] for y in (-.12, 0.0, .12)])
             labels.extend([label] * 3)
         for i in range(40):
             for j in range(2):
                 a = offset + 3 * i + j
                 faces.extend([[a, a + 1, a + 3], [a + 1, a + 4, a + 3]])
+    # The exposed body has its own observed, short native junction. The wall
+    # island is not the child's sole native contact with its parent.
+    faces.append([0, 123, 124])
     patch = np.array([3 * i + 1 for i in (20, 21, 22)])
     labels = np.asarray(labels, int)
     labels[patch] = 1
-    root = RootPath("child", np.array([[3., 0., 0.], [3., 0., 10.]]),
+    root = RootPath("child", np.array([[.12, 0., 0.], [3., 0., 3.], [3., 0., 10.]]),
                     parent_id="primary", order=1)
     return np.asarray(points), labels, np.array([[0., 0., 0.], [0., 0., 10.]]), [root], np.asarray(faces), patch
 
@@ -161,16 +165,17 @@ def test_circumferential_parent_patch_can_join_observed_parent_components():
             faces.extend([[a, b, c], [b, d, c]])
     offset = len(points)
     for z in np.arange(0., 10.01, .25):
-        points.extend([[3.2, y, z] for y in (-.12, 0., .12)])
+        points.extend([[.62 + 2.58 * min(z / 3., 1.), y, z] for y in (-.12, 0., .12)])
         labels.extend([1]*3)
     for i in range(40):
         for j in range(2):
             a = offset+3*i+j
             faces.extend([[a, a+1, a+3], [a+1, a+4, a+3]])
+    faces.append([0, offset, offset + 1])
     points = np.asarray(points)
     labels = np.asarray(labels)
-    root = RootPath("child", np.array([[0., 0., 0.], [3., 0., 0.],
-                                        [3., 0., 10.]]),
+    root = RootPath("child", np.array([[0., 0., 0.], [.42, 0., 0.],
+                                        [3., 0., 3.], [3., 0., 10.]]),
                     parent_id="primary", order=1, body_start_index=1,
                     raw_start_point=np.zeros(3))
     result, report = reconcile_parent_contacts(

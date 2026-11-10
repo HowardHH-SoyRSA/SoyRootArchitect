@@ -243,7 +243,8 @@ def test_new_bundle_editor_recompute_materialize_and_direct_reopen_keep_mm(calib
     assert not current['final_compliance_audit']['compliant']
     assert current['higher_order_primary_contact']['status'] == 'unresolved_no_mesh'
     assert current['root_label_map']
-    assert current['system_summary']['root_count_total'] == len(session.roots)
+    assert current['system_summary']['root_inventory_count'] == len(session.roots)
+    assert current['system_summary']['root_count_total'] == int(session._trait_frame.measurement_eligible.sum())
 
 
 def test_shortened_primary_uses_frozen_top_for_both_lateral_orders(calibrated_bundle,tmp_path):

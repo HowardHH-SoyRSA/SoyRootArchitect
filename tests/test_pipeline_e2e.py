@@ -182,8 +182,15 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
 
     assert not primary.empty
     assert not traits.empty
-    assert float(traits.loc[traits["root_id"] == "primary", "length"].iloc[0]) > 0
-    assert int(traits.loc[traits["root_id"] == "primary", "lateral_start_count"].iloc[0]) >= 1
+    inventory = pd.read_csv(bundle_file(output_dir, "root_inventory.csv")).set_index("root_id")
+    primary_measurement = inventory.loc["primary"]
+    if primary_measurement["length_measurement_eligible"]:
+        assert float(primary_measurement["length"]) > 0
+    else:
+        assert primary_measurement["length_measurement_status"] == "unavailable"
+        assert primary_measurement["centerline_fit_status"] == "qc_rejected_prior_retained"
+        assert primary_measurement["topology_path_length"] > 0
+    assert int(primary_measurement["lateral_start_count"]) >= 1
     assert "tip_angle_parent_deg" in traits.columns
     assert "tip_angle_z_deg" in traits.columns
     assert (bundle_file(output_dir, "metadata.json")).exists()
@@ -223,14 +230,17 @@ def test_synthetic_pipeline_exports_non_empty_outputs(tmp_path: Path):
     for row in traits.itertuples(index=False):
         if pd.isna(row.parent_id) or not str(row.parent_id):
             continue
-        assert float(row.length) <= float(length_by_id[str(row.parent_id)]) + 1e-9
+        assert str(row.parent_id) in inventory.index
+        # Parent/child length is review evidence, never a validity constraint.
+        if str(row.parent_id) in length_by_id and float(row.length) > float(length_by_id[str(row.parent_id)]) + 1e-9:
+            assert "child_longer_than_parent" in str(row.qc_flags)
     metadata = json.loads((bundle_file(output_dir, "metadata.json")).read_text(encoding="utf-8"))
     assert metadata["primary_guidance_file"] == "support/primary_guidance.json"
     assert "final_centerline_fitting" in metadata["stage_timings_seconds"]
     fitting = metadata["final_centerline_fitting"]
-    assert len(fitting["roots"]) == len(traits)
+    assert len(fitting["roots"]) == len(inventory)
     assert fitting["roots"][0]["assigned_point_count"] == int(np.sum(result.full_root_labels == 0))
-    assert fitting["roots"][0]["length_after"] * result.normalization.scale == pytest.approx(float(traits.iloc[0]["length"]))
+    assert fitting["roots"][0]["length_after"] * result.normalization.scale == pytest.approx(float(primary_measurement["topology_path_length"]))
     assert fitting["primary_method"] == (
         "prior-guided-area-angular-sections-curvature-spline-v2"
     )

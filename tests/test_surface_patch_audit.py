@@ -47,6 +47,9 @@ def test_only_owned_component_without_exposed_body_anchor_is_unresolved():
     labels = np.array([0, 0, 0, 0, 0, 0, 0, 1])
     report = audit_discrete_child_patches(
         points, labels, [root], triangles=faces, d_bar=.5)
-    assert report["status"] == "unresolved_patches"
-    assert report["patches"][0]["vertex_indices"] == [7]
-    assert report["patches"][0]["status"] == "unresolved_exposed_body_anchor_ambiguous"
+    assert report["status"] == "unresolved_body_identity"
+    assert report["unresolved_patch_count"] == 0
+    assert report["unresolved_root_count"] == 1
+    assert report["unresolved_body_anchor_root_count"] == 1
+    assert report["body_anchor_ambiguities"][0]["vertex_indices"] == [7]
+    assert report["body_anchor_ambiguities"][0]["status"] == "unresolved_single_component_body_identity"

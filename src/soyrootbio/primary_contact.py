@@ -9,6 +9,7 @@ from scipy.sparse.csgraph import connected_components
 
 from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 from .surface_patches import _polyline_projection_distance_and_arc
+from .identity_repair import identity_reference, _sample
 from .types import RootPath
 
 
@@ -128,13 +129,15 @@ def restrict_higher_order_primary_contacts(
     d_bar: float,
     excluded_mask: np.ndarray | None = None,
     mesh_context: MeshGeometryContext | None = None,
+    identity_references: dict | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Reassign a native primary/higher-order contact seam to uncertainty.
 
     Try the higher-order side first. If that would split or consume its owned
     body, reassign the touching primary-side vertices instead. All primary-side
-    proposals use one frozen label snapshot and are applied as one batch only
-    if primary connectivity and O1 contacts survive. No protected vertex moves.
+    proposals use one frozen label snapshot. A failed proposal cannot veto an
+    unrelated safe one, and every accepted union must preserve primary native
+    connectivity and O1 contacts. No protected vertex moves.
     """
     p = np.asarray(points, float)
     before = np.asarray(labels, int)
@@ -156,7 +159,7 @@ def restrict_higher_order_primary_contacts(
 
     result = before.copy()
     report = {
-        "policy": "higher-order-primary-native-contact-v3",
+        "policy": "higher-order-primary-native-contact-v4",
         "status": "evaluated" if len(faces) else "unresolved_no_mesh",
         "contact_definition": "every nondegenerate native triangle edge",
         "repair_support_definition": "native triangle edge no longer than 4*d_bar",
@@ -247,7 +250,8 @@ def restrict_higher_order_primary_contacts(
             else:
                 same_label_edges = ownership.edges(int(label), edges)
                 body_anchor_status = _exposed_body_anchor_status(
-                    p, root, owned, retained, same_label_edges, d_bar
+                    p, root, owned, retained, same_label_edges, d_bar,
+                    identity_references=identity_references,
                 )
                 if not _preserves_components(len(p), same_label_edges, editable, retained):
                     row["status"] = "unresolved_would_split_owned_surface"
@@ -285,28 +289,75 @@ def restrict_higher_order_primary_contacts(
         report["contacts"].append(row)
 
     if pending_primary:
-        proposed = np.unique(np.concatenate([item[1] for item in pending_primary]))
         primary_edges = ownership.edges(0, edges)
-        primary_retained = np.setdiff1d(ownership.vertices(0), proposed,
-                                        assume_unique=True)
-        primary_preserved = bool(len(primary_retained)) and _preserves_components(
-            len(p), primary_edges, proposed, primary_retained)
-        o1_preserved = _preserves_o1_contacts(edges, before, order_by_label, proposed)
-        if primary_preserved and o1_preserved:
+        primary_owned = ownership.vertices(0)
+        closure_guards = []
+        closure_context = {}
+
+        def rejection(proposed):
+            retained = np.setdiff1d(primary_owned, proposed, assume_unique=True)
+            if not len(retained) or not _preserves_components(len(p), primary_edges, proposed, retained):
+                return "unresolved_would_split_primary_surface"
+            if not _preserves_o1_contacts(edges, before, order_by_label, proposed):
+                return "unresolved_would_remove_o1_contact"
+            for guarded_vertices, closure in closure_guards:
+                if np.isin(guarded_vertices, proposed).all() and not _closure_wall_preserved(
+                        p, primary_owned, proposed, d_bar,
+                        (identity_references or {}).get("primary"), closure_context, closure):
+                    return "unresolved_joint_primary_wall_support"
+            return None
+
+        # Evaluate proposals against the same frozen surface, then validate the
+        # accepted union. A bad seam elsewhere must not prevent a safe repair.
+        individually_safe = []
+        for row, primary_vertices in pending_primary:
+            reason = rejection(primary_vertices)
+            if reason == "unresolved_would_split_primary_surface":
+                expanded, closure = _close_local_primary_seam(
+                    p, before, raw_edges, primary_edges, primary_owned,
+                    primary_vertices, excluded, d_bar,
+                    (identity_references or {}).get("primary"), closure_context)
+                row["primary_seam_closure"] = closure
+                if len(expanded) > len(primary_vertices) and rejection(expanded) is None:
+                    closure_guards.append((expanded, closure))
+                    if rejection(expanded) is None:
+                        primary_vertices = expanded
+                        reason = None
+            if reason is None:
+                individually_safe.append((row, primary_vertices))
+            else:
+                row["primary_seam_status"] = reason
+                row["status"] = reason
+        proposed = (np.unique(np.concatenate([item[1] for item in individually_safe]))
+                    if individually_safe else np.empty(0, dtype=int))
+        accepted = individually_safe
+        if len(proposed) and rejection(proposed) is not None:
+            # Interacting individually safe seams can jointly cut a root. Use
+            # a stable order and check each complete accumulated proposal.
+            # The preference is more resolved native contacts, then less
+            # released surface, never biological root length or root size.
+            accepted, proposed = [], np.empty(0, dtype=int)
+            for row, vertices in sorted(individually_safe, key=lambda item:
+                    (-item[0]["repair_supported_contact_edge_count"], len(item[1]), item[0]["root_id"])):
+                candidate = np.union1d(proposed, vertices)
+                if rejection(candidate) is None:
+                    accepted.append((row, vertices))
+                    proposed = candidate
+                else:
+                    row["primary_seam_status"] = "unresolved_conflicting_primary_seam_proposals"
+                    row["status"] = "unresolved_conflicting_primary_seam_proposals"
+        if len(proposed):
+            assert rejection(proposed) is None
             result[proposed] = -2
-            for row, primary_vertices in pending_primary:
+            for row, primary_vertices in accepted:
                 row["changed_primary_vertex_count"] = int(len(primary_vertices))
                 row["changed_primary_vertex_indices"] = primary_vertices.tolist()
                 row["primary_seam_status"] = "reassigned_uncertain"
+                row["ownership_resolution"] = "ambiguous_native_contact_separated_to_uncertainty"
+                row["biological_identity_resolved"] = False
                 row["status"] = ("reassigned_both_seams_uncertain"
                                  if row["changed_child_vertex_count"] else
                                  "reassigned_primary_seam_uncertain")
-        else:
-            reason = ("unresolved_would_split_primary_surface" if not primary_preserved
-                      else "unresolved_would_remove_o1_contact")
-            for row, _ in pending_primary:
-                row["primary_seam_status"] = reason
-                row["status"] = reason
 
     for row in report["contacts"]:
         label = next(index for index, root in enumerate(roots, 1)
@@ -335,6 +386,128 @@ def restrict_higher_order_primary_contacts(
                         else "repaired_or_clear")
     report["requires_correction"] = bool(report["unresolved_root_count"])
     return result, report
+
+
+def _close_local_primary_seam(points, labels, raw_edges, primary_edges, owned,
+                              seam, excluded, spacing, reference, cache):
+    """Include a stranded part of the same ambiguous native contact margin.
+
+    This is uncertainty separation, not a claim of a new biological owner.
+    A fragment must be enclosed by the seam/already uncertain surface, remain
+    within two sampling spacings of it, have negligible axial extent, and leave
+    independently supported circumferential primary wall at every local section.
+    Native contacts with any other root, primary endpoints and supported long
+    bodies are barriers. No geometry, child ownership or hierarchy is changed.
+    """
+    report = {"policy": "bounded-native-primary-seam-closure-v1",
+              "status": "unresolved_no_independent_primary_reference",
+              "closure_vertex_indices": [], "fragments": []}
+    if not isinstance(reference, dict) or not reference.get("reference_valid"):
+        return seam, report
+    line = np.asarray(reference.get("prior_path", []), float)
+    if line.ndim != 2 or line.shape[1:] != (3,) or len(line) < 2 or not np.isfinite(line).all():
+        return seam, report
+    if "primary_component" not in cache:
+        cache["primary_component"] = _component_ids(len(owned), np.searchsorted(owned, primary_edges))
+        cache["primary_projection"] = _polyline_projection_distance_and_arc(points[owned], line)
+    original_component = cache["primary_component"]
+    kept = primary_edges[~np.isin(primary_edges, seam).any(axis=1)]
+    cut_component = _component_ids(len(owned), np.searchsorted(owned, kept))
+    _, arc = cache["primary_projection"]
+    total = float(np.linalg.norm(np.diff(line, axis=0), axis=1).sum())
+    closure = []
+    from scipy.spatial import cKDTree
+    seam_tree = cKDTree(points[seam])
+    for original in np.unique(original_component[np.searchsorted(owned, seam)]):
+        domain = owned[(original_component == original) & ~np.isin(owned, seam)]
+        parts = np.unique(cut_component[np.searchsorted(owned, domain)])
+        if len(parts) <= 1:
+            continue
+        for part in parts:
+            fragment = domain[cut_component[np.searchsorted(owned, domain)] == part]
+            local_arc = arc[np.searchsorted(owned, fragment)]
+            # Entire observed long bodies fail these local geometric bounds.
+            if (np.any(excluded[fragment]) or np.ptp(local_arc) > 2 * spacing
+                    or np.min(local_arc) <= 4 * spacing or total - np.max(local_arc) <= 4 * spacing
+                    or np.max(seam_tree.query(points[fragment])[0]) > 2 * spacing):
+                continue
+            boundary_edges = raw_edges[np.isin(raw_edges, fragment).any(axis=1)]
+            boundary = np.setdiff1d(np.unique(boundary_edges), fragment)
+            if not len(boundary) or np.any((labels[boundary] != -2) & ~np.isin(boundary, seam)):
+                continue
+            # Require a connected retained primary component spanning both
+            # axial sides of this contact and retaining a broad native wall.
+            retained = domain[cut_component[np.searchsorted(owned, domain)] != part]
+            supported_sections = []
+            for station in np.unique([np.min(local_arc), np.median(local_arc), np.max(local_arc)]):
+                section_ids = owned[(original_component == original) & (np.abs(arc-station) <= 2*spacing)]
+                observed = section_ids[~np.isin(section_ids, np.r_[seam, fragment])]
+                before_coverage, _ = _section_coverage(points, section_ids, line, station)
+                after_coverage, direction = _section_coverage(points, observed, line, station)
+                section_components = cut_component[np.searchsorted(owned, observed)]
+                continuity = False
+                for comp in np.unique(section_components):
+                    component_ids = retained[cut_component[np.searchsorted(owned, retained)] == comp]
+                    if not len(component_ids):
+                        continue
+                    component_arc = arc[np.searchsorted(owned, component_ids)]
+                    if np.min(component_arc) <= station - 2*spacing and np.max(component_arc) >= station + 2*spacing:
+                        continuity = True
+                        break
+                supported_sections.append({"station": float(station), "retained_vertex_count": int(len(observed)),
+                    "angular_coverage_before_deg": before_coverage, "angular_coverage_after_deg": after_coverage,
+                    "retained_axial_continuity": continuity})
+                if (len(observed) < 6 or direction is None or not continuity
+                        or before_coverage < 270 or after_coverage < 270
+                        or after_coverage < .9 * before_coverage):
+                    break
+            else:
+                closure.extend(fragment.tolist())
+                report["fragments"].append({"vertex_indices": fragment.tolist(),
+                    "original_primary_component": int(original),
+                    "axial_extent": float(np.ptp(local_arc)), "native_boundary_labels": sorted(set(labels[boundary].tolist())),
+                    "maximum_seam_distance": float(np.max(seam_tree.query(points[fragment])[0])),
+                    "retained_wall_sections": supported_sections})
+    if closure:
+        report["status"] = "supported_local_contact_margin_closure"
+        report["closure_vertex_indices"] = sorted(set(closure))
+    else:
+        report["status"] = "unresolved_no_supported_local_closure"
+    return np.union1d(seam, closure).astype(int), report
+
+
+def _closure_wall_preserved(points, owned, removed, spacing, reference, cache, report):
+    """Recheck every closure section against the complete final proposal."""
+    line = np.asarray(reference["prior_path"], float)
+    _, arc = cache["primary_projection"]
+    component = cache["primary_component"]
+    keep = ~np.isin(owned, removed)
+    for fragment in report["fragments"]:
+        for section in fragment["retained_wall_sections"]:
+            station = section["station"]
+            ids = owned[keep & (component == fragment["original_primary_component"])
+                        & (np.abs(arc-station) <= 2*spacing)]
+            coverage, direction = _section_coverage(points, ids, line, station)
+            if (len(ids) < 6 or direction is None or coverage < 270
+                    or coverage < .9 * section["angular_coverage_before_deg"]):
+                return False
+    return True
+
+
+def _section_coverage(points, indices, line, station):
+    if len(indices) < 3:
+        return 0., None
+    center, tangent, _ = _sample(line, np.asarray([station]))
+    direction = tangent[0]
+    if not np.isfinite(direction).all() or np.linalg.norm(direction) < .5:
+        return 0., None
+    first = np.cross(direction, np.eye(3)[np.argmin(np.abs(direction))])
+    first /= np.linalg.norm(first)
+    second = np.cross(direction, first)
+    vectors = points[indices] - center[0]
+    angles = np.sort(np.arctan2(vectors @ second, vectors @ first))
+    coverage = float(np.degrees(2*np.pi - np.max(np.diff(np.r_[angles, angles[0]+2*np.pi]))))
+    return coverage, direction
 
 
 def mark_higher_order_primary_contact_qc(roots: list[RootPath], report: dict) -> None:
@@ -386,6 +559,7 @@ def _preserves_components(count: int, edges: np.ndarray,
 def _exposed_body_anchor_status(
     points: np.ndarray, root: RootPath, owned: np.ndarray,
     retained: np.ndarray, same_label_edges: np.ndarray, spacing: float,
+    *, identity_references: dict | None = None,
 ) -> str:
     """Keep a distal body anchor in each anchored native component.
 
@@ -394,14 +568,15 @@ def _exposed_body_anchor_status(
     near the distal half of the existing exposed centerline; a component with
     such evidence must retain some of it after the proposed cut.
     """
-    body = np.asarray(root.points, dtype=float)[max(0, int(root.body_start_index)):]
+    body, radius, provenance = identity_reference(root, identity_references)
+    if body is None:
+        return provenance
     if len(body) < 2 or not len(owned):
         return "unresolved_no_exposed_body_anchor"
     length = float(np.linalg.norm(np.diff(body, axis=0), axis=1).sum())
     if length <= 1e-12:
         return "unresolved_no_exposed_body_anchor"
     distance, arc = _polyline_projection_distance_and_arc(points[owned], body)
-    radius = root.mean_radius
     radius_limit = (
         1.5 * float(radius) if radius is not None and np.isfinite(radius)
         and radius > 0 else 0.0

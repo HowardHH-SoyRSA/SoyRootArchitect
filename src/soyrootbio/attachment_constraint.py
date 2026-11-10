@@ -17,6 +17,7 @@ from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 
 from .surface_patches import _polyline_projection_distance_and_arc as project
 from .types import RootPath
+from .identity_repair import identity_reference
 
 
 @dataclass(frozen=True)
@@ -489,7 +490,8 @@ def restrict_rejected_contacts(labels: np.ndarray, report: dict,
                               roots: list[RootPath], points: np.ndarray, *,
                               triangles: np.ndarray | None = None,
                               d_bar: float | None = None,
-                              mesh_context: MeshGeometryContext | None = None) -> tuple[np.ndarray, dict]:
+                              mesh_context: MeshGeometryContext | None = None,
+                              identity_references: dict | None = None) -> tuple[np.ndarray, dict]:
     """Leave only implicated proximal child interface vertices uncertain.
 
     The distal exposed body, parent surface, other roots, and all pre-existing
@@ -527,6 +529,11 @@ def restrict_rejected_contacts(labels: np.ndarray, report: dict,
         vertices = vertices[result[vertices] == label]
         if not len(vertices):
             continue
+        independent_body, independent_radius, reference_source = identity_reference(root, identity_references)
+        if independent_body is None:
+            connectivity_rollbacks.append(str(root.root_id))
+            rollback_reasons[str(root.root_id)] = reference_source
+            continue
         start = int(root.body_start_index)
         if start >= len(root.points) - 1:
             continue
@@ -538,6 +545,20 @@ def restrict_rejected_contacts(labels: np.ndarray, report: dict,
         if mesh_edges is None:
             connectivity_rollbacks.append(str(root.root_id))
             rollback_reasons[str(root.root_id)] = "unresolved_no_native_connectivity"
+            continue
+        if d_bar is None:
+            native_lengths = np.linalg.norm(p[mesh_edges[:, 0]] - p[mesh_edges[:, 1]], axis=1)
+            positive = native_lengths[native_lengths > 0]
+            spacing = float(np.median(positive)) if len(positive) else 1e-12
+        else:
+            spacing = float(d_bar)
+        radius = max(float(independent_radius or root.mean_radius or 0.), 2 * spacing)
+        reference_distance, reference_arc = project(p[vertices], independent_body)
+        exposed = (reference_distance <= 1.75 * radius + 1.5 * spacing) & \
+                  (reference_arc > max(4 * spacing, 2 * radius))
+        if np.count_nonzero(exposed) >= 3 and np.ptp(reference_arc[exposed]) >= max(2 * spacing, radius):
+            connectivity_rollbacks.append(str(root.root_id))
+            rollback_reasons[str(root.root_id)] = "would_remove_independently_supported_exposed_body"
             continue
         ownership = support_generation(result)
         owned = ownership.vertices(label)

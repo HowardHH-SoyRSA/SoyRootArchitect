@@ -21,6 +21,7 @@ from .primary_contact import audit_higher_order_primary_contacts
 from .surface_patch_audit import audit_discrete_child_patches
 from .traits import compute_traits
 from .types import Normalization, RootPath
+from .measurement_evidence import make_evidence_context, rebase_assessment
 
 
 def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
@@ -95,12 +96,27 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
         ))
     labels = remapped
     primary = norm.transform_points(np.asarray(rows['primary']['polyline']))
+    original_context = make_evidence_context(mesh.positions, mesh.triangles)
+    normalized_context = make_evidence_context(points, mesh.triangles)
+    rebased_assessments = {}
+    for rid, path, body_start in [('primary', primary, 0)] + [(r.root_id, r.points, r.body_start_index) for r in paths]:
+        label = 0 if rid == 'primary' else retained.index(rid) + 1
+        rebased_assessments[rid] = rebase_assessment(
+            rows[rid].get('centerline_assessment', {}),
+            old_points=mesh.positions, old_labels=before, old_label=old_label[rid],
+            old_path=np.asarray(rows[rid]['polyline']), new_points=points,
+            new_labels=labels, new_label=label, new_path=path,
+            scale=1. / norm.scale, offset=-norm.minimum / norm.scale,
+            triangles=mesh.triangles, body_start_index=body_start,
+            old_context=original_context, new_context=normalized_context)
+    for root in paths:
+        root.centerline_assessment = rebased_assessments[root.root_id]
     edges = _support_edges(points, mesh.triangles, spacing)
     graph = coo_matrix((np.ones(len(edges), np.uint8), (edges[:, 0], edges[:, 1])), shape=(len(points), len(points))).tocsr()
     preserved, need_refit, details = {}, set(), []
     for rid, path, body_start in [('primary', primary, 0)] + [(r.root_id, r.points, r.body_start_index) for r in paths]:
         old_indices = np.flatnonzero(before == old_label[rid])
-        assessment = deepcopy(rows[rid].get('centerline_assessment', {}))
+        assessment = deepcopy(rebased_assessments[rid])
         label = 0 if rid == 'primary' else retained.index(rid) + 1
         indices = np.flatnonzero(labels == label)
         largest_changed = False
@@ -117,12 +133,12 @@ def exclude_hidden_noise(source: str | Path, target: str | Path) -> dict:
     retained_faces = mesh.triangles[touched == 0]
     if need_refit:
         primary, final_fit = refit_final_centerlines(
-            points, labels, primary, paths, d_bar=spacing, triangles=retained_faces,
+            points, labels, primary, paths, d_bar=spacing, triangles=mesh.triangles,
             gravity=gravity, primary_top_reference=top, preserved_bodies=preserved,
         )
     else:
         final_fit = deepcopy(meta['final_centerline_fitting'])
-        final_fit['roots'] = [r for r in final_fit['roots'] if r['root_id'] not in removed]
+        final_fit['roots'] = [rebased_assessments[rid] for rid in ['primary', *retained]]
         updates = {d['root_id']: d for d in details}
         for row in final_fit['roots']:
             row.update(updates[row['root_id']])

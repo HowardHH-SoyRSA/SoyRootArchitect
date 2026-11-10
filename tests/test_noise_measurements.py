@@ -23,7 +23,11 @@ def test_noise_geometry_does_not_contribute_to_measurements_or_fraction_denomina
     for key in ('length','surface_area','volume','mean_radius','point_count'):
         np.testing.assert_allclose(actual[key],expected[key])
     for key in ('root_system_surface_area','root_system_volume','assigned_vertex_fraction','unassigned_vertex_fraction'):
-        assert actual.attrs['system_summary'][key] == expected.attrs['system_summary'][key]
+        np.testing.assert_allclose(actual.attrs['system_summary'][key],expected.attrs['system_summary'][key],equal_nan=True)
+    # A sparse tetrahedron does not supply circular cross-sections. Excluding
+    # unrelated noise must preserve that uncertainty as well as native area.
+    assert actual.attrs['system_summary']['root_system_surface_area'] > 0
+    assert actual.attrs['system_summary']['volume_unavailable_root_count'] == 1
     labels[4]=0
     with pytest.raises(ValueError,match='cannot contribute'):
         measure(points,triangles,labels,mask)

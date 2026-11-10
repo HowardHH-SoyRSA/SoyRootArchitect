@@ -11,6 +11,7 @@ from soyrootbio.pipeline import (
 )
 from soyrootbio.topology import repair_root_hierarchy, validate_root_tree
 from soyrootbio.traits import compute_traits
+from soyrootbio.measurement_evidence import build_measurement_evidence, make_evidence_context
 from soyrootbio.types import Normalization, RootPath
 
 
@@ -458,6 +459,33 @@ def _surface_samples(path: np.ndarray, radius: float) -> np.ndarray:
     return np.vstack(rings)
 
 
+def _verified_native_sections(points, paths):
+    """Analytic test tubes provide real adjacency and independently known ends."""
+    faces, labels = [], []
+    offset = 0
+    for label, path in enumerate(paths):
+        for ring in range(len(path)-1):
+            for side in range(24):
+                a=offset+ring*24+side
+                b=offset+ring*24+(side+1)%24
+                faces.extend([[a,b,a+24],[b,b+24,a+24]])
+        labels.extend([label]*(24*len(path)))
+        offset += 24*len(path)
+    faces,labels=np.asarray(faces),np.asarray(labels)
+    context=make_evidence_context(points,faces)
+    assessments=[]
+    for label,path in enumerate(paths):
+        support=points[labels==label]
+        spacing=float(np.linalg.norm(support[1]-support[0]))
+        evidence=build_measurement_evidence(points,labels,label,path,triangles=faces,
+            spacing=spacing,identity_resolved=True,attachment_supported=True,tip_supported=True,
+            origin_coverage_complete=True,
+            context=context,source="analytic_native_tube_fixture")
+        assessments.append(dict(status="fitted",fit_qc_passed=True,identity_qc_passed=True,
+                                measurement_evidence=evidence))
+    return faces,labels,assessments
+
+
 def test_traits_preserve_directional_angles_and_vector_coordinates():
     primary = np.array(
         [
@@ -496,6 +524,8 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
     primary_mask[: len(primary_surface)] = True
     lateral_labels = np.zeros(len(points), dtype=int)
     lateral_labels[len(primary_surface) :] = 1
+    faces,full_labels,assessments=_verified_native_sections(points,[primary,lateral_points])
+    lateral.centerline_assessment=assessments[1]
 
     traits = compute_traits(
         primary,
@@ -505,6 +535,8 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
         lateral_labels,
         Normalization(minimum=np.zeros(3), scale=1.0),
         lateral_start_count=1,
+        full_points=points,triangles=faces,full_root_labels=full_labels,
+        primary_centerline_assessment=assessments[0],
     )
 
     required_columns = {
@@ -591,27 +623,27 @@ def test_traits_preserve_directional_angles_and_vector_coordinates():
 def test_traits_are_reported_in_denormalized_source_mesh_units():
     primary = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.0]])
     points = _surface_samples(primary, radius=0.02)
-    full_points = np.array(
-        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 3.0, 0.0], [0.0, 3.0, 0.0]]
-    )
-    triangles = np.array([[0, 1, 2], [0, 2, 3]])
+    normalization=Normalization(minimum=np.array([5.0, -2.0, 7.0]), scale=10.0)
+    full_points=normalization.inverse_points(points)
+    triangles,labels,assessments=_verified_native_sections(points,[primary])
+    expected_area=10.*24*2*.2*np.sin(np.pi/24)  # Polygonal cylinder, no artificial end caps.
     traits = compute_traits(
         primary,
         [],
         points,
         np.ones(len(points), dtype=bool),
         np.zeros(len(points), dtype=int),
-        Normalization(minimum=np.array([5.0, -2.0, 7.0]), scale=10.0),
+        normalization,
         full_points=full_points,
         triangles=triangles,
         full_root_labels=np.zeros(len(full_points), dtype=int),
-        mesh_metadata={"surface_area_source_units2": 6.0},
+        primary_centerline_assessment=assessments[0],
     )
 
     row = traits.iloc[0]
     assert row["length"] == pytest.approx(10.0)
     assert row["chord_length"] == pytest.approx(10.0)
-    assert row["surface_area"] == pytest.approx(6.0)
+    assert row["surface_area"] == pytest.approx(expected_area)
     np.testing.assert_allclose(
         row[["root_start_x", "root_start_y", "root_start_z"]].to_numpy(dtype=float),
         [5.0, -2.0, 7.0],
@@ -622,7 +654,7 @@ def test_traits_are_reported_in_denormalized_source_mesh_units():
     )
     assert row["coordinate_unit"] == "mesh_unit"
     assert not any("mm" in column.lower() for column in traits.columns)
-    assert traits.attrs["system_summary"]["root_system_surface_area"] == pytest.approx(6.0)
+    assert traits.attrs["system_summary"]["root_system_surface_area"] == pytest.approx(expected_area)
 
 
 def test_mesh_unit_tip_vector_is_invariant_to_polyline_sampling_density():
@@ -670,6 +702,8 @@ def test_mesh_unit_tip_vector_is_invariant_to_polyline_sampling_density():
         primary_mask[: len(primary_surface)] = True
         lateral_labels = np.zeros(len(points), dtype=int)
         lateral_labels[len(primary_surface) :] = 1
+        faces,full_labels,assessments=_verified_native_sections(points,[primary,path])
+        lateral.centerline_assessment=assessments[1]
         traits = compute_traits(
             primary,
             [lateral],
@@ -678,6 +712,8 @@ def test_mesh_unit_tip_vector_is_invariant_to_polyline_sampling_density():
             lateral_labels,
             Normalization(minimum=np.zeros(3), scale=1.0),
             tip_vector_window=2.0,
+            full_points=points,triangles=faces,full_root_labels=full_labels,
+            primary_centerline_assessment=assessments[0],
         )
         return traits.loc[traits["root_id"] == lateral.root_id].iloc[0]
 

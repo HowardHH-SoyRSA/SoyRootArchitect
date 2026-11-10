@@ -18,6 +18,10 @@ from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 from .mesh_geometry import MeshGeometryContext, OwnershipGeometryGeneration
 from .native_sections import recovered_wall_sections
+from .measurement_evidence import (
+    array_fingerprint, assess_origin_coverage, assess_terminal_direction,
+    build_measurement_evidence, make_evidence_context,
+)
 
 from .geometry import (
     is_above_primary_top,
@@ -40,7 +44,7 @@ POLICY = {
     "minimum_section_points": 8,
     "smoothing_neighbor_weight": 0.125,
     "smoothing_max_displacement_spacing": 0.25,
-    "component_policy": "largest_connected_support_no_bridges",
+    "component_policy": "whole_prior_supported_body_identity_no_bridges",
     "sparse_policy": "longest_contiguous_measurable_body_or_single_location",
     "tip_policy": "assigned_terminal_sections_no_extrapolation",
     "connector_policy": "owned_junction_transverse_hulls_no_free_space_bridges",
@@ -56,6 +60,21 @@ POLICY = {
     "primary_station_spacing_floor": 2.0,
     "primary_length_inflation_limit": 1.15,
     "primary_qc_failure_policy": "retain_prior_axis_and_do_not_apply_rejected_fit",
+    "lateral_method": "validated-prior-axis-regularized-candidates-v1",
+    "lateral_station_spacing_floor": 2.0,
+    "lateral_station_spacing_radius_fraction": 0.5,
+    "lateral_minimum_section_fraction": 0.60,
+    "lateral_minimum_surface_coverage": 0.80,
+    "lateral_sampling_length_ratio_limit": 1.08,
+    "lateral_length_inflation_limit": 1.15,
+    "lateral_centering_improvement_margin": 0.025,
+    "lateral_maximum_backtrack_fraction": 0.01,
+    "lateral_maximum_center_error_radius_fraction": 0.35,
+    "lateral_extent_common_body_fraction": 0.95,
+    "lateral_extent_surface_coverage_margin": 0.05,
+    "lateral_extent_transverse_tolerance_radius_fraction": 0.75,
+    "lateral_extent_minimum_extension_spacing": 2.0,
+    "lateral_extent_endpoint_tolerance_spacing": 1.0,
 }
 
 
@@ -667,7 +686,9 @@ def _section(points, tree, line, tangents, arc, assigned, i, spacing):
     left, right = max(0, i - 1), min(len(line) - 1, i + 1)
     turn = np.arccos(np.clip(np.dot(tangents[left], tangents[right]), -1, 1))
     curvature = turn / max(arc[right] - arc[left], spacing)
-    half_width = min(2 * spacing / (1 + 2 * spacing * curvature), 0.30 / max(curvature, 1e-12))
+    width_scale = float(POLICY["section_half_width_spacing"]) * spacing
+    half_width = min(width_scale / (1 + width_scale * curvature),
+                     float(POLICY["curvature_turn_limit_radians"]) / max(curvature, 1e-12))
     half_width = max(0.5 * spacing, half_width)
     near = np.atleast_1d(tree.query(station, k=min(16, len(points)))[0])
     radius = max(4 * spacing, 2.5 * float(np.median(near)))
@@ -743,14 +764,345 @@ def _fit_body(points, initial, spacing):
     # One local pass only. Its displacement bound shrinks at bends; endpoints
     # and the support-derived tip are never smoothed.
     if len(line) > 2:
-        delta = 0.125 * (line[:-2] + line[2:] - 2 * line[1:-1])
-        limit = 0.25 * np.asarray(widths)[run[1:-1]] / 2
+        delta = float(POLICY["smoothing_neighbor_weight"]) * (line[:-2] + line[2:] - 2 * line[1:-1])
+        limit = float(POLICY["smoothing_max_displacement_spacing"]) * np.asarray(widths)[run[1:-1]] / 2
         delta *= np.minimum(1, limit / np.maximum(np.linalg.norm(delta, axis=1), 1e-12))[:, None]
         line[1:-1] += delta
     return line, {"status": "fitted" if rejected == 0 and np.all(reliable) else "partial_support", "rejected_section_count": rejected,
                   "sparse_section_count": int(np.count_nonzero(valid & ~reliable)),
                   "excluded_section_count": int(len(valid) - len(run)),
                   "section_half_width_min": float(min(widths)), "section_half_width_max": float(max(widths))}
+
+
+def _lateral_sections(points, line, spacing, weights, tree):
+    """Independent radius-scale sections; never feed noisy station updates back."""
+    length = path_length(line)
+    pilot = resample_polyline(line, max(2 * spacing, length / 700.0))
+    distances = np.asarray(tree.query(pilot, k=min(24, len(points)))[0])
+    radius = max(2 * spacing, float(np.median(distances)))
+    step = max(float(POLICY["lateral_station_spacing_floor"]) * spacing,
+               float(POLICY["lateral_station_spacing_radius_fraction"]) * radius,
+               length / 700.0)
+    sampled = resample_polyline(line, step)
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(sampled, axis=0), axis=1))]
+    near = np.asarray(tree.query(sampled, k=min(24, len(points)))[0])
+    radii = np.maximum(2 * spacing, np.median(near, axis=1))
+    if len(radii) > 4:
+        padded = np.pad(radii, 2, mode="edge")
+        radii = np.array([np.median(padded[i:i+5]) for i in range(len(radii))])
+    left = np.maximum(0., arc - np.maximum(3 * spacing, 2 * radii))
+    right = np.minimum(arc[-1], arc + np.maximum(3 * spacing, 2 * radii))
+    tangent = np.column_stack([np.interp(right, arc, sampled[:, j]) - np.interp(left, arc, sampled[:, j])
+                               for j in range(3)])
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1), 1e-12)[:, None]
+    assigned = cKDTree(sampled).query(points)[1]
+    sections = [_primary_section(points, weights, tree, sampled, tangent, arc, assigned,
+                                 radii, i, spacing, step) for i in range(len(sampled))]
+    for i, section in enumerate(sections):
+        if not section["accepted"] or section.get("thin_support"):
+            continue
+        # A one-sided wall can surround its own biased midpoint. Coverage must
+        # also surround the independently measured section centre, not only the
+        # candidate's current station. Do not manufacture an axis from a wall.
+        local = np.asarray(tree.query_ball_point(sampled[i], max(3*radii[i], 6*spacing)), int)
+        delta = points[local] - sampled[i]
+        keep = ((np.abs(delta @ tangent[i]) <= section["half_width"])
+                & (np.abs(arc[assigned[local]]-arc[i]) <= max(2*section["half_width"], 1.5*step)))
+        transverse = (points[local[keep]] - section["candidate"]) @ section["basis"].T
+        angles = np.sort(np.arctan2(transverse[:, 1], transverse[:, 0]))
+        gap = float(np.max(np.diff(np.r_[angles, angles[0]+2*np.pi]))) if len(angles) else 2*np.pi
+        section["measured_center_angular_coverage"] = 1-gap/(2*np.pi)
+        if gap >= np.pi or 1-gap/(2*np.pi) < float(POLICY["primary_minimum_angular_coverage"]):
+            section.update(accepted=False, rejection_reason="one_sided_about_measured_center")
+    for i, section in enumerate(sections):
+        if section["accepted"]:
+            # Lateral sections supply transverse observations. Uneven sampling
+            # along a sleeve must not move its stations towards a dense ring or
+            # shorten both ends at every fitting pass.
+            displacement = section["candidate"]-sampled[i]
+            section["candidate"] = sampled[i]+displacement-np.dot(displacement, section["tangent"])*section["tangent"]
+    return sampled, arc, sections, step
+
+
+def _supported_lateral_reference(line, sampled, arc, sections, step):
+    """Crop unsupported ends/gaps without replacing the reference's bends."""
+    accepted = np.array([s["accepted"] for s in sections], bool)
+    indices = np.flatnonzero(accepted)
+    if len(indices) < 2:
+        return None, None
+    breaks = []
+    for k, (a, b) in enumerate(zip(indices[:-1], indices[1:])):
+        limit = max(3 * step, 2 * max(sections[a]["radius"], sections[b]["radius"]))
+        if arc[b] - arc[a] > limit:
+            breaks.append(k + 1)
+    run = max(np.split(indices, breaks), key=lambda x: arc[x[-1]] - arc[x[0]])
+    if len(run) < 2:
+        return None, None
+    a, b = int(run[0]), int(run[-1])
+    # Sampled points lie on the original polyline; projection recovers exact
+    # endpoints while retaining all original internal vertices, including bends.
+    _, position = _polyline_projection(sampled[[a, b]], line)
+    original_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+    inside = (original_arc > position[0] + 1e-12) & (original_arc < position[1] - 1e-12)
+    retained = np.vstack([sampled[a], line[inside], sampled[b]])
+    retained = retained[np.r_[True, np.linalg.norm(np.diff(retained, axis=0), axis=1) > 1e-12]]
+    return retained, (a, b + 1)
+
+
+def _lateral_candidate_metrics(points, line, spacing, weights, tree):
+    """Curve quality and whole selected-body coverage, independent of its source."""
+    sampled, arc, sections, step = _lateral_sections(points, line, spacing, weights, tree)
+    accepted = [i for i, s in enumerate(sections) if s["accepted"]]
+    radii = np.array([s["radius"] for s in sections])
+    scale = max(4 * spacing, float(np.median(radii)))
+    coarse = resample_polyline(line, scale)
+    length = path_length(line)
+    ratio = length / max(path_length(coarse), 1e-12)
+    _, progress = _polyline_projection(line, coarse)
+    backward = np.diff(progress)
+    backtrack = float(-np.sum(backward[backward < 0]))
+    # Measure spatial coverage, not vertex-count coverage: dense mesh rings at
+    # the base must not conceal a long, sparsely sampled distal body. Local
+    # radii account for taper; a global median radius rejects thick basal walls.
+    dense = resample_polyline(line, spacing)
+    _, representatives = np.unique(np.floor((points-points.min(axis=0))/(2*spacing)).astype(np.int64),
+                                   axis=0, return_index=True)
+    spatial_points = points[representatives]
+    distance, dense_index = cKDTree(dense).query(spatial_points)
+    _, station_index = cKDTree(sampled).query(dense)
+    # Nearest-wall distance describes the minor radius of a flattened root.
+    # Use its measured transverse envelope for the major radius as well.
+    envelope_radius = np.array([max(s["radius"], float(np.max(np.linalg.norm(s["envelope"], axis=1))))
+                                if s.get("envelope") is not None else s["radius"] for s in sections])
+    local_limit = np.maximum(1.25*envelope_radius[station_index[dense_index]], 4*spacing)
+    surface_coverage = float(np.mean(distance <= local_limit))
+    center_error = []
+    for i in accepted:
+        section = sections[i]
+        shift = (section["candidate"]-sampled[i]) @ section["basis"].T
+        magnitude = float(np.linalg.norm(shift))
+        normalizing_radius = max(section["radius"], spacing)
+        if section.get("envelope") is not None and magnitude > 1e-12:
+            # The nearest wall is only a pilot/search radius. An off-centre
+            # station or flattened shaft has a smaller nearest distance than
+            # its measured cross-section. Use the observed half-width in the
+            # displacement direction; retain the independent angular gates.
+            projection = section["envelope"] @ (shift/magnitude)
+            normalizing_radius = max(spacing, .5*float(np.ptp(projection)))
+        center_error.append(magnitude/normalizing_radius)
+    error = float(np.quantile(center_error, .75)) if center_error else None
+    rejection = []
+    section_fraction = len(accepted) / max(len(sections), 1)
+    if section_fraction < float(POLICY["lateral_minimum_section_fraction"]):
+        rejection.append("insufficient_surrounding_sections")
+    if not sections[0]["accepted"] or not sections[-1]["accepted"]:
+        rejection.append("unsupported_endpoint_section")
+    for endpoint in (0, len(sampled)-1):
+        section = sections[endpoint]
+        if not section["accepted"]:
+            continue
+        local = np.asarray(tree.query_ball_point(sampled[endpoint], max(3*radii[endpoint], 6*spacing)), int)
+        forward = (points[local]-sampled[endpoint]) @ section["tangent"]
+        # A wide slab may see the first/last ring from empty space beyond it.
+        # That supplies a transverse fit, but cannot certify an extrapolated
+        # endpoint. Retain longitudinal locations only inside observed extent.
+        if (len(forward) and ((endpoint == 0 and np.min(forward) > .5*spacing)
+                             or (endpoint != 0 and np.max(forward) < -.5*spacing))):
+            rejection.append("extrapolated_endpoint")
+            break
+    if surface_coverage < float(POLICY["lateral_minimum_surface_coverage"]):
+        rejection.append("incomplete_selected_body_extent")
+    if error is not None and error > float(POLICY["lateral_maximum_center_error_radius_fraction"]):
+        rejection.append("poor_transverse_centering")
+    if ratio > float(POLICY["lateral_sampling_length_ratio_limit"]) and length - path_length(coarse) > 2 * spacing:
+        rejection.append("sampling_scale_oscillation")
+    if backtrack > max(spacing, float(POLICY["lateral_maximum_backtrack_fraction"]) * length):
+        rejection.append("longitudinal_backtracking")
+    record = {"length_normalized": float(length), "section_fraction": section_fraction,
+              "surface_coverage_fraction": surface_coverage, "centering_error_radius_fraction": error,
+              "centering_scale": "measured_transverse_directional_half_width",
+              "transverse_extent_radius_normalized": float(np.median(envelope_radius)),
+              "sampling_scale_length_ratio": float(ratio), "backtrack_length_normalized": backtrack,
+              "section_count": len(sections), "rejected_section_count": len(sections)-len(accepted),
+              "rejections": rejection, "valid": not rejection,
+              "score": error + 0.5 * max(0., ratio-1.) if error is not None else None}
+    return record
+
+
+def _assess_lateral_candidate(points, line, spacing, weights, tree):
+    """Allow one local endpoint crop, then repeat every acceptance check.
+
+    Transverse regularization changes the endpoint frame. A supported interior
+    must not be lost solely because that new endpoint slab is one-sided. This
+    is a bounded crop, never repeated shrinking or extrapolation to force a fit.
+    """
+    original = _lateral_candidate_metrics(points, line, spacing, weights, tree)
+    endpoint_reasons = {"unsupported_endpoint_section", "extrapolated_endpoint"}
+    if not endpoint_reasons.intersection(original["rejections"]):
+        return line, original
+    sampled, arc, sections, step = _lateral_sections(points, line, spacing, weights, tree)
+    accepted = np.array([s["accepted"] for s in sections], bool)
+    start_window = max(3*step, 2*sections[0]["radius"])
+    end_window = max(3*step, 2*sections[-1]["radius"])
+    for at_start in (True, False):
+        window = start_window if at_start else end_window
+        order = range(len(sampled)) if at_start else range(len(sampled)-1, -1, -1)
+        for index in order:
+            section = sections[index]
+            end_distance = arc[index] if at_start else arc[-1]-arc[index]
+            if end_distance > window:
+                break
+            if not accepted[index]:
+                continue
+            local = np.asarray(tree.query_ball_point(sampled[index], max(3*section["radius"], 6*spacing)), int)
+            forward = (points[local]-sampled[index]) @ section["tangent"]
+            if len(forward) and ((at_start and np.min(forward) > .5*spacing)
+                                 or (not at_start and np.max(forward) < -.5*spacing)):
+                accepted[index] = False
+            else:
+                break
+    indices = np.flatnonzero(accepted)
+    if len(indices) < 2:
+        return line, original
+    first, last = int(indices[0]), int(indices[-1])
+    if arc[first] > start_window or arc[-1]-arc[last] > end_window:
+        return line, original
+    _, ends = _polyline_projection(sampled[[first, last]], line)
+    original_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+    inside = (original_arc > ends[0]+1e-12) & (original_arc < ends[1]-1e-12)
+    cropped = np.vstack([sampled[first], line[inside], sampled[last]])
+    if path_length(cropped) >= path_length(line)-1e-12:
+        return line, original
+    reassessed = _lateral_candidate_metrics(points, cropped, spacing, weights, tree)
+    reassessed.update(endpoint_trim_applied=True,
+                      endpoint_trim_removed_length_normalized=float(path_length(line)-path_length(cropped)),
+                      endpoint_trim_start_limit_normalized=float(start_window),
+                      endpoint_trim_end_limit_normalized=float(end_window),
+                      pretrim_rejections=original["rejections"],
+                      pretrim_length_normalized=float(path_length(line)))
+    return cropped, reassessed
+
+
+def _lateral_extent_preference(candidates, spacing):
+    """Prefer an observed extension of the same body over a centred crop.
+
+    Only independently admissible curves participate. More arc length alone is
+    insufficient: the other curve must cover the common body and contain a
+    sustained, supported extension beyond a candidate's endpoint. Partial bodies
+    remain valid fallback options when no complete attachment-compatible body
+    can be committed.
+    """
+    probes = {name: resample_polyline(line, max(2*spacing, path_length(line)/300.))
+              for name, line, _ in candidates}
+    for name, line, record in candidates:
+        record["selection_extent_dominated_by"] = []
+        record["selection_extent_deficit_normalized"] = 0.0
+        length = path_length(line)
+        arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+        window = max(4*spacing, record["transverse_extent_radius_normalized"])
+        first = np.array([np.interp(min(window, length), arc, line[:, j]) for j in range(3)])-line[0]
+        last = line[-1]-np.array([np.interp(max(0., length-window), arc, line[:, j]) for j in range(3)])
+        first /= max(np.linalg.norm(first), 1e-12)
+        last /= max(np.linalg.norm(last), 1e-12)
+        for other_name, other, other_record in candidates:
+            if other_name == name or path_length(other) <= length+2*spacing:
+                continue
+            if other_record["surface_coverage_fraction"] < record["surface_coverage_fraction"]-float(POLICY["lateral_extent_surface_coverage_margin"]):
+                continue
+            tolerance = max(2*spacing, float(POLICY["lateral_extent_transverse_tolerance_radius_fraction"])
+                            * min(record["transverse_extent_radius_normalized"], other_record["transverse_extent_radius_normalized"]))
+            common_distance, _ = _polyline_projection(probes[name], other)
+            if np.mean(common_distance <= tolerance) < float(POLICY["lateral_extent_common_body_fraction"]):
+                continue
+            endpoint_tolerance = float(POLICY["lateral_extent_endpoint_tolerance_spacing"])*spacing
+            _, endpoint_position = _polyline_projection(line[[0, -1]], other)
+            other_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(other, axis=0), axis=1))]
+            nearest = np.column_stack([np.interp(endpoint_position, other_arc, other[:, j]) for j in range(3)])
+            if (np.dot(line[0]-nearest[0], first) < -endpoint_tolerance
+                    or np.dot(line[-1]-nearest[-1], last) > endpoint_tolerance):
+                # Extending one end while losing the opposite end is not
+                # containment, even when the shared middle exceeds 95%.
+                continue
+            sampled = probes[other_name]
+            distance, position = _polyline_projection(sampled, line)
+            outside = (distance > endpoint_tolerance) & (
+                ((position <= endpoint_tolerance) & ((sampled-line[0]) @ first < -endpoint_tolerance))
+                | ((position >= length-endpoint_tolerance) & ((sampled-line[-1]) @ last > endpoint_tolerance)))
+            indices = np.flatnonzero(outside)
+            runs = np.split(indices, np.flatnonzero(np.diff(indices)>1)+1)
+            extension = max((path_length(sampled[run]) for run in runs if len(run)>1), default=0.)
+            if extension+1e-12 < float(POLICY["lateral_extent_minimum_extension_spacing"])*spacing:
+                continue
+            record["selection_extent_dominated_by"].append(other_name)
+            record["selection_extent_deficit_normalized"] = max(record["selection_extent_deficit_normalized"], float(extension))
+    return [x for x in candidates if not x[2]["selection_extent_dominated_by"]]
+
+
+def _fit_lateral_body(points, initial, prior, spacing, point_weights=None, *, candidate_output=None):
+    """Select a validated prior/axis/regularized curve, preserving real support.
+
+    These are geometry candidates, not hierarchy hypotheses. Length evidence
+    only rejects a refinement; it never deletes a root or changes its parent.
+    Existing attachment validation and measurement-evidence rebuilding still run.
+    """
+    points, prior = np.asarray(points, float), np.asarray(prior, float)
+    weights = np.ones(len(points)) if point_weights is None else np.asarray(point_weights, float)
+    tree = cKDTree(points)
+    candidates = []; reports = []
+    for name, reference in (("prior", prior), ("starting_axis", np.asarray(initial, float))):
+        if len(reference) < 2 or path_length(reference) <= 1e-12:
+            continue
+        sampled, arc, sections, step = _lateral_sections(points, reference, spacing, weights, tree)
+        cropped, interval = _supported_lateral_reference(reference, sampled, arc, sections, step)
+        if cropped is None:
+            reports.append({"name": name, "valid": False, "rejections": ["no_supported_contiguous_extent"]})
+            continue
+        reference_length = path_length(cropped)
+        cropped, record = _assess_lateral_candidate(points, cropped, spacing, weights, tree)
+        record.update(name=name, input_length_normalized=float(path_length(reference)),
+                      supported_crop_length_normalized=float(path_length(cropped)))
+        candidates.append((name, cropped, record));reports.append(record)
+        a, b = interval
+        refined = _regularized_primary_curve(sampled[a:b], sections[a:b], spacing)
+        refined, refined_record = _assess_lateral_candidate(points, refined, spacing, weights, tree)
+        refined_record.update(name="regularized_"+name, reference=name,
+                              candidate_to_reference_length_ratio=path_length(refined)/max(reference_length,1e-12))
+        scale = max(4*spacing, float(np.median([s["radius"] for s in sections[a:b]])))
+        if (path_length(refined) > float(POLICY["lateral_length_inflation_limit"])*reference_length
+                and path_length(refined)-reference_length > 2*scale):
+            refined_record["rejections"].append("unexplained_refinement_length_inflation")
+            refined_record["valid"] = False
+        candidates.append(("regularized_"+name, refined, refined_record));reports.append(refined_record)
+    admissible = [x for x in candidates if x[2]["valid"]]
+    preferred_extent = _lateral_extent_preference(admissible, spacing)
+    if candidate_output is not None:
+        # Internal candidate geometry is kept out of exported scalar reports.
+        # Family attachment validation can try another independently accepted
+        # body before retaining an unmeasurable topology-only prior.
+        candidate_output.extend(sorted(admissible, key=lambda x: (bool(x[2]["selection_extent_dominated_by"]),
+                                                                  x[0] != "prior", x[2]["score"])))
+    base = {"method": POLICY["lateral_method"], "lateral_candidate_assessments": reports,
+            "candidate_metric_coordinate_unit": "analysis_normalized",
+            "candidate_selection_rule": "admissible_supported_extent_dominance_then_centering_and_prior_tie"}
+    if not admissible:
+        return prior.copy(), {**base, "status": "qc_rejected_prior_retained", "fit_qc_passed": False,
+            "fit_applied": False, "traits_geometry_source": "retained_prior", "exposed_body_supported": False,
+            "selected_candidate": None, "rejected_section_count": 0,
+            "qc_flags": ["centerline_lateral_no_admissible_candidate"]}
+    winner = min(preferred_extent, key=lambda x: x[2]["score"])
+    # A tiny centering improvement does not justify replacing an admissible
+    # earlier curve. Tie preference is deterministic and independent of IDs.
+    for preferred in ("prior", "starting_axis"):
+        alternative = next((x for x in preferred_extent if x[0] == preferred), None)
+        if alternative is not None and alternative[2]["score"] <= winner[2]["score"] + float(POLICY["lateral_centering_improvement_margin"]):
+            winner = alternative
+            break
+    name, body, record = winner
+    return body, {**base, "status": "fitted" if record["rejected_section_count"] == 0 else "partial_support",
+        "fit_qc_passed": True, "fit_applied": True, "exposed_body_supported": True,
+        "traits_geometry_source": "validated_prior" if name == "prior" else "accepted_fit",
+        "selected_candidate": name, "rejected_section_count": record["rejected_section_count"],
+        "qc_flags": []}
 
 
 def _supported_connector(candidate, parent_support, child_support, spacing):
@@ -901,6 +1253,128 @@ def _retained_attachment_prefix(old, body, support, child_hints, top_reference, 
     return line, body_start, join_gap
 
 
+def _origin_supported_component(cloud, components, old, root, spacing, *,
+                                reference=None, return_evidence=False):
+    """Assess correspondence to the whole independent pre-fit body.
+
+    Vertex population is deliberately not the ranking score. A sustained
+    proximal tube can win over a larger stolen tail, but a few proximal wall
+    vertices cannot displace a long supported body. Selection remains a partial
+    component measurement whenever native ownership is disconnected.
+    """
+    sizes = np.bincount(components)
+    largest = int(np.argmax(sizes))
+    if root is None or len(sizes) == 1:
+        result = (largest, "single_or_primary_component")
+        return (*result, []) if return_evidence else result
+    source = old
+    if reference and reference.get("reference_valid"):
+        source = np.asarray(reference["prior_path"], float)[int(reference.get("body_start_index", 0)):]
+    step = max(2 * spacing, path_length(source) / 1000)
+    line = resample_polyline(source, step)
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+    nearest_all = cKDTree(cloud).query(line)[0]
+    radius = float(np.quantile(nearest_all, .35))
+    expected = (reference or {}).get("mean_radius")
+    if expected is not None and np.isfinite(expected) and expected > 0:
+        radius = min(radius, float(expected))
+    limit = max(4 * spacing, 1.6 * radius)
+    evidence = []
+    rows = []
+    for component, size in enumerate(sizes):
+        if size < 8:
+            continue
+        distance = cKDTree(cloud[components == component]).query(line)[0]
+        supported = distance <= limit
+        hits = np.flatnonzero(supported)
+        interval = supported[:-1] & supported[1:]
+        supported_length = float(np.sum(np.diff(arc)[interval]))
+        runs = np.split(hits, np.flatnonzero(np.diff(hits) > 1) + 1)
+        longest = max((float(arc[r[-1]] - arc[r[0]]) for r in runs if len(r)), default=0.)
+        # Rooted continuity is independent evidence with a bounded benefit;
+        # its influence vanishes for a short isolated basal patch.
+        early = next((float(arc[r[-1]] - arc[r[0]]) for r in runs
+                      if len(r) and arc[r[0]] <= max(4 * radius, 8 * spacing)), 0.)
+        score = supported_length + .25 * min(early, max(4 * radius, 8 * spacing))
+        qualifies = len(hits) >= 3 and longest >= max(4 * spacing, 1.5 * radius)
+        rows.append({"component": component, "vertex_count": int(size),
+                     "matched_prior_length": supported_length,
+                     "longest_supported_prior_interval": longest,
+                     "early_supported_prior_length": early,
+                     "first_supported_prior_arc": float(arc[hits[0]]) if len(hits) else None,
+                     "tube_distance_limit": limit, "score": score, "qualified": bool(qualifies)})
+        if qualifies:
+            evidence.append((score, early, -float(np.median(distance[hits])), -component, component))
+    evidence.sort(reverse=True)
+    if not evidence:
+        result = (largest, "origin_component_unresolved")
+    else:
+        chosen = evidence[0][-1]
+        ambiguous = (len(evidence) > 1 and evidence[1][0] >= .95 * evidence[0][0]
+                     and abs(evidence[1][1] - evidence[0][1]) <= 2 * spacing)
+        reason = ("origin_component_ambiguous" if ambiguous else
+                  "early_body_supported_component" if evidence[0][1] >= max(4 * spacing, 1.5 * radius)
+                  else "whole_prior_supported_component")
+        result = chosen, reason
+    return (*result, rows) if return_evidence else result
+
+
+def _identity_reference(root, old):
+    existing = (root.centerline_assessment or {}) if root is not None else {}
+    reference = existing.get("prefit_identity_evidence")
+    if isinstance(reference, dict):
+        return reference
+    # A legacy fitted path is not an independent pre-fit identity reference.
+    already_fitted = bool(existing.get("status") or existing.get("traits_geometry_source"))
+    return {"policy": "pre-fit-exposed-body-v1", "prior_path": [] if already_fitted else old.tolist(),
+            "body_start_index": int(root.body_start_index) if root is not None else 0,
+            "mean_radius": root.mean_radius if root is not None else None,
+            "coordinate_unit": "analysis_normalized", "path_fingerprint": array_fingerprint(old),
+            "origin": (np.asarray(root.insertion_point).tolist() if root is not None and root.insertion_point is not None else old[0].tolist()),
+            "reference_valid": not already_fitted}
+
+
+def _verified_terminal_support(points, triangles, ids, line, reference, spacing, context):
+    """Conservative observed native terminal, not an arbitrary fitted endpoint."""
+    if triangles is None or not len(triangles) or len(line) < 2 or len(ids) < 8 or not reference.get("reference_valid"):
+        return False
+    if not assess_terminal_direction(line, spacing=spacing)["terminal_direction_supported"]:
+        return False
+    prior = np.asarray(reference["prior_path"], float)
+    if not len(prior) or np.linalg.norm(line[-1] - prior[-1]) > 4 * spacing:
+        return False
+    tangent = line[-1] - line[-2]
+    tangent /= np.linalg.norm(tangent)
+    surface = points[ids]
+    delta = surface - line[-1]
+    forward = delta @ tangent
+    radial = np.linalg.norm(delta - forward[:, None] * tangent, axis=1)
+    local_radius = max(spacing, float(np.quantile(np.linalg.norm(delta, axis=1), .05)))
+    local = np.linalg.norm(delta, axis=1) <= max(8 * spacing, 2 * local_radius)
+    if np.count_nonzero(local) < 3 or np.any((forward > 3 * spacing) & (radial < max(4 * spacing, 2 * local_radius))):
+        return False
+    graph = context.get("_native_full_graph")
+    if graph is not None:
+        terminal_ids = ids[local & (forward >= -max(4 * spacing, local_radius))]
+        owned = np.zeros(len(points), bool)
+        owned[ids] = True
+        # Edges are stored once in index order, so inspect both orientations.
+        adjacency = graph[terminal_ids].tocoo()
+        reverse = context["_native_full_graph_reverse"][terminal_ids].tocoo()
+        first = np.r_[terminal_ids[adjacency.row], terminal_ids[reverse.row]]
+        second = np.r_[adjacency.col, reverse.col]
+        crosses = ~owned[second]
+        if np.any(crosses):
+            vector = points[second[crosses]] - points[first[crosses]]
+            continuation = vector @ tangent > .25 * np.linalg.norm(vector, axis=1)
+            distal = (points[second[crosses]] - line[-1]) @ tangent >= -2 * spacing
+            if np.any(continuation & distal):
+                return False
+    # An open scan boundary is not a biological terminal. Identity and current
+    # ownership are independently checked by the caller.
+    return not bool(np.any(context["_native_boundary_vertices"][ids[local]]))
+
+
 def refit_final_centerlines(
     points: np.ndarray, labels: np.ndarray, primary: np.ndarray,
     roots: list[RootPath], *, d_bar: float, triangles: np.ndarray | None = None,
@@ -910,6 +1384,7 @@ def refit_final_centerlines(
     mesh_context: MeshGeometryContext | None = None,
     nodule_labels: np.ndarray | None = None,
     preserved_bodies: dict[str, dict] | None = None,
+    identity_references: dict[str, dict] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Refit all roots in parent-first order using full-resolution final labels.
 
@@ -978,6 +1453,7 @@ def refit_final_centerlines(
                                point_tree=mesh_context.point_tree if mesh_context is not None else None)
         vertex_area_weights = _vertex_area_weights(points, triangles)
     edges.setflags(write=False)
+    measurement_context = make_evidence_context(points, triangles)
     ownership = (mesh_context.ownership(labels) if mesh_context is not None
                  else OwnershipGeometryGeneration(labels, points))
     by_id = {root.root_id: (i, root) for i, root in enumerate(roots, 1)}
@@ -1003,6 +1479,8 @@ def refit_final_centerlines(
         child_hints.setdefault(root.parent_id, []).append((root.root_id, np.asarray(hint, dtype=float).copy()))
     original_child_hints = {parent_id: list(hints) for parent_id, hints in child_hints.items()}
     staged = {}
+    staged_support_indices = {}
+    staged_lateral_candidates = {}
     for root in [None, *ordered]:
         if cooperate:
             cooperate()
@@ -1013,18 +1491,32 @@ def refit_final_centerlines(
         flags = []
         detail = {"root_id": rid, "numeric_label": label, "assigned_point_count": int(len(indices)), "length_before": path_length(old),
                   "coordinate_unit": "normalized", "input_geometry_fingerprint": hashlib.sha256(np.round(np.asarray(old, dtype=np.float64), decimals=8).tobytes(order="C")).hexdigest()[:20]}
+        reference = (identity_references or {}).get(rid) or _identity_reference(root, old)
+        if root is None and (preserved_bodies or {}).get("primary"):
+            reference = preserved_bodies["primary"].get("assessment", {}).get("prefit_identity_evidence", reference)
+        detail["prefit_identity_evidence"] = reference
+        if not reference.get("reference_valid"):
+            flags.append("centerline_identity_reference_unavailable")
         if not len(indices):
             # Preserve the record for label mapping, but export no line segment.
             body = np.asarray(old[:1], dtype=float).copy()
             support = np.empty((0, 3))
+            staged_support_indices[rid] = np.empty(0, int)
             detail.update(status="no_support", component_count=0, excluded_fragment_points=0)
         else:
             cloud = points[indices]
             graph = ownership.local_graph(label, edges)
             count, components = connected_components(graph, directed=False)
             sizes = np.bincount(components)
-            keep = components == int(np.argmax(sizes))
+            selected_component, component_decision, component_evidence = _origin_supported_component(
+                cloud, components, old, root, d_bar, reference=reference, return_evidence=True)
+            keep = components == selected_component
+            detail.update(component_selection=component_decision,
+                          selected_component=int(selected_component),
+                          largest_component=int(np.argmax(sizes)),
+                          component_identity_evidence=component_evidence)
             support = cloud[keep]
+            staged_support_indices[rid] = indices[keep]
             # Full resolution spacing, bounded by the analysis spacing. This
             # prevents a reduced analysis cloud from producing wide bend slabs.
             spacing = d_bar
@@ -1087,9 +1579,24 @@ def refit_final_centerlines(
                 else:
                     hint = old[0]
                     initial = _axis(support, graph[keep][:, keep], hint, spacing)
-                    body, fit_report = _fit_body(support, initial, spacing)
+                    reference_body = np.asarray(reference.get("prior_path", old), float)
+                    reference_start = int(reference.get("body_start_index", root.body_start_index))
+                    staged_lateral_candidates[rid] = []
+                    body, fit_report = _fit_lateral_body(
+                        support, initial, reference_body[reference_start:], spacing,
+                        vertex_area_weights[indices][keep], candidate_output=staged_lateral_candidates[rid])
                 detail.update(fit_report)
                 flags.extend(fit_report.get("qc_flags", []))
+            if root is not None and count > 1:
+                # A good local fit does not certify a disconnected identity.
+                detail["identity_qc_passed"] = False
+                detail["component_measurement_only"] = True
+                flags.append("centerline_identity_unresolved")
+                if component_decision.startswith("origin_component_"):
+                    flags.append("centerline_origin_component_unresolved")
+                    detail.update(fit_qc_passed=False, exposed_body_supported=False)
+                elif selected_component != int(np.argmax(sizes)):
+                    flags.append("centerline_disconnected_distal_identity_review")
         if nodule_labels is not None and len(indices) and detail.get("component_count", 0) > 1:
             native_nodules = np.asarray(nodule_labels)
             crossing = edges[((labels[edges[:, 0]] == label) & (native_nodules[edges[:, 1]] <= -3))
@@ -1258,6 +1765,83 @@ def refit_final_centerlines(
             (float(np.min(np.linalg.norm(line[allowed] - hint, axis=1))) for _, hint in shifted),
             default=0.0,
         ) if len(allowed) else np.inf
+        if (root is not None and detail.get("fit_qc_passed") and required
+                and (not len(allowed) or largest_shift > 4.0*d_bar)):
+            for candidate_name, candidate_body, candidate_record in staged_lateral_candidates.get(rid, []):
+                if candidate_name == detail.get("selected_candidate"):
+                    continue
+                candidate_line = candidate_body
+                candidate_start = 0
+                candidate_connector = np.vstack([anchor, candidate_body[0]])
+                candidate_gap = float(np.linalg.norm(anchor-candidate_body[0]))
+                candidate_connector_ok = candidate_gap <= 1e-12
+                candidate_reason = "coincident" if candidate_connector_ok else "owned_junction_support_rejected"
+                if len(parent_support) >= 8 and len(candidate_body) >= 2:
+                    candidate_connector_ok = _supported_connector(candidate_connector, parent_support, support, d_bar)
+                    if candidate_connector_ok:
+                        candidate_reason = "supported"
+                    else:
+                        end = int(cKDTree(old).query(candidate_body[0])[1])
+                        curved = np.vstack([anchor, old[1:end], candidate_body[0]])
+                        if len(curved) > 2 and _supported_connector(curved, parent_support, support, d_bar):
+                            candidate_connector, candidate_connector_ok = curved, True
+                            candidate_reason = "curved_repaired_connector_supported"
+                if candidate_connector_ok and candidate_gap > 1e-12:
+                    candidate_line = np.vstack([candidate_connector[:-1], candidate_body])
+                    candidate_start = len(candidate_connector)-1
+                candidate_allowed = _legal_attachment_indices(candidate_line, top_reference, gravity_direction)
+                candidate_shifted = [(child_id, hint) for child_id, hint in required
+                    if not len(candidate_allowed) or np.min(np.linalg.norm(candidate_line[candidate_allowed]-hint, axis=1)) > 4.0*d_bar]
+                candidate_prefix = None
+                if candidate_shifted:
+                    candidate_prefix = _retained_attachment_prefix(
+                        old, candidate_body, support, [hint for _, hint in candidate_shifted],
+                        top_reference, gravity_direction, d_bar)
+                    if candidate_prefix is None:
+                        continue
+                    candidate_line, candidate_start, candidate_join_gap = candidate_prefix
+                    candidate_allowed = _legal_attachment_indices(candidate_line, top_reference, gravity_direction)
+                    if not len(candidate_allowed) or any(
+                        np.min(np.linalg.norm(candidate_line[candidate_allowed]-hint, axis=1)) > 4.0*d_bar
+                        for _, hint in required
+                    ):
+                        continue
+                previous_candidate = detail.get("selected_candidate")
+                body, line, body_start = candidate_body, candidate_line, candidate_start
+                connector, connector_ok, connector_reason = candidate_connector, candidate_connector_ok, candidate_reason
+                gap = candidate_gap
+                allowed, shifted, largest_shift = candidate_allowed, [], 0.0
+                flags[:] = [f for f in flags if f != "centerline_unsupported_parent_connector"]
+                if not connector_ok:
+                    flags.append("centerline_unsupported_parent_connector")
+                detail.update(
+                    selected_candidate=candidate_name,
+                    attachment_candidate_fallback_from=previous_candidate,
+                    attachment_candidate_selection="validated_candidate_preserves_descendant_attachments",
+                    status="fitted" if candidate_record["rejected_section_count"] == 0 else "partial_support",
+                    fit_applied=True, fit_qc_passed=True, exposed_body_supported=True,
+                    traits_geometry_source="validated_prior" if candidate_name == "prior" else "accepted_fit",
+                    rejected_section_count=candidate_record["rejected_section_count"],
+                    parent_connector_mode="supported" if connector_ok else "unsupported_gap",
+                    parent_connector_supported=bool(connector_ok), parent_connector_support_decision=connector_reason,
+                    parent_connector_length=path_length(connector) if body_start else 0.0,
+                    attachment_gap=0.0 if connector_ok else gap,
+                )
+                if candidate_prefix is not None:
+                    flags.append("centerline_preserved_topology_prefix")
+                    detail.update(
+                        parent_connector_mode="preserved_topology", parent_connector_supported=False,
+                        parent_connector_rejection_reason=(connector_reason if not connector_ok
+                                                           else "accepted_connector_replaced_for_descendant"),
+                        attachment_preservation_reason="descendant_attachment_shift_exceeds_4_spacings",
+                        preserved_topology_length=path_length(line[:body_start+1]),
+                        preserved_topology_join_gap=candidate_join_gap,
+                        preserved_topology_required_by=sorted(child_id for child_id, _ in candidate_shifted),
+                        attachment_candidate_fallback_prefix=True,
+                        parent_connector_length=path_length(line[:body_start+1]),
+                        attachment_gap=float(np.linalg.norm(line[0]-anchor)),
+                    )
+                break
         if required and (not len(allowed) or root is not None and largest_shift > 4.0 * d_bar):
             preservation_reason = (
                 "no_legal_below_top_point" if not len(allowed)
@@ -1315,6 +1899,8 @@ def refit_final_centerlines(
                 detail.update(
                     status=retained_status,
                     fit_applied=False,
+                    rejected_fitted_body_qc_passed=bool(detail.get("fit_qc_passed")),
+                    fit_qc_passed=False,
                     traits_geometry_source="retained_prior",
                     parent_connector_mode="retained_prior" if root is not None else "none",
                     parent_connector_supported=False if root is not None else None,
@@ -1374,6 +1960,34 @@ def refit_final_centerlines(
             "accepted_fit" if detail["fit_applied"] else "unmeasurable_support",
         )
         detail.setdefault("exposed_body_supported", detail["status"] in {"fitted", "partial_support"})
+        identity_resolved = bool(detail.get("component_count", 0) == 1
+                                 and detail["prefit_identity_evidence"].get("reference_valid")
+                                 and detail.get("fit_qc_passed")
+                                 and detail.get("exposed_body_supported")
+                                 and not (root is not None and "native_body_identity_unresolved" in root.qc_flags))
+        detail["identity_qc_passed"] = identity_resolved
+        support_ids = staged_support_indices[rid]
+        tip_verified = bool(identity_resolved and _verified_terminal_support(
+            points, triangles, support_ids, line[body_start:],
+            detail["prefit_identity_evidence"], d_bar, measurement_context))
+        detail["biological_tip_verified"] = tip_verified
+        reference = detail["prefit_identity_evidence"]
+        origin_evidence = assess_origin_coverage(
+            line, top_reference[int(np.argmax(top_reference @ -gravity_direction))] if root is None else anchor,
+            reference_path=reference.get("prior_path") if reference.get("reference_valid") else None,
+            spacing=detail.get("fit_spacing", d_bar),
+            attachment_supported=root is None or detail.get("parent_connector_supported", False))
+        detail["origin_coverage_complete"] = origin_evidence["origin_coverage_complete"]
+        detail["origin_coverage_evidence"] = origin_evidence
+        detail["measurement_evidence"] = build_measurement_evidence(
+            points, labels, 0 if root is None else by_id[rid][0], line,
+            triangles=triangles, selected_vertex_indices=support_ids,
+            spacing=detail.get("fit_spacing", d_bar), body_start_index=body_start,
+            identity_resolved=identity_resolved,
+            attachment_supported=root is None or detail.get("parent_connector_supported", False),
+            tip_supported=tip_verified,
+            origin_coverage_complete=origin_evidence["origin_coverage_complete"],
+            origin_coverage_evidence=origin_evidence, context=measurement_context)
         detail.update(length_after=path_length(line), exposed_body_length=path_length(line[body_start:]), body_start_index=body_start,
                       tip_displacement=float(np.linalg.norm(line[-1] - old[-1])), qc_flags=flags)
         if root is not None:

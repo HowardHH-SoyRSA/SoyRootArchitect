@@ -53,11 +53,14 @@ def test_empty_and_one_section_support_remain_explicit_incomplete_estimates():
     support=_cylinder([2.5])
     measured=compute_traits(path,[],support,np.ones(len(support),bool),np.zeros(len(support),int),norm)
     row=measured.iloc[0]
-    assert np.isfinite(row.volume)
+    # One cross-section measures a local diameter, not a tube volume over the
+    # entire unsupported prior path.
+    assert row.mean_diameter == pytest.approx(.4)
+    assert np.isnan(row.volume)
     assert not row.volume_estimate_complete
     assert not row.body_coverage_complete
     assert 'radius_endpoint_support_incomplete' in row.qc_flags
-    assert measured.attrs['system_summary']['root_system_volume_estimate_partial_root_count'] == 1
+    assert measured.attrs['system_summary']['root_system_volume_estimate_unavailable_root_count'] == 1
     assert not measured.attrs['system_summary']['root_system_volume_estimate_complete']
 
 
@@ -166,8 +169,13 @@ def test_endpoint_coverage_never_overrides_negative_final_fit_evidence(assessmen
     traits=compute_traits(_path(np.linspace(0,5,21)),[],support,np.ones(len(support),bool),np.zeros(len(support),int),
                           Normalization(np.zeros(3),1.,1.),primary_centerline_assessment=assessment)
     row=traits.iloc[0]
-    assert row.body_coverage_complete
-    assert np.isfinite(row.volume)
+    retained = assessment.get('status') == 'qc_rejected_prior_retained' or assessment.get('traits_geometry_source') == 'retained_prior_path'
+    assert bool(row.body_coverage_complete) is not retained
+    if retained:
+        assert np.isnan(row.volume)
+        assert np.isnan(row.length)
+    else:
+        assert np.isfinite(row.volume)
     assert not row.length_estimate_complete
     assert not row.volume_estimate_complete
     assert not traits.attrs['system_summary']['root_system_volume_estimate_complete']

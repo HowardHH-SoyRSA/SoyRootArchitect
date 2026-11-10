@@ -14,7 +14,44 @@ def eligible_mask(frame):
     keep = np.isfinite(length) & (length > 0)
     if "measurement_excluded" in frame:
         keep &= ~frame.measurement_excluded.eq(True)
+    if "length_measurement_status" in frame:
+        keep &= frame.length_measurement_status.isin(["complete", "partial"])
     return keep
+
+
+def metric_eligible_mask(frame, metric):
+    """Use each metric's evidence; legacy frames retain their old row filter."""
+    status = f"{metric}_measurement_status"
+    if status not in frame:
+        return eligible_mask(frame)
+    values = pd.to_numeric(frame[metric], errors="coerce")
+    keep = frame[status].isin(["complete", "partial"]) & np.isfinite(values)
+    if metric in {"length", "mean_diameter", "volume"}:
+        keep &= values > 0
+    if metric == "surface_area":
+        keep &= values >= 0
+    if "measurement_excluded" in frame:
+        keep &= ~frame.measurement_excluded.eq(True)
+    return keep
+
+
+def metric_status_counts(frame, metric):
+    """Partition one shared non-noise inventory, including invalid finite zeroes."""
+    active = frame[~frame.measurement_excluded.eq(True)] if "measurement_excluded" in frame else frame
+    values = pd.to_numeric(active[metric], errors="coerce")
+    valid = np.isfinite(values) & (values > 0 if metric in {"length", "mean_diameter", "volume"} else values >= 0)
+    status = f"{metric}_measurement_status"
+    if status in active:
+        available = valid & active[status].isin(["complete", "partial"])
+        complete = available & active[status].eq("complete")
+    else:
+        available = valid
+        flag = {"length": "length_estimate_complete", "volume": "volume_estimate_complete",
+                "mean_diameter": "radius_profile_complete", "surface_area": "surface_area_estimate_complete"}.get(metric)
+        complete = available & active[flag].eq(True) if flag in active else pd.Series(False, index=active.index)
+    return dict(inventory=len(active), complete=int(complete.sum()),
+                partial=int((available & ~complete).sum()), unavailable=int((~available).sum()),
+                excluded=len(frame)-len(active))
 
 
 def _finite(values):
@@ -140,12 +177,15 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
     label_for = {"primary": 0, **{r.root_id: i for i, r in enumerate(laterals, 1)}}
     row_for = frame.set_index("root_id")
     eligible = set(frame.loc[frame.measurement_eligible, "root_id"])
+    surface_eligible = set(frame.loc[metric_eligible_mask(frame, "surface_area"), "root_id"])
     primary_length = float(row_for.loc["primary", "length"]) if "primary" in eligible else np.nan
     branches = []
     for r in laterals:
         if r.root_id not in eligible:
             continue
         valid_parent = r.parent_id in eligible and r.parent_id in paths
+        if "base_parent_angle_deg_measurement_status" in frame:
+            valid_parent = valid_parent and row_for.loc[r.root_id, "base_parent_angle_deg_measurement_status"] in {"complete", "partial"}
         insertion = np.asarray(r.insertion_point if r.insertion_point is not None else r.points[0])
         arc = project_arc(insertion, paths[r.parent_id]) if valid_parent else np.nan
         valid_parent = valid_parent and np.isfinite(arc)
@@ -172,15 +212,16 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
             mesh_cache[key] = mesh_measurement(points, selected)
         return mesh_cache[key]
     for idx, row in frame.iterrows():
-        if row.root_id not in eligible:
-            continue
-        chord = paths[row.root_id][-1] - paths[row.root_id][0]
-        reach = float(np.linalg.norm(chord - np.dot(chord, gravity)*gravity))
-        frame.loc[idx, "horizontal_reach"] = reach
-        frame.loc[idx, "relative_horizontal_reach"] = _ratio(reach, primary_length)
-        for key, value in selected_mesh([row.root_id]).items():
-            frame.loc[idx, key] = value
-    frame["volume_frustum"] = frame.volume.where(frame.measurement_eligible)
+        endpoints_supported = row.get("tip_start_gravity_angle_deg_measurement_status", "complete") in {"complete", "partial"}
+        if row.root_id in eligible and endpoints_supported:
+            chord = paths[row.root_id][-1] - paths[row.root_id][0]
+            reach = float(np.linalg.norm(chord - np.dot(chord, gravity)*gravity))
+            frame.loc[idx, "horizontal_reach"] = reach
+            frame.loc[idx, "relative_horizontal_reach"] = _ratio(reach, primary_length)
+        if row.root_id in surface_eligible:
+            for key, value in selected_mesh([row.root_id]).items():
+                frame.loc[idx, key] = value
+    frame["volume_frustum"] = frame.volume.where(metric_eligible_mask(frame, "volume"))
     groups = [("system", frame), ("laterals", frame[frame.root_order > 0])]
     groups += [(f"order_{order}", frame[frame.root_order == order]) for order in sorted(frame.root_order.unique())]
     summaries, gaps, distributions = [], [], []
@@ -206,12 +247,18 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
                                  coincident=bool(gap <= 1e-9), length_unit=unit))
             distinct = pos[np.r_[True, np.diff(pos) > 1e-9]]
             distinct_gaps.extend(np.diff(distinct).tolist())
-        vertices = points[np.isin(labels, [label_for[r] for r in ids])]
+        geometry_ids = set(candidates.loc[metric_eligible_mask(candidates, "surface_area"), "root_id"])
+        vertices = points[np.isin(labels, [label_for[r] for r in geometry_ids])]
         extent = _extent(vertices, top, gravity)
-        mesh = selected_mesh(ids)
-        volume = float(selected.volume_frustum.sum(min_count=1)) if len(selected) else (np.nan if len(candidates) else 0.)
+        mesh = selected_mesh(geometry_ids)
+        volume_rows = candidates[metric_eligible_mask(candidates, "volume")]
+        surface_rows = candidates[metric_eligible_mask(candidates, "surface_area")]
+        diameter_rows = candidates[metric_eligible_mask(candidates, "mean_diameter")]
+        volume = float(volume_rows.volume_frustum.sum(min_count=1)) if len(volume_rows) else (np.nan if len(candidates) else 0.)
         length = float(selected.length.sum()) if len(selected) else (np.nan if len(candidates) else 0.)
+        volume_counts = metric_status_counts(candidates, "volume")
         row = dict(scope=scope, root_count=len(selected), excluded_root_count=len(candidates)-len(selected),
+                   root_inventory_count=metric_status_counts(candidates, "length")["inventory"],
                    length_sum=length, length_unit=unit, area_unit=f"{unit}^2", volume_unit=f"{unit}^3",
                    distinct_parent_count=len(parents), parent_length_sum=parent_sum,
                    branching_child_count=len(chosen), branching_unusable_parent_count=len(chosen)-len(valid),
@@ -223,17 +270,20 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
                    distinct_site_gap_count=len(distinct_gaps),
                    relative_horizontal_reach_p90=float(np.quantile(_finite(selected.relative_horizontal_reach), .9)) if len(_finite(selected.relative_horizontal_reach)) else np.nan,
                    volume_frustum=volume,
-                   volume_frustum_complete=bool(len(selected) and selected.volume_estimate_complete.eq(True).all()) if "volume_estimate_complete" in selected else False,
+                   volume_frustum_complete=bool(volume_counts["inventory"] and not volume_counts["partial"] and not volume_counts["unavailable"]),
                    segmented_vertex_count=len(vertices), **extent, **mesh)
         row.update(envelope_length_density=_ratio(length, extent["hull_volume"]),
                    envelope_length_density_unit=f"{unit}/{unit}^3",
                    solidity_mesh=_ratio(mesh["mesh_volume"], extent["hull_volume"]),
                    solidity_frustum=_ratio(volume, extent["hull_volume"]))
-        row["surface_area_partitioned_sum"] = float(selected.surface_area.sum(min_count=1)) if len(selected) else (np.nan if len(candidates) else 0.)
+        row["surface_area_partitioned_sum"] = float(surface_rows.surface_area.sum(min_count=1)) if len(surface_rows) else (np.nan if len(candidates) else 0.)
         for column in form_columns:
-            if column in selected:
-                row[f"mean_{column}"] = _mean(selected[column])
-        diam = _finite(selected.mean_diameter)
+            if column in candidates:
+                metric = ({"median_diameter": "mean_diameter", "minimum_diameter": "mean_diameter",
+                           "maximum_diameter": "mean_diameter", "volume_frustum": "volume",
+                           "chord_length": "length", "tortuosity": "length"}.get(column, column))
+                row[f"mean_{column}"] = _mean(candidates.loc[metric_eligible_mask(candidates, metric), column])
+        diam = _finite(diameter_rows.mean_diameter)
         row.update(diameter_mean=_mean(diam), diameter_cv=_cv(diam), diameter_available_root_count=len(diam))
         for name, q in (("median", .5), ("p10", .1), ("p90", .9)):
             row[f"diameter_{name}"] = float(np.quantile(diam, q, method="linear")) if len(diam) else np.nan
@@ -241,7 +291,10 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
         for flag in ("length_estimate_complete", "volume_estimate_complete", "radius_profile_complete", "centerline_measurement_support_complete"):
             row[f"{flag}_root_count"] = int(selected[flag].eq(True).sum()) if flag in selected else 0
         for column in ("length", "mean_diameter", "volume", "surface_area"):
-            row[f"{column}_unavailable_root_count"] = int((~np.isfinite(pd.to_numeric(candidates[column], errors="coerce"))).sum())
+            counts = metric_status_counts(candidates, column)
+            for status in ("complete", "partial", "unavailable"):
+                row[f"{column}_{status}_root_count"] = counts[status]
+            row[f"{column}_measured_root_count"] = counts["complete"] + counts["partial"]
         for value in np.unique(diam):
             distributions.append(dict(scope=scope, mean_diameter=float(value), root_count=int(np.sum(diam==value)),
                                       cumulative_fraction=float(np.mean(diam<=value)), length_unit=unit))
@@ -250,10 +303,11 @@ def add_architecture_traits(frame, primary, laterals, points, labels, faces, top
     frame.attrs["branch_positions"] = branch_frame.to_dict("records")
     frame.attrs["branch_spacing"] = gaps
     frame.attrs["diameter_distribution"] = distributions
-    frame.attrs["measurement_policy"] = dict(version="all-orders-v1", eligibility="finite positive length; noise excluded",
-        geometry="final assigned vertices of eligible roots only; no nodules, unassigned or uncertain points",
+    frame.attrs["measurement_policy"] = dict(version="metric-evidence-v2", eligibility="per-metric supported complete or partial measurements; noise excluded; legacy root count uses eligible length",
+        geometry="final assigned vertices of surface-measurable roots; independent of centerline availability; no nodules, unassigned or uncertain points",
         mesh_faces="all three corners in the selected eligible roots; no artificial caps",
         immutable_primary_top=np.asarray(top).tolist(), coordinate_unit=unit,
         primary_top_source="explicit_immutable_reference", quantiles="linear (R type 7)",
         spacing="within recorded eligible parents; coincident sites retained; distinct-site sensitivity provided",
-        solidity="mesh and frustum volumes divided by hull; validity follows numerator and coverage")
+        solidity="mesh and frustum volumes divided by hull; validity follows numerator and coverage",
+        status_partition="complete + partial + unavailable = non-noise root inventory for each metric")

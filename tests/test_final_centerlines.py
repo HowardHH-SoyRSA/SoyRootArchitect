@@ -544,9 +544,14 @@ def test_parent_refit_preserves_below_top_o2_attachment(join_prior_to_body, top_
         )
         summary = traits_frame.attrs["system_summary"]
         assert summary["root_system_length_complete"] is False
-        assert summary["root_system_length_unavailable_root_count"] >= 1
+        assert summary["root_system_length_partial_root_count"] >= 1
         traits = traits_frame.set_index("root_id")
-        assert np.isnan(traits.loc["o1", "length"])
+        # Retaining an unsupported attachment for a descendant does not erase
+        # the independently supported exposed body's partial measurement.
+        supported = np.asarray(o1.centerline_assessment["measurement_evidence"]["supported_interval_mask"], bool)
+        expected = np.linalg.norm(np.diff(o1.points, axis=0), axis=1)[supported].sum()
+        assert traits.loc["o1", "length"] == pytest.approx(expected)
+        assert traits.loc["o1", "length_measurement_status"] == "partial"
         assert traits.loc["o1", "preserved_topology_length"] > 0
         assert traits.loc["o1", "exposed_body_length"] > 0
         assert traits.loc["o1", "topology_path_length"] > traits.loc["o1", "exposed_body_length"]

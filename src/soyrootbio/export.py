@@ -19,6 +19,7 @@ from .topology import hierarchy_frame, write_editable_hierarchy
 from .traits import angle_vectors_frame, lateral_counts_frame, trait_summary_frame
 from .types import Normalization, RootPath, TopologyReport
 from .nodules import NODULE_COLOR, NoduleResult, export_nodules, geometry_digest
+from .provenance import processing_provenance
 
 
 SEGMENT_COLORS = {
@@ -56,6 +57,7 @@ def export_results(
     topology_report: TopologyReport | None = None,
     nodules: NoduleResult | None = None,
     noise_mask: np.ndarray | None = None,
+    primary_centerline_assessment: dict | None = None,
 ) -> None:
     """Write measurement, topology, provenance, figure-input, and PLY outputs."""
 
@@ -135,6 +137,24 @@ def export_results(
         metadata,
     )
 
+    from .measurement_evidence import make_evidence_context, rebase_assessment
+    evidence_points = normalization.transform_points(
+        np.asarray(full_points if full_points is not None else original_points, dtype=float))
+    old_evidence_context = make_evidence_context(evidence_points, triangles)
+    new_evidence_context = make_evidence_context(geometry_points, triangles)
+    evidence_offset = normalization.to_output_points(np.zeros((1, 3)))[0]
+
+    def output_assessment(assessment, path, label, body_start=0):
+        return rebase_assessment(
+            assessment or {}, old_points=evidence_points, old_labels=geometry_labels,
+            old_label=label, old_path=path, new_points=geometry_points,
+            new_labels=geometry_labels, new_label=label,
+            new_path=normalization.to_output_points(path),
+            scale=normalization.output_scale, offset=evidence_offset,
+            triangles=triangles, body_start_index=body_start,
+            old_context=old_evidence_context, new_context=new_evidence_context)
+
+    measured_qc = traits.set_index("root_id")["qc_flags"].to_dict() if "qc_flags" in traits else {}
     editable_paths = [
         replace(
             root,
@@ -144,8 +164,12 @@ def export_results(
                 if root.insertion_point is None
                 else normalization.to_output_points(np.asarray(root.insertion_point)[None, :])[0]
             ),
+            centerline_assessment=output_assessment(root.centerline_assessment, root.points,
+                                                   label, root.body_start_index),
+            qc_flags=([flag for flag in str(measured_qc[root.root_id]).split(";") if flag and flag != "nan"]
+                      if root.root_id in measured_qc else list(root.qc_flags)),
         )
-        for root in lateral_paths
+        for label, root in enumerate(lateral_paths, 1)
     ]
     primary_trait = traits.loc[traits["root_id"] == "primary"]
     primary_confidence = float(primary_trait.iloc[0]["confidence"]) if len(primary_trait) else 1.0
@@ -160,7 +184,9 @@ def export_results(
         editable_paths,
         primary_confidence=primary_confidence,
         primary_qc_flags=primary_qc_flags,
-        primary_centerline_assessment=next((row for row in metadata.get("final_centerline_fitting", {}).get("roots", []) if row.get("root_id") == "primary"), None),
+        primary_centerline_assessment=output_assessment(
+            primary_centerline_assessment if primary_centerline_assessment is not None else
+            next((row for row in metadata.get("final_centerline_fitting", {}).get("roots", []) if row.get("root_id") == "primary"), {}), primary_path, 0),
         coordinate_unit=normalization.coordinate_unit,
     )
     write_rsml(
@@ -171,12 +197,17 @@ def export_results(
         metadata,
     )
     metadata = dict(metadata)
+    previous_provenance = metadata.get("processing_provenance")
+    metadata["processing_provenance"] = processing_provenance(metadata.get("source"), _json_safe(metadata.get("config")))
+    if previous_provenance and previous_provenance != metadata["processing_provenance"]:
+        metadata["source_processing_provenance"] = previous_provenance
     if "joint_root_collar" in metadata:
         with (output_dir / "collar_qc.json").open("w", encoding="utf-8") as handle:
             json.dump(_json_safe(metadata["joint_root_collar"]), handle,
                       indent=2, ensure_ascii=False, allow_nan=False)
     metadata["system_summary"] = traits.attrs.get("system_summary", {})
     metadata["measurement_policy"] = traits.attrs.get("measurement_policy", {})
+    metadata["measured_child_parent_length_reviews"] = traits.attrs.get("measured_child_parent_length_reviews", [])
     metadata["root_label_map"] = tables["root_label_map.csv"].to_dict(orient="records")
     metadata["skeleton_original_overlay_layout"] = skeleton_overlay_layout
     if topology_report is not None:
@@ -200,10 +231,9 @@ def write_measurement_tables(output_dir, traits, label_map, *, topology=None):
         path.replace(directory / path.name)
     keep = eligible_mask(traits)
     # QC retains every topology identity; biological summaries use eligible roots.
-    inventory_columns = [c for c in traits if c in {"root_id", "parent_id", "root_order", "confidence", "point_count",
-        "qc_flags", "measurement_eligible", "measurement_exclusion_reason", "measurement_excluded", "centerline_fit_status"}
-        or c.endswith("_complete") or c.startswith("radius_")]
-    inventory = traits[inventory_columns].copy()
+    # Keep independent surface/diameter/partial-body measurements accessible even
+    # when the legacy length-eligible root_traits table omits this identity.
+    inventory = traits.copy()
     if topology is not None:
         extra = [c for c in topology if c not in inventory or c == "root_id"]
         inventory = inventory.merge(topology[extra], on="root_id", how="left", validate="one_to_one")
@@ -251,11 +281,24 @@ def write_rsml(
     ET.SubElement(metadata_element, "user").text = "SoyRootBio user"
     ET.SubElement(metadata_element, "file-key").text = Path(str(metadata.get("source", "root"))).stem
     property_definitions = ET.SubElement(metadata_element, "property-definitions")
+    metric_names = ("length", "mean_diameter", "volume", "surface_area",
+                    "base_parent_angle_deg", "tip_angle_parent_deg", "tip_primary_angle_deg",
+                    "tip_gravity_angle_deg", "tip_start_gravity_angle_deg")
+    metric_definitions = tuple(item for metric in metric_names for item in (
+        (f"{metric}_measurement_status", "string", "none"),
+        (f"{metric}_measurement_eligible", "boolean", "none"),
+        (f"{metric}_measurement_reason", "string", "none")))
     for name, value_type, unit in (
         ("root_order", "integer", "none"),
         ("confidence", "real", "none"),
+        ("tracing_confidence", "real", "none"),
+        ("measurement_identity_resolved", "boolean", "none"),
+        ("measurement_evidence_valid", "boolean", "none"),
+        ("measurement_evidence_reason", "string", "none"),
         ("length", "real", unit),
         ("mean_diameter", "real", unit),
+        ("volume", "real", f"{unit}^3"),
+        ("surface_area", "real", f"{unit}^2"),
         ("tortuosity", "real", "none"),
         ("volume_frustum", "real", f"{unit}^3"),
         ("mesh_volume", "real", f"{unit}^3"),
@@ -271,7 +314,13 @@ def write_rsml(
         ("radius_profile_complete", "boolean", "none"),
         ("radius_profile_method", "string", "none"),
         ("qc_flags", "string", "none"),
-    ):
+    ) + tuple((metric, "real", "degree") for metric in metric_names if metric.endswith("_deg")) + (
+        ("volume_estimate_complete", "boolean", "none"),
+        ("surface_area_estimate_complete", "boolean", "none"),
+        ("centerline_measurement_support_complete", "boolean", "none"),
+        ("origin_coverage_complete", "boolean", "none"),
+        ("origin_coverage_reason", "string", "none"),
+    ) + metric_definitions:
         definition = ET.SubElement(property_definitions, "property-definition")
         ET.SubElement(definition, "label").text = name
         ET.SubElement(definition, "type").text = value_type
@@ -355,8 +404,20 @@ def _rsml_root_element(
         "radius_profile_method": "not_assessed" if trait is None else trait.get("radius_profile_method", "legacy_segment_distance"),
         "qc_flags": "" if trait is None else trait.get("qc_flags", ""),
     }
+    if trait is not None:
+        for name in ("tracing_confidence", "measurement_identity_resolved",
+                     "measurement_evidence_valid", "measurement_evidence_reason",
+                     "volume", "surface_area", "base_parent_angle_deg", "tip_angle_parent_deg",
+                     "tip_primary_angle_deg", "tip_gravity_angle_deg", "tip_start_gravity_angle_deg",
+                     "volume_estimate_complete", "surface_area_estimate_complete",
+                     "centerline_measurement_support_complete", "origin_coverage_complete", "origin_coverage_reason"):
+            if name in trait:
+                values[name] = trait[name]
+        for name in trait.keys():
+            if name.endswith(("_measurement_status", "_measurement_eligible", "_measurement_reason")):
+                values[name] = trait[name]
     for name, value in values.items():
-        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        if value is None or value is pd.NA or (isinstance(value, (float, np.floating)) and not np.isfinite(value)):
             ET.SubElement(properties, name, {"available": "false"})
         else:
             ET.SubElement(properties, name, {"value": str(value).lower() if isinstance(value, (bool, np.bool_)) else str(value)})
